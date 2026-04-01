@@ -1,0 +1,26 @@
+[package]
+name = "imranview"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1.0"
+image = { version = "0.25", default-features = false, features = [
+    "avif",
+    "bmp",
+    "gif",
+    "hdr",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "qoi",
+    "tiff",
+    "webp",
+] }
+rfd = "0.15"
+slint = "1"
+
+[build-dependencies]
+slint-build = "1"

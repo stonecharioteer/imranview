@@ -1,0 +1,84 @@
+export component AppWindow inherits Window {
+    in property <string> window-title: "ImranView";
+    in property <string> status-line: "Open an image to start";
+    in property <image> current-image;
+    in property <bool> has-image: false;
+
+    title: window-title;
+    preferred-width: 1200px;
+    preferred-height: 760px;
+    background: #20242b;
+
+    callback request-open();
+    callback request-next();
+    callback request-prev();
+
+    MenuBar {
+        Menu {
+            title: "File";
+            MenuItem {
+                title: "Open...";
+                activated => {
+                    root.request-open();
+                }
+            }
+        }
+        Menu {
+            title: "Navigate";
+            MenuItem {
+                title: "Previous";
+                activated => {
+                    root.request-prev();
+                }
+            }
+            MenuItem {
+                title: "Next";
+                activated => {
+                    root.request-next();
+                }
+            }
+        }
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: #0f1115;
+
+            if root.has-image : Image {
+                source: root.current-image;
+                width: parent.width;
+                height: parent.height;
+                image-fit: contain;
+            }
+
+            if !root.has-image : Text {
+                text: "ImranView\n\nUse File > Open...";
+                color: #cfd6e6;
+                font-size: 24px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+        }
+
+        Rectangle {
+            height: 28px;
+            background: #2a313a;
+
+            Text {
+                text: root.status-line;
+                color: #d5dce8;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                overflow: elide;
+            }
+        }
+    }
+}
