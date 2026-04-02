@@ -1,61 +1,74 @@
 # ImranView Architecture
 
-ImranView is a native desktop image viewer built with Rust + Slint.
+ImranView is a native desktop image viewer built with Rust + egui/eframe.
 
 ## Design goals
 
 - Fast startup and lightweight runtime
 - Native desktop behavior on Linux, macOS, and Windows
 - Clear separation between UI and image pipeline
-- Easy extension toward IrfanView-like editing and batch features
+- Easy extension toward practical editing and batch workflows
 
 ## Current module layout
 
 - `src/main.rs`
   - App bootstrap
-  - Slint callback wiring
-  - UI refresh logic
+  - egui render/update loop
+  - Toolbar/menu/status/thumbnail UI composition
+  - Keyboard shortcut handling
+  - Dispatch of commands to background workers
+- `src/native_menu.rs` (macOS only)
+  - Native application menu bar installation (`muda`)
+  - Menu event polling and action mapping
+  - Native menu item checked/enabled state sync
 - `src/app_state.rs`
   - Viewer/session state
   - Current file, folder list, navigation index, directory label
   - Zoom model (`Fit` vs manual factor)
-  - Thumbnail window/cache management
+  - Thumbnail list/window mode state and decode hints
   - Status and window title composition
 - `src/image_io.rs`
   - Decode image files via `image` crate
   - EXIF orientation application
   - Large-image preview downscaling
   - Thumbnail generation
-  - Convert decoded image into Slint image buffers
   - Folder image discovery and extension filtering
-- `ui/app-window.slint`
-  - Main window, menu structure, folder panel, viewer canvas, thumbnail strip, status bar
-  - Toolbar uses OSS Tabler SVG icons (MIT) from `assets/icons/tabler`
+- `src/worker.rs`
+  - Background worker threads for open/save/transform operations
+  - Dedicated thumbnail worker pool
+  - Neighbor preload cache for low-latency next/previous navigation
+  - Command/result channel contract (`WorkerCommand`, `WorkerResult`)
+- `src/settings.rs`
+  - Persistent viewer settings load/save
+  - Cross-platform config path resolution
+- `src/perf.rs`
+  - Performance budget definitions
+  - Structured timing logs for startup/open/save/edit paths
 
 ## Runtime flow
 
 1. User opens image (menu or CLI file path argument).
-2. `AppState::open_image()` decodes and orients the image, then discovers sibling images in the same folder.
-3. If needed, large images are downscaled for interactive preview and dimensions are tracked (`preview` vs `original`).
-4. Thumbnail cache is reconciled and primed around the current index.
-5. UI properties (`current-image`, `status-line`, `window-title`, folder model, thumbnail model, zoom`) are updated.
-6. Navigation, folder clicks, thumbnail clicks, and zoom callbacks mutate `AppState` and refresh the same view model pipeline.
+2. UI thread enqueues heavy work (`OpenImage`, `SaveImage`, `TransformImage`) to worker channels.
+3. Worker decodes/orients image and discovers sibling files in folder.
+4. App state applies worker results and refreshes main texture on the next UI frame.
+5. Thumbnail cards request lazy decode only when hinted/visible; decode runs in thumbnail workers.
+6. Neighbor images are preloaded asynchronously to speed up rapid next/previous navigation.
+7. Status bar and window title are recomputed from `AppState` after each state mutation.
 
 ## Planned expansion points
 
-- Multi-threaded decode and prefetch cache
 - Advanced transforms (resize, crop, color corrections)
-- Plugin-style command registry for future tools
 - Metadata panel (EXIF/IPTC/XMP)
 - Batch conversion/rename pipeline
+- CI performance regression gates
 
 ## Why this structure
 
-The main risk in image viewers is letting rendering, IO, and state mutate each other directly. Keeping `app_state` and `image_io` separate from Slint UI gives us:
+The main risk in image viewers is letting rendering, IO, and state mutate each other directly. Keeping `app_state` and `image_io` separate from UI code gives us:
 
 - simpler testing of decode/navigation logic
 - cleaner UI iterations without touching image internals
-- a path to move heavy image work off the UI thread later
+- background execution of heavy image work while keeping UI responsive
 
 ## Error strategy
 

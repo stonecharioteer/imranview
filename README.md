@@ -1,6 +1,6 @@
 # ImranView
 
-ImranView is a native, cross-platform image viewer inspired by IrfanView and built with Rust + Slint.
+ImranView is a native, cross-platform, lightweight image viewer built with Rust + egui/eframe.
 
 ## Current status
 
@@ -9,19 +9,20 @@ This repository now contains a working desktop viewer slice with:
 - Open an image from `File > Open...`
 - Open via CLI path argument (`cargo run -- /path/to/image.jpg`)
 - Previous/next navigation for images in the same folder
-- Classic IrfanView-inspired shell (menu-first, compact toolbar, black canvas, segmented status bar)
-- Optional thumbnail strip with current-image highlight
+- Menu-first shell (compact toolbar, black canvas, segmented status bar)
+- Optional thumbnail strip and dedicated thumbnail window mode, with current-image highlight
 - Zoom controls: fit, actual size, in/out
-- Shortcuts: `Left/Right`, `+/-`, `0` (fit), `1` (actual), `Ctrl + Mouse Wheel`, `T`/`H`/`S` for thumbnails/toolbar/status
+- Shortcuts: `Left/Right`, `+/-`, `0` (fit), `1` (actual), `Ctrl + Mouse Wheel`, `Ctrl+S`, `Ctrl+Shift+S`
 - EXIF orientation handling on load
 - Preview downscaling for large images (status line shows preview vs original dimensions)
-- Toolbar icons use OSS Tabler Icons (MIT), not IrfanView assets
+- Toolbar icons use OSS Tabler Icons (MIT)
+- Background workers for open/save/edit/thumbnail tasks to keep UI responsive
 
 Lightweight guardrails currently in place:
 
-- Thumbnails are not generated until the strip is enabled
-- Thumbnail loading is windowed around the current file (no full-folder eager decode)
-- Image decoding/downscaling is kept in the Rust core, UI stays thin
+- Thumbnails are loaded lazily and progressively, prioritizing visible items
+- Navigation preloads neighboring images to reduce next/previous latency
+- Image decoding/downscaling stays in Rust background workers, UI thread remains thin
 
 ## Run locally
 
@@ -35,10 +36,16 @@ Open a file directly:
 cargo run -- /absolute/path/to/photo.jpg
 ```
 
+Using the `justfile` helper:
+
+```bash
+just run --debug [--release] [/absolute/path/to/photo.jpg]
+```
+
 ## Notes
 
-- UI: Slint (`ui/app-window.slint`)
-- Core logic: Rust modules (`src/app_state.rs`, `src/image_io.rs`)
+- UI: egui/eframe (`src/main.rs`)
+- Core logic: Rust modules (`src/app_state.rs`, `src/image_io.rs`, `src/worker.rs`)
 - Supported formats come from the configured `image` crate codecs in `Cargo.toml`
 - Error handling: typed IO errors with `thiserror`, contextual propagation with `anyhow`
 

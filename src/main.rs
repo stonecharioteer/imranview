@@ -1,5 +1,7 @@
 mod app_state;
 mod image_io;
+#[cfg(target_os = "macos")]
+mod native_menu;
 mod perf;
 mod settings;
 mod worker;
@@ -13,6 +15,8 @@ use anyhow::{Result, anyhow};
 use eframe::egui;
 
 use crate::app_state::{AppState, ThumbnailEntry};
+#[cfg(target_os = "macos")]
+use crate::native_menu::{NativeMenu, NativeMenuAction};
 use crate::settings::{load_settings, save_settings};
 use crate::worker::{TransformOp, WorkerCommand, WorkerRequestKind, WorkerResult};
 
@@ -193,6 +197,8 @@ struct ImranViewApp {
     toolbar_icons: Option<ToolbarIcons>,
     last_logged_thumb_entry_count: Option<usize>,
     scroll_thumbnail_to_current: bool,
+    #[cfg(target_os = "macos")]
+    native_menu: Option<NativeMenu>,
 }
 
 impl ImranViewApp {
@@ -202,6 +208,17 @@ impl ImranViewApp {
         let (thumbnail_tx, thumbnail_rx) = mpsc::channel::<PathBuf>();
         let (worker_thread_tx, worker_rx) = mpsc::channel::<WorkerResult>();
         worker::spawn_workers(worker_thread_rx, thumbnail_rx, worker_thread_tx);
+        #[cfg(target_os = "macos")]
+        let native_menu = match NativeMenu::install() {
+            Ok(menu) => Some(menu),
+            Err(err) => {
+                log::warn!(
+                    target: "imranview::ui",
+                    "failed to install native macOS menu; falling back to in-window menu: {err:#}"
+                );
+                None
+            }
+        };
 
         let mut app = Self {
             state,
@@ -218,6 +235,8 @@ impl ImranViewApp {
             toolbar_icons: ToolbarIcons::try_load(&cc.egui_ctx),
             last_logged_thumb_entry_count: None,
             scroll_thumbnail_to_current: false,
+            #[cfg(target_os = "macos")]
+            native_menu,
         };
 
         if let Some(path) = cli_path {
@@ -723,6 +742,68 @@ impl ImranViewApp {
         }
     }
 
+    fn should_draw_in_window_menu(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            return self.native_menu.is_none();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_native_menu_events(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.native_menu.as_ref() else {
+            return;
+        };
+
+        menu.sync_state(&self.state);
+        let actions = menu.drain_actions();
+        for action in actions {
+            match action {
+                NativeMenuAction::Open => self.open_path_dialog(),
+                NativeMenuAction::Save => self.dispatch_save(None, false),
+                NativeMenuAction::SaveAs => self.open_save_as_dialog(),
+                NativeMenuAction::Exit => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                NativeMenuAction::RotateLeft => self.dispatch_transform(TransformOp::RotateLeft),
+                NativeMenuAction::RotateRight => self.dispatch_transform(TransformOp::RotateRight),
+                NativeMenuAction::FlipHorizontal => {
+                    self.dispatch_transform(TransformOp::FlipHorizontal);
+                }
+                NativeMenuAction::FlipVertical => {
+                    self.dispatch_transform(TransformOp::FlipVertical);
+                }
+                NativeMenuAction::ToggleShowToolbar => {
+                    self.state.set_show_toolbar(!self.state.show_toolbar());
+                    self.persist_settings();
+                }
+                NativeMenuAction::ToggleShowStatusBar => {
+                    self.state
+                        .set_show_status_bar(!self.state.show_status_bar());
+                    self.persist_settings();
+                }
+                NativeMenuAction::ToggleThumbnailStrip => {
+                    self.state
+                        .set_show_thumbnail_strip(!self.state.show_thumbnail_strip());
+                    self.persist_settings();
+                }
+                NativeMenuAction::ToggleThumbnailWindow => {
+                    self.state
+                        .set_thumbnails_window_mode(!self.state.thumbnails_window_mode());
+                    self.persist_settings();
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn handle_native_menu_events(&mut self, _ctx: &egui::Context) {}
+
     fn draw_menu(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -1181,9 +1262,12 @@ impl ImranViewApp {
 impl eframe::App for ImranViewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker_results(ctx);
+        self.handle_native_menu_events(ctx);
         self.run_shortcuts(ctx);
 
-        self.draw_menu(ctx);
+        if self.should_draw_in_window_menu() {
+            self.draw_menu(ctx);
+        }
         self.draw_toolbar(ctx);
         self.draw_thumbnail_strip(ctx);
 
