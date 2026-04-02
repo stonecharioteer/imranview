@@ -1,16 +1,18 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
-use slint::Image;
 
+use crate::image_io::LoadedImagePayload;
+#[cfg(test)]
 use crate::image_io::{
-    LoadedImage, collect_images_in_directory, load_image, load_thumbnail, refresh_loaded_image,
-    save_image,
+    collect_images_in_directory, load_image_payload, payload_from_working_image, save_image,
 };
+#[cfg(test)]
 use crate::perf::{
     EDIT_IMAGE_BUDGET, NAVIGATION_BUDGET, OPEN_IMAGE_BUDGET, SAVE_IMAGE_BUDGET, log_timing,
 };
@@ -21,14 +23,40 @@ const ZOOM_MAX: f32 = 16.0;
 const ZOOM_STEP_IN: f32 = 1.2;
 const ZOOM_STEP_OUT: f32 = 1.0 / ZOOM_STEP_IN;
 const THUMBNAIL_WINDOW_RADIUS_STRIP: usize = 90;
-const THUMBNAIL_DECODE_RADIUS_WINDOW_MODE: usize = 180;
+const THUMBNAIL_DECODE_RADIUS_STRIP: usize = 12;
+const THUMBNAIL_DECODE_RADIUS_WINDOW_MODE: usize = 36;
 
 #[derive(Clone)]
-pub struct ThumbnailView {
-    pub source_index: i32,
+pub struct ThumbnailEntry {
     pub label: String,
-    pub preview: Image,
+    pub path: PathBuf,
     pub current: bool,
+    pub decode_hint: bool,
+}
+
+#[derive(Clone)]
+pub struct LoadedImageState {
+    pub preview_rgba: Arc<[u8]>,
+    pub preview_width: u32,
+    pub preview_height: u32,
+    pub original_width: u32,
+    pub original_height: u32,
+    pub downscaled_for_preview: bool,
+    pub working_image: Arc<DynamicImage>,
+}
+
+impl LoadedImageState {
+    pub fn from_payload(payload: LoadedImagePayload) -> Self {
+        Self {
+            preview_rgba: Arc::from(payload.preview_rgba.into_boxed_slice()),
+            preview_width: payload.preview_width,
+            preview_height: payload.preview_height,
+            original_width: payload.original_width,
+            original_height: payload.original_height,
+            downscaled_for_preview: payload.downscaled_for_preview,
+            working_image: payload.working_image,
+        }
+    }
 }
 
 enum ZoomMode {
@@ -41,8 +69,7 @@ pub struct AppState {
     current_directory: Option<PathBuf>,
     images_in_directory: Vec<PathBuf>,
     current_index: Option<usize>,
-    current_image: Option<LoadedImage>,
-    thumbnail_cache: HashMap<PathBuf, Image>,
+    current_image: Option<LoadedImageState>,
     zoom_mode: ZoomMode,
     show_toolbar: bool,
     show_status_bar: bool,
@@ -52,6 +79,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::new_with_settings(PersistedSettings::default())
     }
@@ -72,7 +100,6 @@ impl AppState {
             images_in_directory: Vec::new(),
             current_index: None,
             current_image: None,
-            thumbnail_cache: HashMap::new(),
             zoom_mode: ZoomMode::Fit,
             show_toolbar: settings.show_toolbar,
             show_status_bar: settings.show_status_bar,
@@ -96,80 +123,97 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     pub fn open_image(&mut self, path: impl Into<PathBuf>) -> Result<()> {
         let started = Instant::now();
         let path = path.into();
-        let loaded = load_image(&path)?;
+        let payload = load_image_payload(&path)?;
         let directory = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let files = collect_images_in_directory(&directory)?;
-        self.reconcile_thumbnail_cache(&directory, &files);
 
-        let current_index = files
-            .iter()
-            .position(|candidate| same_path(candidate, &path));
-        self.current_file = Some(path);
-        self.current_directory = Some(directory);
-        self.images_in_directory = files;
-        self.current_index = current_index;
-        self.current_image = Some(loaded);
-        self.zoom_mode = ZoomMode::Fit;
-        self.prime_thumbnail_window();
-        self.last_error = None;
-
+        self.apply_open_payload(path, directory, files, payload);
         log_timing("open_image", started.elapsed(), OPEN_IMAGE_BUDGET);
         Ok(())
     }
 
+    pub fn apply_open_payload(
+        &mut self,
+        path: PathBuf,
+        directory: PathBuf,
+        files: Vec<PathBuf>,
+        payload: LoadedImagePayload,
+    ) {
+        let first_open = self.current_image.is_none();
+        let current_index = resolve_current_index(&files, &path);
+        log::debug!(
+            target: "imranview::state",
+            "apply_open_payload path={} files={} current_index={:?} first_open={}",
+            path.display(),
+            files.len(),
+            current_index,
+            first_open
+        );
+        self.current_file = Some(path);
+        self.current_directory = Some(directory);
+        self.images_in_directory = files;
+        self.current_index = current_index;
+        self.current_image = Some(LoadedImageState::from_payload(payload));
+        self.zoom_mode = ZoomMode::Fit;
+        self.last_error = None;
+        if first_open && !self.show_thumbnail_strip && !self.thumbnails_window_mode {
+            self.show_thumbnail_strip = true;
+        }
+    }
+
+    pub fn apply_transform_payload(&mut self, payload: LoadedImagePayload) -> Result<()> {
+        if self.current_image.is_none() {
+            anyhow::bail!("no image loaded")
+        }
+        self.current_image = Some(LoadedImageState::from_payload(payload));
+        self.last_error = None;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn open_next(&mut self) -> Result<()> {
         self.open_adjacent("navigate_next", 1)
     }
 
+    #[cfg(test)]
     pub fn open_previous(&mut self) -> Result<()> {
         self.open_adjacent("navigate_previous", -1)
     }
 
-    pub fn open_at_index(&mut self, index: i32) -> Result<()> {
-        if index < 0 {
-            anyhow::bail!("invalid image index");
-        }
-        let index = index as usize;
-        let path = self
-            .images_in_directory
-            .get(index)
-            .cloned()
-            .context("invalid image index")?;
-        self.open_image(path)
+    pub fn resolve_next_path(&self) -> Result<PathBuf> {
+        self.resolve_adjacent_path(1)
     }
 
-    pub fn save_current(&mut self) -> Result<()> {
-        let path = self
-            .current_file
-            .clone()
-            .context("no image loaded to save")?;
-        self.save_to_path(path, false)
+    pub fn resolve_previous_path(&self) -> Result<PathBuf> {
+        self.resolve_adjacent_path(-1)
     }
 
+    #[cfg(test)]
     pub fn save_current_as(&mut self, path: PathBuf) -> Result<()> {
         self.save_to_path(path, true)
     }
 
-    pub fn rotate_left(&mut self) -> Result<()> {
-        self.apply_edit("rotate_left", |image| image.rotate270())
-    }
-
+    #[cfg(test)]
     pub fn rotate_right(&mut self) -> Result<()> {
         self.apply_edit("rotate_right", |image| image.rotate90())
     }
 
-    pub fn flip_horizontal(&mut self) -> Result<()> {
-        self.apply_edit("flip_horizontal", |image| image.fliph())
+    pub fn current_working_image(&self) -> Result<Arc<DynamicImage>> {
+        self.current_image
+            .as_ref()
+            .map(|image| Arc::clone(&image.working_image))
+            .context("no image loaded")
     }
 
-    pub fn flip_vertical(&mut self) -> Result<()> {
-        self.apply_edit("flip_vertical", |image| image.flipv())
+    pub fn current_file_path(&self) -> Option<PathBuf> {
+        self.current_file.clone()
     }
 
     pub fn set_zoom_fit(&mut self) {
@@ -198,19 +242,25 @@ impl AppState {
         }
     }
 
-    pub fn toggle_toolbar(&mut self) {
-        self.show_toolbar = !self.show_toolbar;
+    pub fn set_show_toolbar(&mut self, show: bool) {
+        self.show_toolbar = show;
     }
 
-    pub fn toggle_status_bar(&mut self) {
-        self.show_status_bar = !self.show_status_bar;
+    pub fn set_show_status_bar(&mut self, show: bool) {
+        self.show_status_bar = show;
     }
 
     pub fn toggle_thumbnail_strip(&mut self) {
         self.show_thumbnail_strip = !self.show_thumbnail_strip;
         if self.show_thumbnail_strip {
             self.thumbnails_window_mode = false;
-            self.prime_thumbnail_window();
+        }
+    }
+
+    pub fn set_show_thumbnail_strip(&mut self, show: bool) {
+        self.show_thumbnail_strip = show;
+        if show {
+            self.thumbnails_window_mode = false;
         }
     }
 
@@ -218,7 +268,13 @@ impl AppState {
         self.thumbnails_window_mode = !self.thumbnails_window_mode;
         if self.thumbnails_window_mode {
             self.show_thumbnail_strip = false;
-            self.prime_thumbnail_window();
+        }
+    }
+
+    pub fn set_thumbnails_window_mode(&mut self, show: bool) {
+        self.thumbnails_window_mode = show;
+        if show {
+            self.show_thumbnail_strip = false;
         }
     }
 
@@ -263,27 +319,25 @@ impl AppState {
         self.last_error = Some(message.into());
     }
 
-    pub fn has_image(&self) -> bool {
-        self.current_image.is_some()
+    pub fn clear_error(&mut self) {
+        self.last_error = None;
     }
 
-    pub fn current_image(&self) -> Option<Image> {
-        self.current_image
-            .as_ref()
-            .map(|loaded| loaded.image.clone())
+    pub fn has_image(&self) -> bool {
+        self.current_image.is_some()
     }
 
     pub fn image_width(&self) -> f32 {
         self.current_image
             .as_ref()
-            .map(|image| image.width as f32)
+            .map(|image| image.preview_width as f32)
             .unwrap_or(0.0)
     }
 
     pub fn image_height(&self) -> f32 {
         self.current_image
             .as_ref()
-            .map(|image| image.height as f32)
+            .map(|image| image.preview_height as f32)
             .unwrap_or(0.0)
     }
 
@@ -313,7 +367,17 @@ impl AppState {
         }
     }
 
-    pub fn thumbnail_entries(&mut self) -> Vec<ThumbnailView> {
+    pub fn current_preview_rgba(&self) -> Option<(Arc<[u8]>, u32, u32)> {
+        self.current_image.as_ref().map(|image| {
+            (
+                Arc::clone(&image.preview_rgba),
+                image.preview_width,
+                image.preview_height,
+            )
+        })
+    }
+
+    pub fn thumbnail_entries(&self) -> Vec<ThumbnailEntry> {
         if !self.show_thumbnail_strip && !self.thumbnails_window_mode {
             return Vec::new();
         }
@@ -377,7 +441,10 @@ impl AppState {
             .as_ref()
             .map(|image| {
                 if image.downscaled_for_preview {
-                    format!("Preview: {} x {}", image.width, image.height)
+                    format!(
+                        "Preview: {} x {}",
+                        image.preview_width, image.preview_height
+                    )
                 } else {
                     "Original".to_owned()
                 }
@@ -413,28 +480,16 @@ impl AppState {
         match self.zoom_mode {
             ZoomMode::Fit => format!("{file_name} - ImranView"),
             ZoomMode::Manual(scale) => {
-                let zoom_w = (image.width as f32 * scale).max(1.0).round() as u32;
-                let zoom_h = (image.height as f32 * scale).max(1.0).round() as u32;
+                let zoom_w = (image.preview_width as f32 * scale).max(1.0).round() as u32;
+                let zoom_h = (image.preview_height as f32 * scale).max(1.0).round() as u32;
                 format!("{file_name} - ImranView (Zoom: {zoom_w} x {zoom_h})")
             }
         }
     }
 
+    #[cfg(test)]
     fn open_adjacent(&mut self, perf_label: &str, step: isize) -> Result<()> {
-        let Some(current_index) = self.current_index else {
-            anyhow::bail!("no image loaded");
-        };
-        let total = self.images_in_directory.len();
-        if total <= 1 {
-            return Ok(());
-        }
-
-        let next_index = wrapped_index(current_index, total, step);
-        let next_path = self
-            .images_in_directory
-            .get(next_index)
-            .cloned()
-            .context("failed to resolve adjacent image path")?;
+        let next_path = self.resolve_adjacent_path(step)?;
 
         let started = Instant::now();
         self.open_image(next_path)?;
@@ -442,13 +497,14 @@ impl AppState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn save_to_path(&mut self, path: PathBuf, switch_current_file: bool) -> Result<()> {
         let started = Instant::now();
         let loaded = self
             .current_image
             .as_ref()
             .context("no image loaded to save")?;
-        save_image(&path, &loaded.working_image)?;
+        save_image(&path, loaded.working_image.as_ref())?;
         log_timing("save_image", started.elapsed(), SAVE_IMAGE_BUDGET);
 
         if switch_current_file {
@@ -459,14 +515,16 @@ impl AppState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn apply_edit<F>(&mut self, perf_label: &str, transform: F) -> Result<()>
     where
         F: Fn(&DynamicImage) -> DynamicImage,
     {
         let started = Instant::now();
-        let loaded = self.current_image.as_mut().context("no image loaded")?;
-        loaded.working_image = transform(&loaded.working_image);
-        refresh_loaded_image(loaded);
+        let loaded = self.current_image.as_ref().context("no image loaded")?;
+        let transformed = transform(loaded.working_image.as_ref());
+        let payload = payload_from_working_image(Arc::new(transformed));
+        self.current_image = Some(LoadedImageState::from_payload(payload));
         self.last_error = None;
         log_timing(perf_label, started.elapsed(), EDIT_IMAGE_BUDGET);
         Ok(())
@@ -483,106 +541,68 @@ impl AppState {
         self.zoom_mode = ZoomMode::Manual((current * step_factor).clamp(ZOOM_MIN, ZOOM_MAX));
     }
 
-    fn thumbnail_entries_for_strip_mode(&mut self, current_index: usize) -> Vec<ThumbnailView> {
+    fn thumbnail_entries_for_strip_mode(&self, current_index: usize) -> Vec<ThumbnailEntry> {
         let total = self.images_in_directory.len();
         let start = current_index.saturating_sub(THUMBNAIL_WINDOW_RADIUS_STRIP);
         let end = (current_index + THUMBNAIL_WINDOW_RADIUS_STRIP + 1).min(total);
         let mut items = Vec::with_capacity(end.saturating_sub(start));
 
         for index in start..end {
-            items.push(self.make_thumbnail_view(index, true, current_index));
+            items.push(self.make_thumbnail_entry(
+                index,
+                current_index,
+                THUMBNAIL_DECODE_RADIUS_STRIP,
+            ));
         }
         items
     }
 
-    fn thumbnail_entries_for_window_mode(&mut self, current_index: usize) -> Vec<ThumbnailView> {
+    fn thumbnail_entries_for_window_mode(&self, current_index: usize) -> Vec<ThumbnailEntry> {
         let mut items = Vec::with_capacity(self.images_in_directory.len());
         for index in 0..self.images_in_directory.len() {
-            let decode_now = index.abs_diff(current_index) <= THUMBNAIL_DECODE_RADIUS_WINDOW_MODE;
-            items.push(self.make_thumbnail_view(index, decode_now, current_index));
+            items.push(self.make_thumbnail_entry(
+                index,
+                current_index,
+                THUMBNAIL_DECODE_RADIUS_WINDOW_MODE,
+            ));
         }
         items
     }
 
-    fn make_thumbnail_view(
-        &mut self,
+    fn make_thumbnail_entry(
+        &self,
         index: usize,
-        decode_now: bool,
         current_index: usize,
-    ) -> ThumbnailView {
+        decode_radius: usize,
+    ) -> ThumbnailEntry {
         let path = self.images_in_directory[index].clone();
-        let preview = self
-            .thumbnail_cache
-            .get(&path)
-            .cloned()
-            .or_else(|| {
-                if !decode_now {
-                    return None;
-                }
-                match load_thumbnail(&path) {
-                    Ok(thumbnail) => {
-                        self.thumbnail_cache.insert(path.clone(), thumbnail.clone());
-                        Some(thumbnail)
-                    }
-                    Err(_) => None,
-                }
-            })
-            .unwrap_or_default();
-
         let label = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
 
-        ThumbnailView {
-            source_index: index as i32,
+        ThumbnailEntry {
             label,
-            preview,
+            path,
             current: index == current_index,
+            decode_hint: index.abs_diff(current_index) <= decode_radius,
         }
     }
 
-    fn prime_thumbnail_window(&mut self) {
+    fn resolve_adjacent_path(&self, step: isize) -> Result<PathBuf> {
         let Some(current_index) = self.current_index else {
-            return;
+            anyhow::bail!("no image loaded");
         };
-
-        let decode_radius = if self.thumbnails_window_mode {
-            THUMBNAIL_DECODE_RADIUS_WINDOW_MODE
-        } else if self.show_thumbnail_strip {
-            THUMBNAIL_WINDOW_RADIUS_STRIP
-        } else {
-            return;
-        };
-
-        let start = current_index.saturating_sub(decode_radius);
-        let end = (current_index + decode_radius + 1).min(self.images_in_directory.len());
-
-        for index in start..end {
-            let path = self.images_in_directory[index].clone();
-            if self.thumbnail_cache.contains_key(&path) {
-                continue;
-            }
-            if let Ok(thumbnail) = load_thumbnail(&path) {
-                self.thumbnail_cache.insert(path, thumbnail);
-            }
-        }
-    }
-
-    fn reconcile_thumbnail_cache(&mut self, directory: &Path, files: &[PathBuf]) {
-        let same_directory = self
-            .current_directory
-            .as_ref()
-            .map(|current| same_path(current, directory))
-            .unwrap_or(false);
-
-        if !same_directory {
-            self.thumbnail_cache.clear();
-            return;
+        let total = self.images_in_directory.len();
+        if total == 0 {
+            anyhow::bail!("no image loaded");
         }
 
-        self.thumbnail_cache
-            .retain(|cached_path, _| files.iter().any(|path| same_path(cached_path, path)));
+        let next_index = wrapped_index(current_index, total, step);
+        self.images_in_directory
+            .get(next_index)
+            .cloned()
+            .context("failed to resolve adjacent image path")
     }
 }
 
@@ -594,6 +614,27 @@ fn wrapped_index(current: usize, len: usize, step: isize) -> usize {
     let len = len as isize;
     let next = (current as isize + step).rem_euclid(len);
     next as usize
+}
+
+fn resolve_current_index(files: &[PathBuf], path: &Path) -> Option<usize> {
+    files
+        .iter()
+        .position(|candidate| candidate == path)
+        .or_else(|| {
+            files
+                .iter()
+                .position(|candidate| same_path(candidate, path))
+        })
+        .or_else(|| {
+            let target_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+            files.iter().position(|candidate| {
+                candidate
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_ascii_lowercase() == target_name)
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| (!files.is_empty()).then_some(0))
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {

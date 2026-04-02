@@ -32,8 +32,9 @@ pub fn load_settings() -> PersistedSettings {
         Ok(json) => match serde_json::from_str::<PersistedSettings>(&json) {
             Ok(settings) => settings,
             Err(error) => {
-                eprintln!(
-                    "[settings] invalid settings JSON at {}: {error}",
+                log::warn!(
+                    target: "imranview::settings",
+                    "invalid settings JSON at {}: {error}",
                     path.display()
                 );
                 PersistedSettings::default()
@@ -41,7 +42,11 @@ pub fn load_settings() -> PersistedSettings {
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedSettings::default(),
         Err(error) => {
-            eprintln!("[settings] failed to read {}: {error}", path.display());
+            log::warn!(
+                target: "imranview::settings",
+                "failed to read {}: {error}",
+                path.display()
+            );
             PersistedSettings::default()
         }
     }

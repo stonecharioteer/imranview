@@ -13,6 +13,7 @@ pub const OPEN_IMAGE_BUDGET: PerfBudget = PerfBudget {
     target_ms: 150,
     threshold_ms: 300,
 };
+#[cfg(test)]
 pub const NAVIGATION_BUDGET: PerfBudget = PerfBudget {
     target_ms: 90,
     threshold_ms: 180,
@@ -28,16 +29,29 @@ pub const EDIT_IMAGE_BUDGET: PerfBudget = PerfBudget {
 
 pub fn log_timing(label: &str, elapsed: Duration, budget: PerfBudget) {
     let elapsed_ms = elapsed.as_millis();
-    let level = if elapsed_ms > budget.threshold_ms {
-        "WARN"
+    if elapsed_ms > budget.threshold_ms {
+        log::warn!(
+            target: "imranview::perf",
+            "[WARN] {label}={}ms (target={}ms threshold={}ms)",
+            elapsed_ms,
+            budget.target_ms,
+            budget.threshold_ms
+        );
     } else if elapsed_ms > budget.target_ms {
-        "SLOW"
+        log::info!(
+            target: "imranview::perf",
+            "[SLOW] {label}={}ms (target={}ms threshold={}ms)",
+            elapsed_ms,
+            budget.target_ms,
+            budget.threshold_ms
+        );
     } else {
-        "OK"
-    };
-
-    eprintln!(
-        "[perf][{level}] {label}={}ms (target={}ms threshold={}ms)",
-        elapsed_ms, budget.target_ms, budget.threshold_ms
-    );
+        log::debug!(
+            target: "imranview::perf",
+            "[OK] {label}={}ms (target={}ms threshold={}ms)",
+            elapsed_ms,
+            budget.target_ms,
+            budget.threshold_ms
+        );
+    }
 }

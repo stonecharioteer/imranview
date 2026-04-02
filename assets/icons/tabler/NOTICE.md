@@ -13,4 +13,7 @@ Downloaded icons:
 - `maximize.svg`
 - `photo.svg`
 
+Derived assets:
+- `png/*.png` are rasterized derivatives of the SVG files above.
+
 See `LICENSE` in this directory for the full license text.

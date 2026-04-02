@@ -1,12 +1,12 @@
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use exif::{In, Tag};
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageReader};
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 use thiserror::Error;
 
 pub type ImageIoResult<T> = std::result::Result<T, ImageIoError>;
@@ -39,14 +39,20 @@ pub enum ImageIoError {
     },
 }
 
-pub struct LoadedImage {
-    pub image: Image,
-    pub width: u32,
-    pub height: u32,
+pub struct LoadedImagePayload {
+    pub preview_rgba: Vec<u8>,
+    pub preview_width: u32,
+    pub preview_height: u32,
     pub original_width: u32,
     pub original_height: u32,
     pub downscaled_for_preview: bool,
-    pub working_image: DynamicImage,
+    pub working_image: Arc<DynamicImage>,
+}
+
+pub struct ThumbnailPayload {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
@@ -56,24 +62,41 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
 const PREVIEW_MAX_DIMENSION: u32 = 4096;
 const THUMBNAIL_MAX_DIMENSION: u32 = 192;
 
-pub fn load_image(path: &Path) -> ImageIoResult<LoadedImage> {
+pub fn load_image_payload(path: &Path) -> ImageIoResult<LoadedImagePayload> {
     let working_image = decode_oriented_image(path).map_err(|source| ImageIoError::LoadImage {
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(build_loaded_image(working_image))
+    Ok(payload_from_working_image(Arc::new(working_image)))
 }
 
-pub fn refresh_loaded_image(loaded: &mut LoadedImage) {
-    let (image, width, height, downscaled_for_preview) =
-        render_preview_image(&loaded.working_image);
-    let (original_width, original_height) = loaded.working_image.dimensions();
-    loaded.image = image;
-    loaded.width = width;
-    loaded.height = height;
-    loaded.original_width = original_width;
-    loaded.original_height = original_height;
-    loaded.downscaled_for_preview = downscaled_for_preview;
+pub fn payload_from_working_image(working_image: Arc<DynamicImage>) -> LoadedImagePayload {
+    let (preview_rgba, preview_width, preview_height, downscaled_for_preview) =
+        render_preview_rgba(working_image.as_ref());
+    let (original_width, original_height) = working_image.dimensions();
+    LoadedImagePayload {
+        preview_rgba,
+        preview_width,
+        preview_height,
+        original_width,
+        original_height,
+        downscaled_for_preview,
+        working_image,
+    }
+}
+
+pub fn load_thumbnail_payload(path: &Path) -> ImageIoResult<ThumbnailPayload> {
+    let oriented = decode_oriented_image(path).map_err(|source| ImageIoError::LoadThumbnail {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let thumbnail = oriented.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
+    let (rgba, width, height) = to_rgba_bytes(&thumbnail);
+    Ok(ThumbnailPayload {
+        rgba,
+        width,
+        height,
+    })
 }
 
 pub fn save_image(path: &Path, image: &DynamicImage) -> ImageIoResult<()> {
@@ -84,16 +107,6 @@ pub fn save_image(path: &Path, image: &DynamicImage) -> ImageIoResult<()> {
             path: path.to_path_buf(),
             source,
         })
-}
-
-pub fn load_thumbnail(path: &Path) -> ImageIoResult<Image> {
-    let oriented = decode_oriented_image(path).map_err(|source| ImageIoError::LoadThumbnail {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let thumbnail = oriented.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
-    let (image, _, _) = to_slint_image(&thumbnail);
-    Ok(image)
 }
 
 pub fn collect_images_in_directory(dir: &Path) -> ImageIoResult<Vec<PathBuf>> {
@@ -132,20 +145,6 @@ pub fn is_supported_image_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_loaded_image(working_image: DynamicImage) -> LoadedImage {
-    let (image, width, height, downscaled_for_preview) = render_preview_image(&working_image);
-    let (original_width, original_height) = working_image.dimensions();
-    LoadedImage {
-        image,
-        width,
-        height,
-        original_width,
-        original_height,
-        downscaled_for_preview,
-        working_image,
-    }
-}
-
 fn decode_oriented_image(path: &Path) -> Result<DynamicImage> {
     let decoded = ImageReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
@@ -157,7 +156,7 @@ fn decode_oriented_image(path: &Path) -> Result<DynamicImage> {
     Ok(apply_exif_orientation(path, decoded))
 }
 
-fn render_preview_image(image: &DynamicImage) -> (Image, u32, u32, bool) {
+fn render_preview_rgba(image: &DynamicImage) -> (Vec<u8>, u32, u32, bool) {
     let (width, height) = image.dimensions();
     let max_dimension = width.max(height);
     if max_dimension > PREVIEW_MAX_DIMENSION {
@@ -166,19 +165,18 @@ fn render_preview_image(image: &DynamicImage) -> (Image, u32, u32, bool) {
             PREVIEW_MAX_DIMENSION,
             FilterType::Triangle,
         );
-        let (img, w, h) = to_slint_image(&preview);
-        return (img, w, h, true);
+        let (rgba, w, h) = to_rgba_bytes(&preview);
+        return (rgba, w, h, true);
     }
 
-    let (img, w, h) = to_slint_image(image);
-    (img, w, h, false)
+    let (rgba, w, h) = to_rgba_bytes(image);
+    (rgba, w, h, false)
 }
 
-fn to_slint_image(image: &DynamicImage) -> (Image, u32, u32) {
+fn to_rgba_bytes(image: &DynamicImage) -> (Vec<u8>, u32, u32) {
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
-    let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(rgba.as_raw(), width, height);
-    (Image::from_rgba8(buffer), width, height)
+    (rgba.into_raw(), width, height)
 }
 
 fn apply_exif_orientation(path: &Path, image: DynamicImage) -> DynamicImage {
