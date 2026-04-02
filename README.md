@@ -1,6 +1,6 @@
 # ImranView
 
-![ImranView Favicon](assets/branding/favicon.png)
+<img src="assets/branding/favicon.png" alt="ImranView Favicon" width="160" />
 
 ImranView is a native, cross-platform, lightweight image viewer built with Rust + egui/eframe.
 

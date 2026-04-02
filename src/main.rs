@@ -209,6 +209,7 @@ struct ImranViewApp {
     last_logged_thumb_entry_count: Option<usize>,
     scroll_thumbnail_to_current: bool,
     show_about_window: bool,
+    center_about_window_next_frame: bool,
     #[cfg(target_os = "macos")]
     native_menu: Option<NativeMenu>,
 }
@@ -254,6 +255,7 @@ impl ImranViewApp {
             last_logged_thumb_entry_count: None,
             scroll_thumbnail_to_current: false,
             show_about_window: false,
+            center_about_window_next_frame: false,
             #[cfg(target_os = "macos")]
             native_menu,
         };
@@ -763,6 +765,7 @@ impl ImranViewApp {
 
     fn open_about_window(&mut self) {
         self.show_about_window = true;
+        self.center_about_window_next_frame = true;
     }
 
     fn should_draw_in_window_menu(&self) -> bool {
@@ -1217,18 +1220,29 @@ impl ImranViewApp {
     }
 
     fn draw_thumbnail_image(&mut self, ui: &mut egui::Ui, entry: &ThumbnailEntry) {
+        let max_size = egui::vec2(THUMB_CARD_WIDTH - 8.0, THUMB_CARD_HEIGHT - 8.0);
         if let Some(texture) = self.thumb_cache.get(&entry.path) {
-            let image_size = egui::vec2(THUMB_CARD_WIDTH - 8.0, THUMB_CARD_HEIGHT - 8.0);
-            ui.add(egui::Image::new((texture.id(), image_size)));
+            let [tex_w, tex_h] = texture.size();
+            let tex_w = tex_w as f32;
+            let tex_h = tex_h as f32;
+            let scale = if tex_w > 0.0 && tex_h > 0.0 {
+                (max_size.x / tex_w).min(max_size.y / tex_h).max(0.01)
+            } else {
+                1.0
+            };
+            let image_size = egui::vec2((tex_w * scale).max(1.0), (tex_h * scale).max(1.0));
+
+            ui.allocate_ui(max_size, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.add(egui::Image::new((texture.id(), image_size)));
+                });
+            });
         } else {
-            ui.allocate_ui(
-                egui::vec2(THUMB_CARD_WIDTH - 8.0, THUMB_CARD_HEIGHT - 8.0),
-                |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("...");
-                    });
-                },
-            );
+            ui.allocate_ui(max_size, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label("...");
+                });
+            });
         }
     }
 
@@ -1271,41 +1285,55 @@ impl ImranViewApp {
         }
 
         let mut open = self.show_about_window;
-        egui::Window::new("About ImranView")
+        let mut window = egui::Window::new("About ImranView")
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(icon) = &self.about_icon_texture {
-                        ui.add(egui::Image::new((icon.id(), egui::vec2(64.0, 64.0))));
-                    }
-                    ui.vertical(|ui| {
-                        ui.heading("ImranView");
-                        ui.label("Imran, brother of Irfan");
-                        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                    });
-                });
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Twitter:");
-                    ui.hyperlink_to("@stonecharioteer", "https://twitter.com/stonecharioteer");
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Website:");
-                    ui.hyperlink_to(
-                        "tech.stonecharioteer.com",
-                        "https://tech.stonecharioteer.com",
-                    );
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Source:");
-                    ui.hyperlink_to(
-                        "github.com/stonecharioteer/imranview",
-                        "https://github.com/stonecharioteer/imranview",
-                    );
+            .resizable(false);
+
+        if self.center_about_window_next_frame {
+            window = window.anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO);
+            self.center_about_window_next_frame = false;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // Keep the popup frame subtle on macOS to avoid heavy non-native looking borders.
+            let frame = egui::Frame::window(&ctx.style())
+                .stroke(egui::Stroke::new(0.5, egui::Color32::from_gray(110)));
+            window = window.frame(frame);
+        }
+
+        window.show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(icon) = &self.about_icon_texture {
+                    ui.add(egui::Image::new((icon.id(), egui::vec2(64.0, 64.0))));
+                }
+                ui.vertical(|ui| {
+                    ui.heading("ImranView");
+                    ui.label("Imran, brother of Irfan");
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 });
             });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Twitter:");
+                ui.hyperlink_to("@stonecharioteer", "https://twitter.com/stonecharioteer");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Website:");
+                ui.hyperlink_to(
+                    "tech.stonecharioteer.com",
+                    "https://tech.stonecharioteer.com",
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Source:");
+                ui.hyperlink_to(
+                    "github.com/stonecharioteer/imranview",
+                    "https://github.com/stonecharioteer/imranview",
+                );
+            });
+        });
 
         self.show_about_window = open;
     }
