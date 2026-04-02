@@ -8,6 +8,8 @@ const ID_FILE_OPEN: &str = "menu.file.open";
 const ID_FILE_SAVE: &str = "menu.file.save";
 const ID_FILE_SAVE_AS: &str = "menu.file.save_as";
 const ID_FILE_EXIT: &str = "menu.file.exit";
+const ID_APP_ABOUT: &str = "menu.app.about";
+const ID_HELP_ABOUT: &str = "menu.help.about";
 const ID_EDIT_ROTATE_LEFT: &str = "menu.edit.rotate_left";
 const ID_EDIT_ROTATE_RIGHT: &str = "menu.edit.rotate_right";
 const ID_EDIT_FLIP_HORIZONTAL: &str = "menu.edit.flip_horizontal";
@@ -19,6 +21,7 @@ const ID_VIEW_SHOW_THUMBNAIL_WINDOW: &str = "menu.view.show_thumbnail_window";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeMenuAction {
+    About,
     Open,
     Save,
     SaveAs,
@@ -54,9 +57,10 @@ impl NativeMenu {
         let app_menu = Submenu::new("App", true);
         menu.append(&app_menu)
             .context("failed to append App menu")?;
+        let app_about = MenuItem::with_id(ID_APP_ABOUT, "About ImranView", true, None);
         app_menu
             .append_items(&[
-                &PredefinedMenuItem::about(Some("About ImranView"), None),
+                &app_about,
                 &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::services(None),
                 &PredefinedMenuItem::separator(),
@@ -172,8 +176,9 @@ impl NativeMenu {
         let help_menu = Submenu::new("Help", true);
         menu.append(&help_menu)
             .context("failed to append Help menu")?;
+        let help_about = MenuItem::with_id(ID_HELP_ABOUT, "About ImranView", true, None);
         help_menu
-            .append_items(&[&PredefinedMenuItem::about(Some("About ImranView"), None)])
+            .append_items(&[&help_about])
             .context("failed to populate Help menu")?;
         help_menu.set_as_help_menu_for_nsapp();
 
@@ -216,6 +221,7 @@ impl NativeMenu {
         let mut actions = Vec::new();
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let action = match event.id.as_ref() {
+                ID_APP_ABOUT | ID_HELP_ABOUT => Some(NativeMenuAction::About),
                 ID_FILE_OPEN => Some(NativeMenuAction::Open),
                 ID_FILE_SAVE => Some(NativeMenuAction::Save),
                 ID_FILE_SAVE_AS => Some(NativeMenuAction::SaveAs),

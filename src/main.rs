@@ -24,6 +24,7 @@ const THUMB_TEXTURE_CACHE_CAP: usize = 320;
 const THUMB_CARD_WIDTH: f32 = 120.0;
 const THUMB_CARD_HEIGHT: f32 = 100.0;
 const TOOLBAR_ICON_SIZE: f32 = 18.0;
+const APP_FAVICON_PNG: &[u8] = include_bytes!("../assets/branding/favicon.png");
 
 #[derive(Clone)]
 struct ToolbarIcons {
@@ -98,18 +99,27 @@ impl ToolbarIcons {
 }
 
 fn load_toolbar_icon(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Result<egui::TextureHandle> {
+    load_png_texture(ctx, &format!("toolbar-{name}"), bytes)
+}
+
+fn load_png_texture(
+    ctx: &egui::Context,
+    texture_name: &str,
+    bytes: &[u8],
+) -> Result<egui::TextureHandle> {
     let image = image::load_from_memory(bytes)
-        .map_err(|err| anyhow!("failed to decode toolbar icon {name}: {err}"))?;
+        .map_err(|err| anyhow!("failed to decode texture {texture_name}: {err}"))?;
     let rgba = image.to_rgba8();
     let width = rgba.width() as usize;
     let height = rgba.height() as usize;
     let pixels = rgba.into_raw();
     let color = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
-    Ok(ctx.load_texture(
-        format!("toolbar-{name}"),
-        color,
-        egui::TextureOptions::LINEAR,
-    ))
+    Ok(ctx.load_texture(texture_name.to_owned(), color, egui::TextureOptions::LINEAR))
+}
+
+fn load_app_icon_data(bytes: &[u8]) -> Result<egui::IconData> {
+    eframe::icon_data::from_png_bytes(bytes)
+        .map_err(|err| anyhow!("failed to decode app icon PNG bytes: {err}"))
 }
 
 #[derive(Default)]
@@ -195,8 +205,10 @@ struct ImranViewApp {
     inflight_thumbnails: HashSet<PathBuf>,
     inflight_preloads: HashSet<PathBuf>,
     toolbar_icons: Option<ToolbarIcons>,
+    about_icon_texture: Option<egui::TextureHandle>,
     last_logged_thumb_entry_count: Option<usize>,
     scroll_thumbnail_to_current: bool,
+    show_about_window: bool,
     #[cfg(target_os = "macos")]
     native_menu: Option<NativeMenu>,
 }
@@ -233,8 +245,15 @@ impl ImranViewApp {
             inflight_thumbnails: HashSet::new(),
             inflight_preloads: HashSet::new(),
             toolbar_icons: ToolbarIcons::try_load(&cc.egui_ctx),
+            about_icon_texture: load_png_texture(&cc.egui_ctx, "about-favicon", APP_FAVICON_PNG)
+                .map_err(|err| {
+                    log::warn!(target: "imranview::ui", "failed to load about favicon texture: {err:#}");
+                    err
+                })
+                .ok(),
             last_logged_thumb_entry_count: None,
             scroll_thumbnail_to_current: false,
+            show_about_window: false,
             #[cfg(target_os = "macos")]
             native_menu,
         };
@@ -742,6 +761,10 @@ impl ImranViewApp {
         }
     }
 
+    fn open_about_window(&mut self) {
+        self.show_about_window = true;
+    }
+
     fn should_draw_in_window_menu(&self) -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -764,6 +787,7 @@ impl ImranViewApp {
         let actions = menu.drain_actions();
         for action in actions {
             match action {
+                NativeMenuAction::About => self.open_about_window(),
                 NativeMenuAction::Open => self.open_path_dialog(),
                 NativeMenuAction::Save => self.dispatch_save(None, false),
                 NativeMenuAction::SaveAs => self.open_save_as_dialog(),
@@ -892,6 +916,13 @@ impl ImranViewApp {
                     {
                         self.state.set_thumbnails_window_mode(show_thumbnail_window);
                         self.persist_settings();
+                    }
+                });
+
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About ImranView").clicked() {
+                        self.open_about_window();
+                        ui.close_menu();
                     }
                 });
             });
@@ -1234,6 +1265,51 @@ impl ImranViewApp {
         });
     }
 
+    fn draw_about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about_window {
+            return;
+        }
+
+        let mut open = self.show_about_window;
+        egui::Window::new("About ImranView")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(icon) = &self.about_icon_texture {
+                        ui.add(egui::Image::new((icon.id(), egui::vec2(64.0, 64.0))));
+                    }
+                    ui.vertical(|ui| {
+                        ui.heading("ImranView");
+                        ui.label("Imran, brother of Irfan");
+                        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    });
+                });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Twitter:");
+                    ui.hyperlink_to("@stonecharioteer", "https://twitter.com/stonecharioteer");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Website:");
+                    ui.hyperlink_to(
+                        "tech.stonecharioteer.com",
+                        "https://tech.stonecharioteer.com",
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Source:");
+                    ui.hyperlink_to(
+                        "github.com/stonecharioteer/imranview",
+                        "https://github.com/stonecharioteer/imranview",
+                    );
+                });
+            });
+
+        self.show_about_window = open;
+    }
+
     fn draw_status_bar(&mut self, ctx: &egui::Context) {
         if !self.state.show_status_bar() {
             return;
@@ -1278,6 +1354,7 @@ impl eframe::App for ImranViewApp {
         }
 
         self.draw_status_bar(ctx);
+        self.draw_about_window(ctx);
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.state.window_title()));
 
@@ -1299,7 +1376,15 @@ fn main() -> Result<()> {
     let cli_path = std::env::args_os().nth(1).map(PathBuf::from);
     log::info!(target: "imranview::startup", "launching ImranView");
 
-    let native_options = eframe::NativeOptions::default();
+    let mut native_options = eframe::NativeOptions::default();
+    match load_app_icon_data(APP_FAVICON_PNG) {
+        Ok(icon_data) => {
+            native_options.viewport = native_options.viewport.with_icon(icon_data);
+        }
+        Err(err) => {
+            log::warn!(target: "imranview::startup", "failed to load app icon: {err:#}");
+        }
+    }
     eframe::run_native(
         "ImranView",
         native_options,

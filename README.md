@@ -1,5 +1,7 @@
 # ImranView
 
+![ImranView Favicon](assets/branding/favicon.png)
+
 ImranView is a native, cross-platform, lightweight image viewer built with Rust + egui/eframe.
 
 ## Current status
