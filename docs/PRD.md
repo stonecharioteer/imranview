@@ -68,6 +68,10 @@ P4. Incremental complexity:
 - Ship practical utility first.
 - Delay niche features until performance budget is protected.
 
+P5. Responsive interaction model:
+- UI input handlers must stay non-blocking.
+- Any expensive open/save/edit/thumbnail work runs on background workers.
+
 ## 6) Current state snapshot
 
 Implemented:
@@ -109,6 +113,14 @@ These budgets are release gates, not aspirational.
 - Release binary size (stripped):
   - Target: <= 35 MB per platform package payload.
 
+### 7.1) Non-negotiable responsiveness and lightweight rules
+
+- Any feature that causes sustained UI stutter or input lag is a release blocker.
+- Heavy actions (`open`, `save`, edits, thumbnail decode) must not run on the UI thread.
+- Thumbnail/cache memory must be bounded with explicit caps and eviction policy.
+- If any threshold budget is exceeded in validation runs, release is blocked until fixed.
+- Performance regressions must be detected automatically in CI/perf smoke checks.
+
 ## 8) Feature backlog and priority
 
 Legend:
@@ -142,6 +154,9 @@ Legend:
 | F-023 | Printing flow | P2 | Missing | Optional for first public milestone |
 | F-024 | Compare images mode | P2 | Missing | Split or side-by-side |
 | F-025 | Plugin extension points | P2 | Missing | Internal extension API first |
+| F-026 | Background command execution pipeline | P0 | Missing | Button/menu actions dispatch to worker queue; UI thread stays responsive |
+| F-027 | Bounded cache and memory governor | P0 | Missing | Enforce thumbnail/decode cache caps with deterministic eviction |
+| F-028 | Automated performance regression gate | P0 | Missing | CI/perf smoke checks fail on budget regressions |
 
 ## 9) Detailed requirements by epic
 
@@ -153,6 +168,7 @@ Requirements:
 - A3: Next/previous must wrap at boundaries.
 - A4: Display current index (`x/y`) in toolbar and status.
 - A5: Gracefully handle unsupported/corrupt files without crash.
+- A6: Button/menu-triggered heavy operations execute asynchronously off the UI thread.
 
 Acceptance criteria:
 - AC-A1: `cargo run -- /path/file.jpg` opens directly.
@@ -160,6 +176,8 @@ Acceptance criteria:
 - AC-A3: Last image next -> first image; first image previous -> last image.
 - AC-A4: Counter updates within one frame after navigation.
 - AC-A5: Error shown in status, app remains interactive.
+- AC-A6: During open/save/edit on large images, window repaint and input remain responsive.
+- AC-A7: Repeated rapid button presses do not freeze UI; stale work can be cancelled or ignored safely.
 
 ## Epic B: Zoom, pan, and viewport behavior (P0)
 
@@ -184,12 +202,15 @@ Requirements:
 - C3: Windowed prefetch near current index only.
 - C4: Click thumbnail opens corresponding file.
 - C5: Dedicated Thumbnails window (separate layout mode).
+- C6: Thumbnail decode jobs run in cancellable background workers.
 
 Acceptance criteria:
 - AC-C1: Enabling strip does not decode all folder files immediately.
 - AC-C2: Switching through large folders does not stall UI thread.
 - AC-C3: Selecting thumbnail updates main viewer and status correctly.
 - AC-C4: Thumbnails window supports grid and directory tree basics.
+- AC-C5: Rapid scroll in thumbnails view can drop stale decode tasks without locking input.
+- AC-C6: Thumbnail cache stays within configured bounds during long folder browsing sessions.
 
 ## Epic D: Classic desktop UX parity (P0/P1)
 
@@ -239,11 +260,15 @@ Requirements:
 - G2: Basic automated tests for state and image IO.
 - G3: Packaging scripts for Linux/macOS/Windows.
 - G4: Crash-safe config and cache writes.
+- G5: Concurrency model for UI commands is explicit and test-covered.
+- G6: Performance gate automation exists for startup/open/navigation latency and memory.
 
 Acceptance criteria:
 - AC-G1: Release candidates build on all 3 platforms.
 - AC-G2: Regression tests cover navigation order, wrap logic, zoom state, and error handling.
 - AC-G3: User can install and launch without Rust toolchain.
+- AC-G4: Tests validate command queue ordering, cancellation, and no UI deadlock under repeated commands.
+- AC-G5: CI/perf checks fail build when thresholds are exceeded.
 
 ## 10) Milestone plan
 
@@ -265,7 +290,8 @@ Milestone M3: Public preview (2-3 weeks)
 
 - Keep decode/transforms in Rust core modules.
 - Keep UI state synchronization explicit (single refresh pipeline).
-- Avoid long-running heavy work on UI thread; background decode jobs where needed.
+- Route heavy user actions through a background command queue (worker threads + result channel).
+- UI thread only dispatches commands and applies completed results.
 - Maintain typed domain errors (`thiserror`) and contextual propagation (`anyhow`).
 
 ## 12) Risks and mitigations
@@ -289,6 +315,8 @@ A feature is done only when all conditions hold:
 - Error paths handled with clear user feedback.
 - Unit/integration tests added where practical.
 - Measured against relevant performance budget.
+- Verified to keep UI responsive under repeated/rapid user actions.
+- Memory and cache behavior validated against configured caps.
 - Documented in README/changelog.
 
 ## 14) Immediate execution checklist
@@ -301,3 +329,6 @@ A feature is done only when all conditions hold:
 - [ ] Add recent files/recent folders.
 - [ ] Add performance timing logs for startup/open/navigation.
 - [ ] Add tests for navigation wrap, zoom state transitions, and error recovery.
+- [ ] Implement background command queue so open/save/edit/thumbnail decode do not block UI input.
+- [ ] Add bounded thumbnail/decode cache policy with configurable limits and eviction.
+- [ ] Add CI perf smoke checks that gate on startup/open/navigation/memory thresholds.
