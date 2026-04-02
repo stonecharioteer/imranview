@@ -1,0 +1,591 @@
+import { ScrollView } from "std-widgets.slint";
+
+export struct ThumbnailItem {
+    source_index: int,
+    label: string,
+    preview: image,
+    current: bool,
+}
+
+component StatusCell inherits Rectangle {
+    in property <string> cell-text;
+    in property <color> cell-background: #efefef;
+    border-width: 1px;
+    border-color: #9c9c9c;
+    background: cell-background;
+
+    Text {
+        text: parent.cell-text;
+        x: 4px;
+        width: parent.width - 8px;
+        height: parent.height;
+        color: #111111;
+        font-size: 12px;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+component ToolbarIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <bool> enabled: true;
+    in property <bool> checked: false;
+    callback clicked();
+
+    width: 28px;
+    height: 24px;
+    border-width: 1px;
+    border-color: #8f8f8f;
+    background: !enabled ? #d6d2ca : checked ? #c5ddff : touch.pressed ? #c9defb : touch.has-hover ? #d9e8fb : #e6e2db;
+    opacity: enabled ? 1.0 : 0.45;
+
+    Image {
+        source: root.icon;
+        width: 16px;
+        height: 16px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        image-fit: contain;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component AppWindow inherits Window {
+    in property <string> window-title: "ImranView";
+    in property <image> current-image;
+    in property <bool> has-image: false;
+    in property <float> image-width: 0.0;
+    in property <float> image-height: 0.0;
+    in property <bool> zoom-fit: true;
+    in property <float> zoom-factor: 1.0;
+    in property <string> zoom-label: "Fit";
+    in property <string> image-counter-label: "0/0";
+    in property <bool> show-toolbar: true;
+    in property <bool> show-status-bar: true;
+    in property <bool> show-thumbnail-strip: false;
+    in property <bool> thumbnails-window-mode: false;
+    in property <string> folder-label: "No folder loaded";
+    in property <string> status-dimensions: "Open image...";
+    in property <string> status-index: "";
+    in property <string> status-zoom: "";
+    in property <string> status-size: "";
+    in property <string> status-preview: "";
+    in property <string> status-name: "";
+    in property <[ThumbnailItem]> thumbnail-model: [];
+    private property <length> scaled-image-width: root.image-width * root.zoom-factor * 1px;
+    private property <length> scaled-image-height: root.image-height * root.zoom-factor * 1px;
+
+    title: window-title;
+    preferred-width: 1120px;
+    preferred-height: 760px;
+    background: #d4d0c8;
+    default-font-family: "Segoe UI";
+
+    callback request-open();
+    callback request-save();
+    callback request-save-as();
+    callback request-next();
+    callback request-prev();
+    callback request-open-index(index: int);
+    callback request-rotate-left();
+    callback request-rotate-right();
+    callback request-flip-horizontal();
+    callback request-flip-vertical();
+    callback request-zoom-in();
+    callback request-zoom-out();
+    callback request-zoom-fit();
+    callback request-zoom-actual();
+    callback request-wheel-zoom(delta-y: float);
+    callback request-toggle-toolbar();
+    callback request-toggle-status-bar();
+    callback request-toggle-thumbnails();
+    callback request-toggle-thumbnails-window-mode();
+    callback request-not-implemented(action: string);
+    callback request-exit();
+
+    MenuBar {
+        Menu {
+            title: "File";
+            MenuItem {
+                title: "Open...";
+                activated => { root.request-open(); }
+            }
+            MenuItem {
+                title: "Save";
+                enabled: root.has-image;
+                activated => { root.request-save(); }
+            }
+            MenuItem {
+                title: "Save As...";
+                enabled: root.has-image;
+                activated => { root.request-save-as(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Thumbnail Strip";
+                checkable: true;
+                checked: root.show-thumbnail-strip;
+                activated => { root.request-toggle-thumbnails(); }
+            }
+            MenuItem {
+                title: "Thumbnail Window";
+                checkable: true;
+                checked: root.thumbnails-window-mode;
+                activated => { root.request-toggle-thumbnails-window-mode(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Exit";
+                activated => { root.request-exit(); }
+            }
+        }
+        Menu {
+            title: "Edit";
+            MenuItem {
+                title: "Rotate Left";
+                enabled: root.has-image;
+                activated => { root.request-rotate-left(); }
+            }
+            MenuItem {
+                title: "Rotate Right";
+                enabled: root.has-image;
+                activated => { root.request-rotate-right(); }
+            }
+            MenuItem {
+                title: "Flip Horizontal";
+                enabled: root.has-image;
+                activated => { root.request-flip-horizontal(); }
+            }
+            MenuItem {
+                title: "Flip Vertical";
+                enabled: root.has-image;
+                activated => { root.request-flip-vertical(); }
+            }
+        }
+        Menu {
+            title: "Options";
+            MenuItem {
+                title: "Properties/Settings...";
+                activated => { root.request-not-implemented("Properties/Settings"); }
+            }
+        }
+        Menu {
+            title: "View";
+            MenuItem {
+                title: "Show/hide status bar";
+                checkable: true;
+                checked: root.show-status-bar;
+                activated => { root.request-toggle-status-bar(); }
+            }
+            MenuItem {
+                title: "Show/hide toolbar";
+                checkable: true;
+                checked: root.show-toolbar;
+                activated => { root.request-toggle-toolbar(); }
+            }
+            MenuItem {
+                title: "Thumbnail Strip";
+                checkable: true;
+                checked: root.show-thumbnail-strip;
+                activated => { root.request-toggle-thumbnails(); }
+            }
+            MenuItem {
+                title: "Thumbnail Window";
+                checkable: true;
+                checked: root.thumbnails-window-mode;
+                activated => { root.request-toggle-thumbnails-window-mode(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Zoom In";
+                enabled: root.has-image;
+                activated => { root.request-zoom-in(); }
+            }
+            MenuItem {
+                title: "Zoom Out";
+                enabled: root.has-image;
+                activated => { root.request-zoom-out(); }
+            }
+            MenuItem {
+                title: "Original Size";
+                enabled: root.has-image;
+                activated => { root.request-zoom-actual(); }
+            }
+            MenuItem {
+                title: "Fit to Window";
+                enabled: root.has-image;
+                activated => { root.request-zoom-fit(); }
+            }
+        }
+        Menu {
+            title: "Help";
+            MenuItem {
+                title: "About ImranView";
+                activated => { root.request-not-implemented("About ImranView"); }
+            }
+        }
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+
+        if root.show-toolbar : Rectangle {
+            height: 34px;
+            background: #d4d0c8;
+            border-width: 1px;
+            border-color: #a9a9a9;
+
+            HorizontalLayout {
+                spacing: 3px;
+                x: 6px;
+                y: 4px;
+                width: parent.width - 12px;
+                height: parent.height - 8px;
+
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/folder-open.svg");
+                    clicked => { root.request-open(); }
+                }
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/chevron-left.svg");
+                    enabled: root.has-image;
+                    clicked => { root.request-prev(); }
+                }
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/chevron-right.svg");
+                    enabled: root.has-image;
+                    clicked => { root.request-next(); }
+                }
+
+                Rectangle { width: 1px; background: #969696; }
+
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/zoom-out.svg");
+                    enabled: root.has-image;
+                    clicked => { root.request-zoom-out(); }
+                }
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/zoom-in.svg");
+                    enabled: root.has-image;
+                    clicked => { root.request-zoom-in(); }
+                }
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/aspect-ratio.svg");
+                    enabled: root.has-image;
+                    checked: !root.zoom-fit && root.zoom-factor == 1.0;
+                    clicked => { root.request-zoom-actual(); }
+                }
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/maximize.svg");
+                    enabled: root.has-image;
+                    checked: root.zoom-fit;
+                    clicked => { root.request-zoom-fit(); }
+                }
+
+                Rectangle { width: 1px; background: #969696; }
+
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/photo.svg");
+                    checked: root.show-thumbnail-strip;
+                    clicked => { root.request-toggle-thumbnails(); }
+                }
+                ToolbarIconButton {
+                    icon: @image-url("../assets/icons/tabler/maximize.svg");
+                    checked: root.thumbnails-window-mode;
+                    clicked => { root.request-toggle-thumbnails-window-mode(); }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.image-counter-label + "   " + root.zoom-label;
+                    color: #111111;
+                    font-size: 13px;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    width: 160px;
+                    height: parent.height;
+                }
+            }
+        }
+
+        if !root.thumbnails-window-mode : Rectangle {
+            vertical-stretch: 1;
+            background: #000000;
+
+            viewer-focus := FocusScope {
+                width: parent.width;
+                height: parent.height;
+                key-pressed(event) => {
+                    if (event.modifiers.control && (event.text == "s" || event.text == "S")) {
+                        if (event.modifiers.shift) {
+                            root.request-save-as();
+                        } else {
+                            root.request-save();
+                        }
+                        return accept;
+                    } else if (event.text == Key.LeftArrow) {
+                        root.request-prev();
+                        return accept;
+                    } else if (event.text == Key.RightArrow) {
+                        root.request-next();
+                        return accept;
+                    } else if (event.text == "+" || event.text == "=") {
+                        root.request-zoom-in();
+                        return accept;
+                    } else if (event.text == "-") {
+                        root.request-zoom-out();
+                        return accept;
+                    } else if (event.text == "0") {
+                        root.request-zoom-fit();
+                        return accept;
+                    } else if (event.text == "1") {
+                        root.request-zoom-actual();
+                        return accept;
+                    } else if (event.text == "[") {
+                        root.request-rotate-left();
+                        return accept;
+                    } else if (event.text == "]") {
+                        root.request-rotate-right();
+                        return accept;
+                    } else if (event.text == "x" || event.text == "X") {
+                        root.request-flip-horizontal();
+                        return accept;
+                    } else if (event.text == "y" || event.text == "Y") {
+                        root.request-flip-vertical();
+                        return accept;
+                    } else if (event.text == "t" || event.text == "T") {
+                        root.request-toggle-thumbnails();
+                        return accept;
+                    } else if (event.text == "w" || event.text == "W") {
+                        root.request-toggle-thumbnails-window-mode();
+                        return accept;
+                    } else if (event.text == "h" || event.text == "H") {
+                        root.request-toggle-toolbar();
+                        return accept;
+                    } else if (event.text == "s" || event.text == "S") {
+                        root.request-toggle-status-bar();
+                        return accept;
+                    }
+                    reject
+                }
+            }
+
+            if root.has-image && root.zoom-fit : Image {
+                source: root.current-image;
+                width: parent.width;
+                height: parent.height;
+                image-fit: contain;
+            }
+
+            if root.has-image && !root.zoom-fit : zoom-scroll := ScrollView {
+                width: parent.width;
+                height: parent.height;
+
+                Rectangle {
+                    width: max(zoom-scroll.visible-width, root.scaled-image-width);
+                    height: max(zoom-scroll.visible-height, root.scaled-image-height);
+
+                    Image {
+                        source: root.current-image;
+                        width: root.scaled-image-width;
+                        height: root.scaled-image-height;
+                        x: max((parent.width - self.width) / 2, 0px);
+                        y: max((parent.height - self.height) / 2, 0px);
+                        image-fit: fill;
+                    }
+                }
+            }
+
+            if !root.has-image : Text {
+                text: "ImranView\n\nFile > Open...";
+                color: #d8d8d8;
+                font-size: 24px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+
+            TouchArea {
+                clicked => { viewer-focus.focus(); }
+                scroll-event(event) => {
+                    if (event.modifiers.control && root.has-image) {
+                        root.request-wheel-zoom(event.delta-y / 1px);
+                        return accept;
+                    }
+                    reject
+                }
+            }
+        }
+
+        if root.thumbnails-window-mode : Rectangle {
+            vertical-stretch: 1;
+            background: #c0c0c0;
+            border-width: 1px;
+            border-color: #9f9f9f;
+
+            VerticalLayout {
+                spacing: 0px;
+
+                Rectangle {
+                    height: 28px;
+                    background: #d4d0c8;
+                    border-width: 1px;
+                    border-color: #a9a9a9;
+
+                    Text {
+                        text: root.folder-label;
+                        x: 8px;
+                        y: 0px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        color: #111111;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                thumb-window-scroll := ScrollView {
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+
+                    Rectangle {
+                        width: max(thumb-window-scroll.visible-width, 1px);
+                        height: root.thumbnail-model.length * 104px + 8px;
+
+                        for thumb[idx] in root.thumbnail-model : Rectangle {
+                            x: 8px;
+                            y: idx * 104px + 4px;
+                            width: parent.width - 16px;
+                            height: 98px;
+                            background: thumb.current ? #d8e8fb : #d4d0c8;
+                            border-color: thumb.current ? #3a8dde : #8b8b8b;
+                            border-width: thumb.current ? 2px : 1px;
+
+                            Image {
+                                source: thumb.preview;
+                                x: 8px;
+                                y: 8px;
+                                width: 112px;
+                                height: 82px;
+                                image-fit: contain;
+                            }
+
+                            Text {
+                                text: thumb.label;
+                                x: 130px;
+                                y: 18px;
+                                width: parent.width - 138px;
+                                height: 26px;
+                                color: #101010;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                font-size: 13px;
+                            }
+
+                            Text {
+                                text: thumb.current ? "Current image" : "";
+                                x: 130px;
+                                y: 50px;
+                                width: parent.width - 138px;
+                                height: 22px;
+                                color: #3c3c3c;
+                                vertical-alignment: center;
+                                font-size: 12px;
+                            }
+
+                            TouchArea {
+                                clicked => { root.request-open-index(thumb.source_index); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.show-thumbnail-strip && !root.thumbnails-window-mode : Rectangle {
+            height: 146px;
+            background: #c0c0c0;
+            border-width: 1px;
+            border-color: #9f9f9f;
+
+            thumb-scroll := ScrollView {
+                width: parent.width;
+                height: parent.height;
+
+                Rectangle {
+                    width: max(thumb-scroll.visible-width, root.thumbnail-model.length * 136px + 12px);
+                    height: thumb-scroll.visible-height;
+
+                    for thumb[idx] in root.thumbnail-model : Rectangle {
+                        x: idx * 136px + 6px;
+                        y: 8px;
+                        width: 130px;
+                        height: parent.height - 16px;
+                        background: #c0c0c0;
+                        border-color: thumb.current ? #3a8dde : #8b8b8b;
+                        border-width: thumb.current ? 2px : 1px;
+
+                        Image {
+                            source: thumb.preview;
+                            x: 4px;
+                            y: 4px;
+                            width: parent.width - 8px;
+                            height: 92px;
+                            image-fit: contain;
+                        }
+
+                        Text {
+                            text: thumb.label;
+                            x: 6px;
+                            y: 100px;
+                            width: parent.width - 12px;
+                            height: 24px;
+                            color: #101010;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            font-size: 12px;
+                        }
+
+                        TouchArea {
+                            clicked => { root.request-open-index(thumb.source_index); }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.show-status-bar : Rectangle {
+            height: 24px;
+            background: #d4d0c8;
+            border-width: 1px;
+            border-color: #a9a9a9;
+
+            HorizontalLayout {
+                spacing: 1px;
+                x: 3px;
+                y: 2px;
+                width: parent.width - 6px;
+                height: parent.height - 4px;
+
+                StatusCell { width: 190px; cell-text: root.status-dimensions; }
+                StatusCell { width: 66px; cell-text: root.status-index; }
+                StatusCell { width: 70px; cell-text: root.status-zoom; }
+                StatusCell { width: 88px; cell-text: root.status-size; }
+                StatusCell { width: 130px; cell-text: root.status-preview; }
+                StatusCell {
+                    horizontal-stretch: 1;
+                    cell-text: root.status-name;
+                }
+            }
+        }
+    }
+}

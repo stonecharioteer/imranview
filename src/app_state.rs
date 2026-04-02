@@ -1,0 +1,774 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use image::DynamicImage;
+
+use crate::image_io::LoadedImagePayload;
+#[cfg(test)]
+use crate::image_io::{
+    collect_images_in_directory, load_image_payload, payload_from_working_image, save_image,
+};
+#[cfg(test)]
+use crate::perf::{
+    EDIT_IMAGE_BUDGET, NAVIGATION_BUDGET, OPEN_IMAGE_BUDGET, SAVE_IMAGE_BUDGET, log_timing,
+};
+use crate::settings::{PersistedSettings, is_existing_dir};
+
+const ZOOM_MIN: f32 = 0.1;
+const ZOOM_MAX: f32 = 16.0;
+const ZOOM_STEP_IN: f32 = 1.2;
+const ZOOM_STEP_OUT: f32 = 1.0 / ZOOM_STEP_IN;
+const THUMBNAIL_WINDOW_RADIUS_STRIP: usize = 90;
+const THUMBNAIL_DECODE_RADIUS_STRIP: usize = 12;
+const THUMBNAIL_DECODE_RADIUS_WINDOW_MODE: usize = 36;
+
+#[derive(Clone)]
+pub struct ThumbnailEntry {
+    pub label: String,
+    pub path: PathBuf,
+    pub current: bool,
+    pub decode_hint: bool,
+}
+
+#[derive(Clone)]
+pub struct LoadedImageState {
+    pub preview_rgba: Arc<[u8]>,
+    pub preview_width: u32,
+    pub preview_height: u32,
+    pub original_width: u32,
+    pub original_height: u32,
+    pub downscaled_for_preview: bool,
+    pub working_image: Arc<DynamicImage>,
+}
+
+impl LoadedImageState {
+    pub fn from_payload(payload: LoadedImagePayload) -> Self {
+        Self {
+            preview_rgba: Arc::from(payload.preview_rgba.into_boxed_slice()),
+            preview_width: payload.preview_width,
+            preview_height: payload.preview_height,
+            original_width: payload.original_width,
+            original_height: payload.original_height,
+            downscaled_for_preview: payload.downscaled_for_preview,
+            working_image: payload.working_image,
+        }
+    }
+}
+
+enum ZoomMode {
+    Fit,
+    Manual(f32),
+}
+
+pub struct AppState {
+    current_file: Option<PathBuf>,
+    current_directory: Option<PathBuf>,
+    images_in_directory: Vec<PathBuf>,
+    current_index: Option<usize>,
+    current_image: Option<LoadedImageState>,
+    zoom_mode: ZoomMode,
+    show_toolbar: bool,
+    show_status_bar: bool,
+    show_thumbnail_strip: bool,
+    thumbnails_window_mode: bool,
+    last_error: Option<String>,
+}
+
+impl AppState {
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::new_with_settings(PersistedSettings::default())
+    }
+
+    pub fn new_with_settings(settings: PersistedSettings) -> Self {
+        let thumbnails_window_mode = settings.thumbnails_window_mode;
+        let show_thumbnail_strip = if thumbnails_window_mode {
+            false
+        } else {
+            settings.show_thumbnail_strip
+        };
+
+        Self {
+            current_file: None,
+            current_directory: settings
+                .last_open_directory
+                .filter(|path| is_existing_dir(path)),
+            images_in_directory: Vec::new(),
+            current_index: None,
+            current_image: None,
+            zoom_mode: ZoomMode::Fit,
+            show_toolbar: settings.show_toolbar,
+            show_status_bar: settings.show_status_bar,
+            show_thumbnail_strip,
+            thumbnails_window_mode,
+            last_error: None,
+        }
+    }
+
+    pub fn to_settings(&self) -> PersistedSettings {
+        PersistedSettings {
+            show_toolbar: self.show_toolbar,
+            show_status_bar: self.show_status_bar,
+            show_thumbnail_strip: self.show_thumbnail_strip,
+            thumbnails_window_mode: self.thumbnails_window_mode,
+            last_open_directory: self
+                .current_directory
+                .as_ref()
+                .filter(|path| is_existing_dir(path))
+                .cloned(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn open_image(&mut self, path: impl Into<PathBuf>) -> Result<()> {
+        let started = Instant::now();
+        let path = path.into();
+        let payload = load_image_payload(&path)?;
+        let directory = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let files = collect_images_in_directory(&directory)?;
+
+        self.apply_open_payload(path, directory, files, payload);
+        log_timing("open_image", started.elapsed(), OPEN_IMAGE_BUDGET);
+        Ok(())
+    }
+
+    pub fn apply_open_payload(
+        &mut self,
+        path: PathBuf,
+        directory: PathBuf,
+        files: Vec<PathBuf>,
+        payload: LoadedImagePayload,
+    ) {
+        let first_open = self.current_image.is_none();
+        let current_index = resolve_current_index(&files, &path);
+        log::debug!(
+            target: "imranview::state",
+            "apply_open_payload path={} files={} current_index={:?} first_open={}",
+            path.display(),
+            files.len(),
+            current_index,
+            first_open
+        );
+        self.current_file = Some(path);
+        self.current_directory = Some(directory);
+        self.images_in_directory = files;
+        self.current_index = current_index;
+        self.current_image = Some(LoadedImageState::from_payload(payload));
+        self.zoom_mode = ZoomMode::Fit;
+        self.last_error = None;
+        if first_open && !self.show_thumbnail_strip && !self.thumbnails_window_mode {
+            self.show_thumbnail_strip = true;
+        }
+    }
+
+    pub fn apply_transform_payload(&mut self, payload: LoadedImagePayload) -> Result<()> {
+        if self.current_image.is_none() {
+            anyhow::bail!("no image loaded")
+        }
+        self.current_image = Some(LoadedImageState::from_payload(payload));
+        self.last_error = None;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn open_next(&mut self) -> Result<()> {
+        self.open_adjacent("navigate_next", 1)
+    }
+
+    #[cfg(test)]
+    pub fn open_previous(&mut self) -> Result<()> {
+        self.open_adjacent("navigate_previous", -1)
+    }
+
+    pub fn resolve_next_path(&self) -> Result<PathBuf> {
+        self.resolve_adjacent_path(1)
+    }
+
+    pub fn resolve_previous_path(&self) -> Result<PathBuf> {
+        self.resolve_adjacent_path(-1)
+    }
+
+    #[cfg(test)]
+    pub fn save_current_as(&mut self, path: PathBuf) -> Result<()> {
+        self.save_to_path(path, true)
+    }
+
+    #[cfg(test)]
+    pub fn rotate_right(&mut self) -> Result<()> {
+        self.apply_edit("rotate_right", |image| image.rotate90())
+    }
+
+    pub fn current_working_image(&self) -> Result<Arc<DynamicImage>> {
+        self.current_image
+            .as_ref()
+            .map(|image| Arc::clone(&image.working_image))
+            .context("no image loaded")
+    }
+
+    pub fn current_file_path(&self) -> Option<PathBuf> {
+        self.current_file.clone()
+    }
+
+    pub fn set_zoom_fit(&mut self) {
+        self.zoom_mode = ZoomMode::Fit;
+    }
+
+    pub fn set_zoom_actual(&mut self) {
+        if self.current_image.is_some() {
+            self.zoom_mode = ZoomMode::Manual(1.0);
+        }
+    }
+
+    pub fn zoom_in(&mut self) {
+        self.apply_zoom_step(ZOOM_STEP_IN);
+    }
+
+    pub fn zoom_out(&mut self) {
+        self.apply_zoom_step(ZOOM_STEP_OUT);
+    }
+
+    pub fn zoom_from_wheel_delta(&mut self, delta_y: f32) {
+        if delta_y > 0.0 {
+            self.zoom_in();
+        } else if delta_y < 0.0 {
+            self.zoom_out();
+        }
+    }
+
+    pub fn set_show_toolbar(&mut self, show: bool) {
+        self.show_toolbar = show;
+    }
+
+    pub fn set_show_status_bar(&mut self, show: bool) {
+        self.show_status_bar = show;
+    }
+
+    pub fn toggle_thumbnail_strip(&mut self) {
+        self.show_thumbnail_strip = !self.show_thumbnail_strip;
+        if self.show_thumbnail_strip {
+            self.thumbnails_window_mode = false;
+        }
+    }
+
+    pub fn set_show_thumbnail_strip(&mut self, show: bool) {
+        self.show_thumbnail_strip = show;
+        if show {
+            self.thumbnails_window_mode = false;
+        }
+    }
+
+    pub fn toggle_thumbnails_window_mode(&mut self) {
+        self.thumbnails_window_mode = !self.thumbnails_window_mode;
+        if self.thumbnails_window_mode {
+            self.show_thumbnail_strip = false;
+        }
+    }
+
+    pub fn set_thumbnails_window_mode(&mut self, show: bool) {
+        self.thumbnails_window_mode = show;
+        if show {
+            self.show_thumbnail_strip = false;
+        }
+    }
+
+    pub fn show_toolbar(&self) -> bool {
+        self.show_toolbar
+    }
+
+    pub fn show_status_bar(&self) -> bool {
+        self.show_status_bar
+    }
+
+    pub fn show_thumbnail_strip(&self) -> bool {
+        self.show_thumbnail_strip
+    }
+
+    pub fn thumbnails_window_mode(&self) -> bool {
+        self.thumbnails_window_mode
+    }
+
+    pub fn folder_label(&self) -> String {
+        self.current_directory
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "No folder loaded".to_owned())
+    }
+
+    pub fn preferred_open_directory(&self) -> Option<PathBuf> {
+        self.current_directory
+            .as_ref()
+            .filter(|path| is_existing_dir(path))
+            .cloned()
+    }
+
+    pub fn suggested_save_name(&self) -> Option<String> {
+        self.current_file.as_ref().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+    }
+
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        self.last_error = Some(message.into());
+    }
+
+    pub fn clear_error(&mut self) {
+        self.last_error = None;
+    }
+
+    pub fn has_image(&self) -> bool {
+        self.current_image.is_some()
+    }
+
+    pub fn image_width(&self) -> f32 {
+        self.current_image
+            .as_ref()
+            .map(|image| image.preview_width as f32)
+            .unwrap_or(0.0)
+    }
+
+    pub fn image_height(&self) -> f32 {
+        self.current_image
+            .as_ref()
+            .map(|image| image.preview_height as f32)
+            .unwrap_or(0.0)
+    }
+
+    pub fn zoom_is_fit(&self) -> bool {
+        matches!(self.zoom_mode, ZoomMode::Fit)
+    }
+
+    pub fn zoom_factor(&self) -> f32 {
+        match self.zoom_mode {
+            ZoomMode::Fit => 1.0,
+            ZoomMode::Manual(factor) => factor,
+        }
+    }
+
+    pub fn zoom_label(&self) -> String {
+        match self.zoom_mode {
+            ZoomMode::Fit => "Fit".to_owned(),
+            ZoomMode::Manual(factor) => format!("{:.0}%", factor * 100.0),
+        }
+    }
+
+    pub fn image_counter_label(&self) -> String {
+        if let Some(index) = self.current_index {
+            format!("{}/{}", index + 1, self.images_in_directory.len())
+        } else {
+            "0/0".to_owned()
+        }
+    }
+
+    pub fn current_preview_rgba(&self) -> Option<(Arc<[u8]>, u32, u32)> {
+        self.current_image.as_ref().map(|image| {
+            (
+                Arc::clone(&image.preview_rgba),
+                image.preview_width,
+                image.preview_height,
+            )
+        })
+    }
+
+    pub fn thumbnail_entries(&self) -> Vec<ThumbnailEntry> {
+        if !self.show_thumbnail_strip && !self.thumbnails_window_mode {
+            return Vec::new();
+        }
+
+        let Some(current_index) = self.current_index else {
+            return Vec::new();
+        };
+
+        if self.thumbnails_window_mode {
+            return self.thumbnail_entries_for_window_mode(current_index);
+        }
+        self.thumbnail_entries_for_strip_mode(current_index)
+    }
+
+    pub fn status_dimensions(&self) -> String {
+        if let Some(error) = &self.last_error {
+            return format!("Error: {error}");
+        }
+
+        let Some(image) = &self.current_image else {
+            return "Open image...".to_owned();
+        };
+
+        format!(
+            "{} x {} x 32 BPP",
+            image.original_width, image.original_height
+        )
+    }
+
+    pub fn status_index(&self) -> String {
+        if self.last_error.is_some() {
+            return String::new();
+        }
+        self.image_counter_label()
+    }
+
+    pub fn status_zoom(&self) -> String {
+        if self.last_error.is_some() {
+            return String::new();
+        }
+        self.zoom_label()
+    }
+
+    pub fn status_size(&self) -> String {
+        if self.last_error.is_some() {
+            return String::new();
+        }
+        self.current_file
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .map(|meta| human_file_size(meta.len()))
+            .unwrap_or_default()
+    }
+
+    pub fn status_preview(&self) -> String {
+        if self.last_error.is_some() {
+            return String::new();
+        }
+
+        self.current_image
+            .as_ref()
+            .map(|image| {
+                if image.downscaled_for_preview {
+                    format!(
+                        "Preview: {} x {}",
+                        image.preview_width, image.preview_height
+                    )
+                } else {
+                    "Original".to_owned()
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn status_name(&self) -> String {
+        if self.last_error.is_some() {
+            return String::new();
+        }
+        self.current_file
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    pub fn window_title(&self) -> String {
+        let Some(path) = &self.current_file else {
+            return "ImranView".to_owned();
+        };
+
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        let Some(image) = &self.current_image else {
+            return format!("{file_name} - ImranView");
+        };
+
+        match self.zoom_mode {
+            ZoomMode::Fit => format!("{file_name} - ImranView"),
+            ZoomMode::Manual(scale) => {
+                let zoom_w = (image.preview_width as f32 * scale).max(1.0).round() as u32;
+                let zoom_h = (image.preview_height as f32 * scale).max(1.0).round() as u32;
+                format!("{file_name} - ImranView (Zoom: {zoom_w} x {zoom_h})")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn open_adjacent(&mut self, perf_label: &str, step: isize) -> Result<()> {
+        let next_path = self.resolve_adjacent_path(step)?;
+
+        let started = Instant::now();
+        self.open_image(next_path)?;
+        log_timing(perf_label, started.elapsed(), NAVIGATION_BUDGET);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn save_to_path(&mut self, path: PathBuf, switch_current_file: bool) -> Result<()> {
+        let started = Instant::now();
+        let loaded = self
+            .current_image
+            .as_ref()
+            .context("no image loaded to save")?;
+        save_image(&path, loaded.working_image.as_ref())?;
+        log_timing("save_image", started.elapsed(), SAVE_IMAGE_BUDGET);
+
+        if switch_current_file {
+            self.open_image(path)?;
+        } else {
+            self.last_error = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_edit<F>(&mut self, perf_label: &str, transform: F) -> Result<()>
+    where
+        F: Fn(&DynamicImage) -> DynamicImage,
+    {
+        let started = Instant::now();
+        let loaded = self.current_image.as_ref().context("no image loaded")?;
+        let transformed = transform(loaded.working_image.as_ref());
+        let payload = payload_from_working_image(Arc::new(transformed));
+        self.current_image = Some(LoadedImageState::from_payload(payload));
+        self.last_error = None;
+        log_timing(perf_label, started.elapsed(), EDIT_IMAGE_BUDGET);
+        Ok(())
+    }
+
+    fn apply_zoom_step(&mut self, step_factor: f32) {
+        if self.current_image.is_none() {
+            return;
+        }
+        let current = match self.zoom_mode {
+            ZoomMode::Fit => 1.0,
+            ZoomMode::Manual(factor) => factor,
+        };
+        self.zoom_mode = ZoomMode::Manual((current * step_factor).clamp(ZOOM_MIN, ZOOM_MAX));
+    }
+
+    fn thumbnail_entries_for_strip_mode(&self, current_index: usize) -> Vec<ThumbnailEntry> {
+        let total = self.images_in_directory.len();
+        let start = current_index.saturating_sub(THUMBNAIL_WINDOW_RADIUS_STRIP);
+        let end = (current_index + THUMBNAIL_WINDOW_RADIUS_STRIP + 1).min(total);
+        let mut items = Vec::with_capacity(end.saturating_sub(start));
+
+        for index in start..end {
+            items.push(self.make_thumbnail_entry(
+                index,
+                current_index,
+                THUMBNAIL_DECODE_RADIUS_STRIP,
+            ));
+        }
+        items
+    }
+
+    fn thumbnail_entries_for_window_mode(&self, current_index: usize) -> Vec<ThumbnailEntry> {
+        let mut items = Vec::with_capacity(self.images_in_directory.len());
+        for index in 0..self.images_in_directory.len() {
+            items.push(self.make_thumbnail_entry(
+                index,
+                current_index,
+                THUMBNAIL_DECODE_RADIUS_WINDOW_MODE,
+            ));
+        }
+        items
+    }
+
+    fn make_thumbnail_entry(
+        &self,
+        index: usize,
+        current_index: usize,
+        decode_radius: usize,
+    ) -> ThumbnailEntry {
+        let path = self.images_in_directory[index].clone();
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        ThumbnailEntry {
+            label,
+            path,
+            current: index == current_index,
+            decode_hint: index.abs_diff(current_index) <= decode_radius,
+        }
+    }
+
+    fn resolve_adjacent_path(&self, step: isize) -> Result<PathBuf> {
+        let Some(current_index) = self.current_index else {
+            anyhow::bail!("no image loaded");
+        };
+        let total = self.images_in_directory.len();
+        if total == 0 {
+            anyhow::bail!("no image loaded");
+        }
+
+        let next_index = wrapped_index(current_index, total, step);
+        self.images_in_directory
+            .get(next_index)
+            .cloned()
+            .context("failed to resolve adjacent image path")
+    }
+}
+
+fn wrapped_index(current: usize, len: usize, step: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let len = len as isize;
+    let next = (current as isize + step).rem_euclid(len);
+    next as usize
+}
+
+fn resolve_current_index(files: &[PathBuf], path: &Path) -> Option<usize> {
+    files
+        .iter()
+        .position(|candidate| candidate == path)
+        .or_else(|| {
+            files
+                .iter()
+                .position(|candidate| same_path(candidate, path))
+        })
+        .or_else(|| {
+            let target_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+            files.iter().position(|candidate| {
+                candidate
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_ascii_lowercase() == target_name)
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| (!files.is_empty()).then_some(0))
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn human_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let value = bytes as f64;
+    if value < KB {
+        format!("{bytes} B")
+    } else if value < MB {
+        format!("{:.1} KB", value / KB)
+    } else if value < GB {
+        format!("{:.2} MB", value / MB)
+    } else {
+        format!("{:.2} GB", value / GB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+    use tempfile::tempdir;
+
+    use super::AppState;
+
+    fn write_test_png(path: &Path, width: u32, height: u32, color: [u8; 4]) {
+        let image = RgbaImage::from_pixel(width, height, Rgba(color));
+        DynamicImage::ImageRgba8(image)
+            .save(path)
+            .expect("failed to write test image");
+    }
+
+    #[test]
+    fn navigation_wraps_between_first_and_last() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let image_a = dir.path().join("a.png");
+        let image_b = dir.path().join("b.png");
+        let image_c = dir.path().join("c.png");
+
+        write_test_png(&image_a, 16, 12, [255, 0, 0, 255]);
+        write_test_png(&image_b, 16, 12, [0, 255, 0, 255]);
+        write_test_png(&image_c, 16, 12, [0, 0, 255, 255]);
+
+        let mut state = AppState::new();
+        state.open_image(&image_a).expect("failed to open image_a");
+        assert_eq!(state.image_counter_label(), "1/3");
+
+        state
+            .open_previous()
+            .expect("failed to wrap previous to last image");
+        assert_eq!(state.status_name(), "c.png");
+
+        state
+            .open_next()
+            .expect("failed to wrap next to first image");
+        assert_eq!(state.status_name(), "a.png");
+    }
+
+    #[test]
+    fn zoom_transitions_are_consistent() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let image_a = dir.path().join("a.png");
+        write_test_png(&image_a, 32, 24, [255, 128, 0, 255]);
+
+        let mut state = AppState::new();
+        state.open_image(&image_a).expect("failed to open image_a");
+
+        assert!(state.zoom_is_fit());
+        assert_eq!(state.zoom_label(), "Fit");
+
+        state.zoom_in();
+        assert!(!state.zoom_is_fit());
+        assert_ne!(state.zoom_label(), "Fit");
+
+        state.set_zoom_actual();
+        assert_eq!(state.zoom_label(), "100%");
+        assert!((state.zoom_factor() - 1.0).abs() < f32::EPSILON);
+
+        state.set_zoom_fit();
+        assert!(state.zoom_is_fit());
+        assert_eq!(state.zoom_label(), "Fit");
+    }
+
+    #[test]
+    fn successful_open_clears_previous_error() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let image_a = dir.path().join("a.png");
+        write_test_png(&image_a, 16, 16, [128, 128, 128, 255]);
+
+        let mut state = AppState::new();
+        state.set_error("synthetic failure");
+        assert!(state.status_dimensions().starts_with("Error:"));
+
+        state.open_image(&image_a).expect("failed to open image_a");
+        assert!(!state.status_dimensions().starts_with("Error:"));
+    }
+
+    #[test]
+    fn save_as_writes_file_and_switches_current_file() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let source = dir.path().join("source.png");
+        let saved = dir.path().join("edited.png");
+
+        write_test_png(&source, 16, 10, [64, 64, 255, 255]);
+
+        let mut state = AppState::new();
+        state
+            .open_image(&source)
+            .expect("failed to open source image");
+        state
+            .rotate_right()
+            .expect("failed to rotate source image before save");
+        state
+            .save_current_as(saved.clone())
+            .expect("failed to save image as edited.png");
+
+        assert!(saved.exists());
+        assert_eq!(state.status_name(), "edited.png");
+
+        let saved_image = image::open(&saved).expect("failed to open saved file");
+        assert_eq!(saved_image.dimensions(), (10, 16));
+    }
+}
