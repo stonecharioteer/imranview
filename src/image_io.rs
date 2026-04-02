@@ -25,6 +25,12 @@ pub enum ImageIoError {
         #[source]
         source: anyhow::Error,
     },
+    #[error("failed to save image to {path}")]
+    SaveImage {
+        path: PathBuf,
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("failed to scan images in directory {path}")]
     DirectoryScan {
         path: PathBuf,
@@ -40,6 +46,7 @@ pub struct LoadedImage {
     pub original_width: u32,
     pub original_height: u32,
     pub downscaled_for_preview: bool,
+    pub working_image: DynamicImage,
 }
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
@@ -50,23 +57,33 @@ const PREVIEW_MAX_DIMENSION: u32 = 4096;
 const THUMBNAIL_MAX_DIMENSION: u32 = 192;
 
 pub fn load_image(path: &Path) -> ImageIoResult<LoadedImage> {
-    let oriented = decode_oriented_image(path).map_err(|source| ImageIoError::LoadImage {
+    let working_image = decode_oriented_image(path).map_err(|source| ImageIoError::LoadImage {
         path: path.to_path_buf(),
         source,
     })?;
-    let (original_width, original_height) = oriented.dimensions();
-    let preview = downscale_for_preview(oriented);
-    let downscaled_for_preview = preview.dimensions() != (original_width, original_height);
-    let (image, width, height) = to_slint_image(preview);
+    Ok(build_loaded_image(working_image))
+}
 
-    Ok(LoadedImage {
-        image,
-        width,
-        height,
-        original_width,
-        original_height,
-        downscaled_for_preview,
-    })
+pub fn refresh_loaded_image(loaded: &mut LoadedImage) {
+    let (image, width, height, downscaled_for_preview) =
+        render_preview_image(&loaded.working_image);
+    let (original_width, original_height) = loaded.working_image.dimensions();
+    loaded.image = image;
+    loaded.width = width;
+    loaded.height = height;
+    loaded.original_width = original_width;
+    loaded.original_height = original_height;
+    loaded.downscaled_for_preview = downscaled_for_preview;
+}
+
+pub fn save_image(path: &Path, image: &DynamicImage) -> ImageIoResult<()> {
+    image
+        .save(path)
+        .with_context(|| format!("failed to save {}", path.display()))
+        .map_err(|source| ImageIoError::SaveImage {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 pub fn load_thumbnail(path: &Path) -> ImageIoResult<Image> {
@@ -75,7 +92,7 @@ pub fn load_thumbnail(path: &Path) -> ImageIoResult<Image> {
         source,
     })?;
     let thumbnail = oriented.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
-    let (image, _, _) = to_slint_image(thumbnail);
+    let (image, _, _) = to_slint_image(&thumbnail);
     Ok(image)
 }
 
@@ -115,6 +132,20 @@ pub fn is_supported_image_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn build_loaded_image(working_image: DynamicImage) -> LoadedImage {
+    let (image, width, height, downscaled_for_preview) = render_preview_image(&working_image);
+    let (original_width, original_height) = working_image.dimensions();
+    LoadedImage {
+        image,
+        width,
+        height,
+        original_width,
+        original_height,
+        downscaled_for_preview,
+        working_image,
+    }
+}
+
 fn decode_oriented_image(path: &Path) -> Result<DynamicImage> {
     let decoded = ImageReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
@@ -126,21 +157,24 @@ fn decode_oriented_image(path: &Path) -> Result<DynamicImage> {
     Ok(apply_exif_orientation(path, decoded))
 }
 
-fn downscale_for_preview(image: DynamicImage) -> DynamicImage {
+fn render_preview_image(image: &DynamicImage) -> (Image, u32, u32, bool) {
     let (width, height) = image.dimensions();
     let max_dimension = width.max(height);
-    if max_dimension <= PREVIEW_MAX_DIMENSION {
-        return image;
+    if max_dimension > PREVIEW_MAX_DIMENSION {
+        let preview = image.resize(
+            PREVIEW_MAX_DIMENSION,
+            PREVIEW_MAX_DIMENSION,
+            FilterType::Triangle,
+        );
+        let (img, w, h) = to_slint_image(&preview);
+        return (img, w, h, true);
     }
 
-    image.resize(
-        PREVIEW_MAX_DIMENSION,
-        PREVIEW_MAX_DIMENSION,
-        FilterType::Triangle,
-    )
+    let (img, w, h) = to_slint_image(image);
+    (img, w, h, false)
 }
 
-fn to_slint_image(image: DynamicImage) -> (Image, u32, u32) {
+fn to_slint_image(image: &DynamicImage) -> (Image, u32, u32) {
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
     let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(rgba.as_raw(), width, height);
