@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -6,21 +7,59 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
-use image::DynamicImage;
+use anyhow::{Context, Result, anyhow};
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImageView};
 
 use crate::image_io::{
-    LoadedImagePayload, ThumbnailPayload, collect_images_in_directory, load_image_payload,
-    load_thumbnail_payload, payload_from_working_image, save_image,
+    LoadedImagePayload, SaveFormat, ThumbnailPayload, collect_images_in_directory,
+    load_image_payload, load_thumbnail_payload, load_working_image, payload_from_working_image,
+    save_image, save_image_with_format,
 };
 use crate::perf::{EDIT_IMAGE_BUDGET, OPEN_IMAGE_BUDGET, SAVE_IMAGE_BUDGET, log_timing};
+
+const PRELOAD_CACHE_CAP: usize = 6;
+const PRELOAD_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub enum WorkerRequestKind {
     Open,
     Save,
+    Edit,
     Preload,
     Thumbnail,
+    Batch,
+    File,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeFilter {
+    Nearest,
+    Triangle,
+    CatmullRom,
+    Gaussian,
+    Lanczos3,
+}
+
+impl ResizeFilter {
+    fn to_image_filter(self) -> FilterType {
+        match self {
+            ResizeFilter::Nearest => FilterType::Nearest,
+            ResizeFilter::Triangle => FilterType::Triangle,
+            ResizeFilter::CatmullRom => FilterType::CatmullRom,
+            ResizeFilter::Gaussian => FilterType::Gaussian,
+            ResizeFilter::Lanczos3 => FilterType::Lanczos3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ColorAdjustParams {
+    pub brightness: i32,
+    pub contrast: f32,
+    pub gamma: f32,
+    pub saturation: f32,
+    pub grayscale: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -29,12 +68,69 @@ pub enum TransformOp {
     RotateRight,
     FlipHorizontal,
     FlipVertical,
+    Resize {
+        width: u32,
+        height: u32,
+        filter: ResizeFilter,
+    },
+    Crop {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+    ColorAdjust(ColorAdjustParams),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchOutputFormat {
+    Png,
+    Jpeg,
+    Webp,
+    Bmp,
+    Tiff,
+}
+
+impl BatchOutputFormat {
+    fn to_save_format(self, jpeg_quality: u8) -> SaveFormat {
+        match self {
+            BatchOutputFormat::Png => SaveFormat::Png,
+            BatchOutputFormat::Jpeg => SaveFormat::Jpeg {
+                quality: jpeg_quality,
+            },
+            BatchOutputFormat::Webp => SaveFormat::Webp,
+            BatchOutputFormat::Bmp => SaveFormat::Bmp,
+            BatchOutputFormat::Tiff => SaveFormat::Tiff,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchConvertOptions {
+    pub input_dir: PathBuf,
+    pub output_dir: PathBuf,
+    pub output_format: BatchOutputFormat,
+    pub rename_prefix: String,
+    pub start_index: u32,
+    pub jpeg_quality: u8,
+}
+
+#[derive(Clone, Debug)]
+pub enum FileOperation {
+    Rename { from: PathBuf, to: PathBuf },
+    Delete { path: PathBuf },
+    Copy { from: PathBuf, to: PathBuf },
+    Move { from: PathBuf, to: PathBuf },
 }
 
 pub enum WorkerCommand {
     OpenImage {
         request_id: u64,
         path: PathBuf,
+    },
+    OpenDirectory {
+        request_id: u64,
+        directory: PathBuf,
     },
     SaveImage {
         request_id: u64,
@@ -49,6 +145,14 @@ pub enum WorkerCommand {
     },
     PreloadImage {
         path: PathBuf,
+    },
+    BatchConvert {
+        request_id: u64,
+        options: BatchConvertOptions,
+    },
+    FileOperation {
+        request_id: u64,
+        operation: FileOperation,
     },
 }
 
@@ -76,6 +180,16 @@ pub enum WorkerResult {
     Preloaded {
         path: PathBuf,
     },
+    BatchCompleted {
+        request_id: u64,
+        processed: usize,
+        failed: usize,
+        output_dir: PathBuf,
+    },
+    FileOperationCompleted {
+        request_id: u64,
+        operation: FileOperation,
+    },
     Failed {
         request_id: Option<u64>,
         kind: WorkerRequestKind,
@@ -85,22 +199,31 @@ pub enum WorkerResult {
 
 struct PreloadCache {
     map: HashMap<PathBuf, LoadedImagePayload>,
+    byte_sizes: HashMap<PathBuf, usize>,
     order: VecDeque<PathBuf>,
     capacity: usize,
+    max_bytes: usize,
+    total_bytes: usize,
 }
 
 impl PreloadCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
             map: HashMap::new(),
+            byte_sizes: HashMap::new(),
             order: VecDeque::new(),
             capacity,
+            max_bytes,
+            total_bytes: 0,
         }
     }
 
     fn take(&mut self, path: &Path) -> Option<LoadedImagePayload> {
         let key = path.to_path_buf();
         let value = self.map.remove(&key)?;
+        if let Some(bytes) = self.byte_sizes.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(bytes);
+        }
         if let Some(index) = self.order.iter().position(|candidate| candidate == path) {
             let _ = self.order.remove(index);
         }
@@ -108,12 +231,20 @@ impl PreloadCache {
     }
 
     fn insert(&mut self, path: PathBuf, payload: LoadedImagePayload) {
+        let payload_bytes = estimate_payload_bytes(&payload);
         if self.map.contains_key(&path) {
+            if let Some(previous_bytes) = self.byte_sizes.insert(path.clone(), payload_bytes) {
+                self.total_bytes = self.total_bytes.saturating_sub(previous_bytes);
+            }
+            self.total_bytes = self.total_bytes.saturating_add(payload_bytes);
             self.map.insert(path.clone(), payload);
             self.touch(&path);
+            self.evict();
             return;
         }
         self.map.insert(path.clone(), payload);
+        self.byte_sizes.insert(path.clone(), payload_bytes);
+        self.total_bytes = self.total_bytes.saturating_add(payload_bytes);
         self.order.push_back(path);
         self.evict();
     }
@@ -127,9 +258,12 @@ impl PreloadCache {
     }
 
     fn evict(&mut self) {
-        while self.map.len() > self.capacity {
+        while self.map.len() > self.capacity || self.total_bytes > self.max_bytes {
             if let Some(oldest) = self.order.pop_front() {
                 self.map.remove(&oldest);
+                if let Some(bytes) = self.byte_sizes.remove(&oldest) {
+                    self.total_bytes = self.total_bytes.saturating_sub(bytes);
+                }
             } else {
                 break;
             }
@@ -180,12 +314,20 @@ fn thumbnail_worker_count() -> usize {
 
 fn run_worker(command_rx: Receiver<WorkerCommand>, result_tx: Sender<WorkerResult>) {
     log::debug!(target: "imranview::worker", "worker thread started");
-    let mut preload_cache = PreloadCache::new(6);
+    let mut preload_cache = PreloadCache::new(PRELOAD_CACHE_CAP, PRELOAD_CACHE_MAX_BYTES);
     while let Ok(command) = command_rx.recv() {
         let result = match command {
             WorkerCommand::OpenImage { request_id, path } => {
                 Some(run_open(request_id, path, &mut preload_cache))
             }
+            WorkerCommand::OpenDirectory {
+                request_id,
+                directory,
+            } => Some(run_open_directory(
+                request_id,
+                directory,
+                &mut preload_cache,
+            )),
             WorkerCommand::SaveImage {
                 request_id,
                 path,
@@ -198,6 +340,14 @@ fn run_worker(command_rx: Receiver<WorkerCommand>, result_tx: Sender<WorkerResul
                 image,
             } => Some(run_transform(request_id, op, image)),
             WorkerCommand::PreloadImage { path } => run_preload(path, &mut preload_cache),
+            WorkerCommand::BatchConvert {
+                request_id,
+                options,
+            } => Some(run_batch_convert(request_id, options)),
+            WorkerCommand::FileOperation {
+                request_id,
+                operation,
+            } => Some(run_file_operation(request_id, operation)),
         };
 
         if let Some(result) = result {
@@ -293,6 +443,52 @@ fn run_open(request_id: u64, path: PathBuf, preload_cache: &mut PreloadCache) ->
     })
 }
 
+fn run_open_directory(
+    request_id: u64,
+    directory: PathBuf,
+    preload_cache: &mut PreloadCache,
+) -> WorkerResult {
+    log::debug!(
+        target: "imranview::worker",
+        "open directory start request_id={} directory={}",
+        request_id,
+        directory.display()
+    );
+    let started = Instant::now();
+    let output = (|| -> Result<WorkerResult> {
+        let files = collect_images_in_directory(&directory)?;
+        let path = files
+            .first()
+            .cloned()
+            .context("selected folder has no supported images")?;
+        let loaded = if let Some(cached) = preload_cache.take(&path) {
+            log::debug!(
+                target: "imranview::worker",
+                "open directory cache hit request_id={} path={}",
+                request_id,
+                path.display()
+            );
+            cached
+        } else {
+            load_image_payload(&path)?
+        };
+        Ok(WorkerResult::Opened {
+            request_id,
+            path,
+            directory,
+            files,
+            loaded,
+        })
+    })();
+
+    log_timing("open_image", started.elapsed(), OPEN_IMAGE_BUDGET);
+    output.unwrap_or_else(|err| WorkerResult::Failed {
+        request_id: Some(request_id),
+        kind: WorkerRequestKind::Open,
+        error: err.to_string(),
+    })
+}
+
 fn run_preload(path: PathBuf, preload_cache: &mut PreloadCache) -> Option<WorkerResult> {
     log::debug!(
         target: "imranview::worker",
@@ -358,15 +554,221 @@ fn run_transform(request_id: u64, op: TransformOp, image: Arc<DynamicImage>) -> 
         op
     );
     let started = Instant::now();
-    let transformed = match op {
-        TransformOp::RotateLeft => image.rotate270(),
-        TransformOp::RotateRight => image.rotate90(),
-        TransformOp::FlipHorizontal => image.fliph(),
-        TransformOp::FlipVertical => image.flipv(),
-    };
-    let loaded = payload_from_working_image(Arc::new(transformed));
-    log_timing("edit_image", started.elapsed(), EDIT_IMAGE_BUDGET);
-    WorkerResult::Transformed { request_id, loaded }
+    let transformed = apply_transform(op, image.as_ref());
+
+    match transformed {
+        Ok(transformed) => {
+            let loaded = payload_from_working_image(Arc::new(transformed));
+            log_timing("edit_image", started.elapsed(), EDIT_IMAGE_BUDGET);
+            WorkerResult::Transformed { request_id, loaded }
+        }
+        Err(err) => WorkerResult::Failed {
+            request_id: Some(request_id),
+            kind: WorkerRequestKind::Edit,
+            error: err.to_string(),
+        },
+    }
+}
+
+fn apply_transform(op: TransformOp, image: &DynamicImage) -> Result<DynamicImage> {
+    match op {
+        TransformOp::RotateLeft => Ok(image.rotate270()),
+        TransformOp::RotateRight => Ok(image.rotate90()),
+        TransformOp::FlipHorizontal => Ok(image.fliph()),
+        TransformOp::FlipVertical => Ok(image.flipv()),
+        TransformOp::Resize {
+            width,
+            height,
+            filter,
+        } => {
+            if width == 0 || height == 0 {
+                return Err(anyhow!("resize dimensions must be greater than zero"));
+            }
+            Ok(image.resize_exact(width, height, filter.to_image_filter()))
+        }
+        TransformOp::Crop {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            let (source_width, source_height) = image.dimensions();
+            if width == 0 || height == 0 {
+                return Err(anyhow!("crop dimensions must be greater than zero"));
+            }
+            if x >= source_width || y >= source_height {
+                return Err(anyhow!("crop origin is outside image bounds"));
+            }
+            let end_x = x.saturating_add(width);
+            let end_y = y.saturating_add(height);
+            if end_x > source_width || end_y > source_height {
+                return Err(anyhow!("crop rectangle exceeds image bounds"));
+            }
+            Ok(image.crop_imm(x, y, width, height))
+        }
+        TransformOp::ColorAdjust(params) => Ok(apply_color_adjustments(image, params)),
+    }
+}
+
+fn apply_color_adjustments(image: &DynamicImage, params: ColorAdjustParams) -> DynamicImage {
+    let mut rgba = image.to_rgba8();
+    let brightness = params.brightness.clamp(-255, 255) as f32 / 255.0;
+    let contrast = 1.0 + (params.contrast.clamp(-100.0, 100.0) / 100.0);
+    let gamma = params.gamma.clamp(0.1, 5.0);
+    let saturation = params.saturation.clamp(0.0, 3.0);
+
+    for pixel in rgba.pixels_mut() {
+        let alpha = pixel[3];
+        let mut r = pixel[0] as f32 / 255.0;
+        let mut g = pixel[1] as f32 / 255.0;
+        let mut b = pixel[2] as f32 / 255.0;
+
+        r = ((r + brightness - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+        g = ((g + brightness - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+        b = ((b + brightness - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+
+        let gray = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+        r = (gray + (r - gray) * saturation).clamp(0.0, 1.0);
+        g = (gray + (g - gray) * saturation).clamp(0.0, 1.0);
+        b = (gray + (b - gray) * saturation).clamp(0.0, 1.0);
+
+        if params.grayscale {
+            r = gray;
+            g = gray;
+            b = gray;
+        }
+
+        r = r.powf(1.0 / gamma).clamp(0.0, 1.0);
+        g = g.powf(1.0 / gamma).clamp(0.0, 1.0);
+        b = b.powf(1.0 / gamma).clamp(0.0, 1.0);
+
+        pixel[0] = (r * 255.0).round() as u8;
+        pixel[1] = (g * 255.0).round() as u8;
+        pixel[2] = (b * 255.0).round() as u8;
+        pixel[3] = alpha;
+    }
+
+    DynamicImage::ImageRgba8(rgba)
+}
+
+fn run_batch_convert(request_id: u64, options: BatchConvertOptions) -> WorkerResult {
+    log::debug!(
+        target: "imranview::worker",
+        "batch convert start request_id={} input={} output={} format={:?}",
+        request_id,
+        options.input_dir.display(),
+        options.output_dir.display(),
+        options.output_format
+    );
+
+    let result = (|| -> Result<WorkerResult> {
+        fs::create_dir_all(&options.output_dir)
+            .with_context(|| format!("failed to create {}", options.output_dir.display()))?;
+
+        let files = collect_images_in_directory(&options.input_dir)?;
+        let mut processed = 0usize;
+        let mut failed = 0usize;
+        let save_format = options
+            .output_format
+            .to_save_format(options.jpeg_quality.clamp(1, 100));
+        let extension = save_format.extension();
+
+        for (offset, path) in files.iter().enumerate() {
+            let stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".to_owned());
+            let index = options.start_index.saturating_add(offset as u32);
+            let name = if options.rename_prefix.trim().is_empty() {
+                format!("{stem}.{extension}")
+            } else {
+                format!("{}{:05}.{extension}", options.rename_prefix.trim(), index)
+            };
+            let output_path = options.output_dir.join(name);
+
+            let one = (|| -> Result<()> {
+                let image = load_working_image(path)?;
+                save_image_with_format(&output_path, &image, save_format)?;
+                Ok(())
+            })();
+
+            if one.is_ok() {
+                processed += 1;
+            } else {
+                failed += 1;
+            }
+        }
+
+        Ok(WorkerResult::BatchCompleted {
+            request_id,
+            processed,
+            failed,
+            output_dir: options.output_dir,
+        })
+    })();
+
+    result.unwrap_or_else(|err| WorkerResult::Failed {
+        request_id: Some(request_id),
+        kind: WorkerRequestKind::Batch,
+        error: err.to_string(),
+    })
+}
+
+fn run_file_operation(request_id: u64, operation: FileOperation) -> WorkerResult {
+    let operation_for_result = operation.clone();
+    let result = (|| -> Result<()> {
+        match operation {
+            FileOperation::Rename { from, to } => {
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                fs::rename(&from, &to)
+                    .with_context(|| format!("failed to rename {}", from.display()))?;
+            }
+            FileOperation::Delete { path } => {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to delete {}", path.display()))?;
+            }
+            FileOperation::Copy { from, to } => {
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                fs::copy(&from, &to)
+                    .with_context(|| format!("failed to copy {}", from.display()))?;
+            }
+            FileOperation::Move { from, to } => {
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                match fs::rename(&from, &to) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        fs::copy(&from, &to)
+                            .with_context(|| format!("failed to move {}", from.display()))?;
+                        fs::remove_file(&from).with_context(|| {
+                            format!("failed to remove source {}", from.display())
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => WorkerResult::FileOperationCompleted {
+            request_id,
+            operation: operation_for_result,
+        },
+        Err(err) => WorkerResult::Failed {
+            request_id: Some(request_id),
+            kind: WorkerRequestKind::File,
+            error: err.to_string(),
+        },
+    }
 }
 
 fn run_thumbnail(path: PathBuf) -> WorkerResult {
@@ -382,5 +784,73 @@ fn run_thumbnail(path: PathBuf) -> WorkerResult {
             kind: WorkerRequestKind::Thumbnail,
             error: err.to_string(),
         },
+    }
+}
+
+fn estimate_payload_bytes(payload: &LoadedImagePayload) -> usize {
+    let preview_bytes = payload.preview_rgba.len();
+    let working_bytes = (payload.original_width as usize)
+        .saturating_mul(payload.original_height as usize)
+        .saturating_mul(4);
+    preview_bytes.saturating_add(working_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+
+    use super::{ColorAdjustParams, ResizeFilter, TransformOp, apply_transform};
+
+    fn test_image(width: u32, height: u32) -> DynamicImage {
+        let image = RgbaImage::from_pixel(width, height, Rgba([120, 80, 30, 255]));
+        DynamicImage::ImageRgba8(image)
+    }
+
+    #[test]
+    fn resize_transform_changes_dimensions() {
+        let source = test_image(32, 20);
+        let resized = apply_transform(
+            TransformOp::Resize {
+                width: 10,
+                height: 8,
+                filter: ResizeFilter::Triangle,
+            },
+            &source,
+        )
+        .expect("resize should succeed");
+        assert_eq!(resized.dimensions(), (10, 8));
+    }
+
+    #[test]
+    fn crop_transform_changes_dimensions() {
+        let source = test_image(64, 40);
+        let cropped = apply_transform(
+            TransformOp::Crop {
+                x: 4,
+                y: 6,
+                width: 20,
+                height: 10,
+            },
+            &source,
+        )
+        .expect("crop should succeed");
+        assert_eq!(cropped.dimensions(), (20, 10));
+    }
+
+    #[test]
+    fn color_adjust_transform_preserves_dimensions() {
+        let source = test_image(16, 12);
+        let adjusted = apply_transform(
+            TransformOp::ColorAdjust(ColorAdjustParams {
+                brightness: 12,
+                contrast: 18.0,
+                gamma: 1.4,
+                saturation: 1.2,
+                grayscale: false,
+            }),
+            &source,
+        )
+        .expect("color adjust should succeed");
+        assert_eq!(adjusted.dimensions(), (16, 12));
     }
 }

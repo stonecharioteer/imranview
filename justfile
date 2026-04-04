@@ -39,3 +39,32 @@ run *args:
     fi
 
     "${cmd[@]}"
+
+perf-gate *logs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    logs=( {{logs}} )
+    if [[ ${#logs[@]} -eq 0 ]]; then
+      logs=(debug.log)
+    fi
+
+    ./scripts/perf_gate.sh "${logs[@]}"
+
+ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    cargo check --all-targets
+    RUST_LOG=imranview::perf=debug cargo test --all-targets -- --nocapture 2>&1 | tee perf.log
+    ./scripts/perf_gate.sh perf.log
+
+package target='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ -n "{{target}}" ]]; then
+      ./scripts/package_release.sh "{{target}}"
+    else
+      ./scripts/package_release.sh
+    fi

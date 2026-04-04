@@ -4,12 +4,15 @@ mod image_io;
 mod native_menu;
 mod perf;
 mod settings;
+mod shortcuts;
 mod worker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use eframe::egui;
@@ -17,14 +20,21 @@ use eframe::egui;
 use crate::app_state::{AppState, ThumbnailEntry};
 #[cfg(target_os = "macos")]
 use crate::native_menu::{NativeMenu, NativeMenuAction};
-use crate::settings::{load_settings, save_settings};
-use crate::worker::{TransformOp, WorkerCommand, WorkerRequestKind, WorkerResult};
+use crate::settings::{PersistedSettings, load_settings, save_settings};
+use crate::shortcuts::{ShortcutAction, menu_item_label};
+use crate::worker::{
+    BatchConvertOptions, BatchOutputFormat, ColorAdjustParams, FileOperation, ResizeFilter,
+    TransformOp, WorkerCommand, WorkerRequestKind, WorkerResult,
+};
 
 const THUMB_TEXTURE_CACHE_CAP: usize = 320;
+const THUMB_TEXTURE_CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
 const THUMB_CARD_WIDTH: f32 = 120.0;
 const THUMB_CARD_HEIGHT: f32 = 100.0;
 const TOOLBAR_ICON_SIZE: f32 = 18.0;
 const APP_FAVICON_PNG: &[u8] = include_bytes!("../assets/branding/favicon.png");
+const FOLDER_PANEL_LIST_LIMIT: usize = 256;
+const RECENT_MENU_LIMIT: usize = 12;
 
 #[derive(Clone)]
 struct ToolbarIcons {
@@ -127,30 +137,145 @@ struct PendingRequests {
     latest_open: u64,
     latest_save: u64,
     latest_edit: u64,
+    latest_batch: u64,
+    latest_file: u64,
     open_inflight: bool,
     save_inflight: bool,
     edit_inflight: bool,
+    batch_inflight: bool,
+    file_inflight: bool,
     queued_navigation_steps: i32,
 }
 
 impl PendingRequests {
     fn has_inflight(&self) -> bool {
-        self.open_inflight || self.save_inflight || self.edit_inflight
+        self.open_inflight
+            || self.save_inflight
+            || self.edit_inflight
+            || self.batch_inflight
+            || self.file_inflight
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ViewportSnapshot {
+    position: Option<[f32; 2]>,
+    inner_size: Option<[f32; 2]>,
+    maximized: Option<bool>,
+    fullscreen: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FolderPanelCache {
+    current_directory: Option<PathBuf>,
+    ancestors: Vec<PathBuf>,
+    siblings: Vec<PathBuf>,
+    children: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct ResizeDialogState {
+    open: bool,
+    width: u32,
+    height: u32,
+    keep_aspect: bool,
+    filter: ResizeFilter,
+}
+
+impl Default for ResizeDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            width: 0,
+            height: 0,
+            keep_aspect: true,
+            filter: ResizeFilter::Lanczos3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CropDialogState {
+    open: bool,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ColorDialogState {
+    open: bool,
+    brightness: i32,
+    contrast: f32,
+    gamma: f32,
+    saturation: f32,
+    grayscale: bool,
+}
+
+impl Default for ColorDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            brightness: 0,
+            contrast: 0.0,
+            gamma: 1.0,
+            saturation: 1.0,
+            grayscale: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BatchDialogState {
+    open: bool,
+    input_dir: String,
+    output_dir: String,
+    output_format: BatchOutputFormat,
+    rename_prefix: String,
+    start_index: u32,
+    jpeg_quality: u8,
+}
+
+impl Default for BatchDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            input_dir: String::new(),
+            output_dir: String::new(),
+            output_format: BatchOutputFormat::Jpeg,
+            rename_prefix: String::new(),
+            start_index: 1,
+            jpeg_quality: 90,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RenameDialogState {
+    open: bool,
+    target_path: Option<PathBuf>,
+    new_name: String,
 }
 
 struct ThumbTextureCache {
     map: HashMap<PathBuf, egui::TextureHandle>,
+    byte_sizes: HashMap<PathBuf, usize>,
     order: VecDeque<PathBuf>,
     capacity: usize,
+    max_bytes: usize,
+    total_bytes: usize,
 }
 
 impl ThumbTextureCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
             map: HashMap::new(),
+            byte_sizes: HashMap::new(),
             order: VecDeque::new(),
             capacity,
+            max_bytes,
+            total_bytes: 0,
         }
     }
 
@@ -162,13 +287,21 @@ impl ThumbTextureCache {
     }
 
     fn insert(&mut self, path: PathBuf, texture: egui::TextureHandle) {
+        let bytes = Self::estimate_texture_bytes(&texture);
         if self.map.contains_key(&path) {
+            if let Some(previous_bytes) = self.byte_sizes.insert(path.clone(), bytes) {
+                self.total_bytes = self.total_bytes.saturating_sub(previous_bytes);
+            }
+            self.total_bytes = self.total_bytes.saturating_add(bytes);
             self.map.insert(path.clone(), texture);
             self.touch(&path);
+            self.evict_if_needed();
             return;
         }
 
         self.map.insert(path.clone(), texture);
+        self.byte_sizes.insert(path.clone(), bytes);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
         self.order.push_back(path);
         self.evict_if_needed();
     }
@@ -182,13 +315,21 @@ impl ThumbTextureCache {
     }
 
     fn evict_if_needed(&mut self) {
-        while self.map.len() > self.capacity {
+        while self.map.len() > self.capacity || self.total_bytes > self.max_bytes {
             if let Some(oldest) = self.order.pop_front() {
                 self.map.remove(&oldest);
+                if let Some(bytes) = self.byte_sizes.remove(&oldest) {
+                    self.total_bytes = self.total_bytes.saturating_sub(bytes);
+                }
             } else {
                 break;
             }
         }
+    }
+
+    fn estimate_texture_bytes(texture: &egui::TextureHandle) -> usize {
+        let [width, height] = texture.size();
+        width.saturating_mul(height).saturating_mul(4)
     }
 }
 
@@ -208,6 +349,17 @@ struct ImranViewApp {
     about_icon_texture: Option<egui::TextureHandle>,
     last_logged_thumb_entry_count: Option<usize>,
     scroll_thumbnail_to_current: bool,
+    folder_panel_cache: FolderPanelCache,
+    last_viewport_snapshot: Option<ViewportSnapshot>,
+    resize_dialog: ResizeDialogState,
+    crop_dialog: CropDialogState,
+    color_dialog: ColorDialogState,
+    batch_dialog: BatchDialogState,
+    rename_dialog: RenameDialogState,
+    confirm_delete_current: bool,
+    info_message: Option<String>,
+    slideshow_running: bool,
+    slideshow_last_tick: Instant,
     show_about_window: bool,
     center_about_window_next_frame: bool,
     #[cfg(target_os = "macos")]
@@ -215,8 +367,12 @@ struct ImranViewApp {
 }
 
 impl ImranViewApp {
-    fn new(cc: &eframe::CreationContext<'_>, cli_path: Option<PathBuf>) -> Self {
-        let state = AppState::new_with_settings(load_settings());
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        cli_path: Option<PathBuf>,
+        settings: PersistedSettings,
+    ) -> Self {
+        let state = AppState::new_with_settings(settings);
         let (worker_tx, worker_thread_rx) = mpsc::channel::<WorkerCommand>();
         let (thumbnail_tx, thumbnail_rx) = mpsc::channel::<PathBuf>();
         let (worker_thread_tx, worker_rx) = mpsc::channel::<WorkerResult>();
@@ -242,7 +398,7 @@ impl ImranViewApp {
             pending: PendingRequests::default(),
             main_texture: None,
             main_texture_generation: 1,
-            thumb_cache: ThumbTextureCache::new(THUMB_TEXTURE_CACHE_CAP),
+            thumb_cache: ThumbTextureCache::new(THUMB_TEXTURE_CACHE_CAP, THUMB_TEXTURE_CACHE_MAX_BYTES),
             inflight_thumbnails: HashSet::new(),
             inflight_preloads: HashSet::new(),
             toolbar_icons: ToolbarIcons::try_load(&cc.egui_ctx),
@@ -254,6 +410,17 @@ impl ImranViewApp {
                 .ok(),
             last_logged_thumb_entry_count: None,
             scroll_thumbnail_to_current: false,
+            folder_panel_cache: FolderPanelCache::default(),
+            last_viewport_snapshot: None,
+            resize_dialog: ResizeDialogState::default(),
+            crop_dialog: CropDialogState::default(),
+            color_dialog: ColorDialogState::default(),
+            batch_dialog: BatchDialogState::default(),
+            rename_dialog: RenameDialogState::default(),
+            confirm_delete_current: false,
+            info_message: None,
+            slideshow_running: false,
+            slideshow_last_tick: Instant::now(),
             show_about_window: false,
             center_about_window_next_frame: false,
             #[cfg(target_os = "macos")]
@@ -306,6 +473,33 @@ impl ImranViewApp {
             self.pending.open_inflight = false;
             log::error!(target: "imranview::ui", "failed to queue open-image command");
             self.state.set_error("failed to queue open-image command");
+        }
+    }
+
+    fn dispatch_open_directory(&mut self, directory: PathBuf) {
+        let request_id = self.next_request_id();
+        self.pending.latest_open = request_id;
+        self.pending.open_inflight = true;
+        self.pending.queued_navigation_steps = 0;
+        log::debug!(
+            target: "imranview::ui",
+            "queue directory open request_id={} directory={}",
+            request_id,
+            directory.display()
+        );
+
+        if self
+            .worker_tx
+            .send(WorkerCommand::OpenDirectory {
+                request_id,
+                directory,
+            })
+            .is_err()
+        {
+            self.pending.open_inflight = false;
+            log::error!(target: "imranview::ui", "failed to queue open-directory command");
+            self.state
+                .set_error("failed to queue open-directory command");
         }
     }
 
@@ -382,6 +576,57 @@ impl ImranViewApp {
             log::error!(target: "imranview::ui", "failed to queue transform-image command");
             self.state
                 .set_error("failed to queue transform-image command");
+        }
+    }
+
+    fn dispatch_batch_convert(&mut self, options: BatchConvertOptions) {
+        let request_id = self.next_request_id();
+        self.pending.latest_batch = request_id;
+        self.pending.batch_inflight = true;
+        log::debug!(
+            target: "imranview::ui",
+            "queue batch convert request_id={} input={} output={}",
+            request_id,
+            options.input_dir.display(),
+            options.output_dir.display()
+        );
+
+        if self
+            .worker_tx
+            .send(WorkerCommand::BatchConvert {
+                request_id,
+                options,
+            })
+            .is_err()
+        {
+            self.pending.batch_inflight = false;
+            self.state
+                .set_error("failed to queue batch-convert command");
+        }
+    }
+
+    fn dispatch_file_operation(&mut self, operation: FileOperation) {
+        let request_id = self.next_request_id();
+        self.pending.latest_file = request_id;
+        self.pending.file_inflight = true;
+        log::debug!(
+            target: "imranview::ui",
+            "queue file operation request_id={} op={:?}",
+            request_id,
+            operation
+        );
+
+        if self
+            .worker_tx
+            .send(WorkerCommand::FileOperation {
+                request_id,
+                operation,
+            })
+            .is_err()
+        {
+            self.pending.file_inflight = false;
+            self.state
+                .set_error("failed to queue file operation command");
         }
     }
 
@@ -524,6 +769,7 @@ impl ImranViewApp {
                 self.pending.open_inflight = false;
                 self.state
                     .apply_open_payload(path, directory, files, loaded);
+                self.clear_folder_panel_cache();
                 self.update_main_texture_from_state(ctx);
                 self.scroll_thumbnail_to_current = true;
                 self.schedule_preload_neighbors();
@@ -577,6 +823,69 @@ impl ImranViewApp {
                 }
                 self.update_main_texture_from_state(ctx);
             }
+            WorkerResult::BatchCompleted {
+                request_id,
+                processed,
+                failed,
+                output_dir,
+            } => {
+                if request_id != self.pending.latest_batch {
+                    log::debug!(
+                        target: "imranview::worker",
+                        "drop stale batch result request_id={} latest_batch={}",
+                        request_id,
+                        self.pending.latest_batch
+                    );
+                    return;
+                }
+                self.pending.batch_inflight = false;
+                self.info_message = Some(format!(
+                    "Batch complete: {} processed, {} failed ({})",
+                    processed,
+                    failed,
+                    output_dir.display()
+                ));
+            }
+            WorkerResult::FileOperationCompleted {
+                request_id,
+                operation,
+            } => {
+                if request_id != self.pending.latest_file {
+                    log::debug!(
+                        target: "imranview::worker",
+                        "drop stale file-op result request_id={} latest_file={}",
+                        request_id,
+                        self.pending.latest_file
+                    );
+                    return;
+                }
+                self.pending.file_inflight = false;
+                match operation {
+                    FileOperation::Rename { from, to } => {
+                        if self.state.current_file_path() == Some(from.clone()) {
+                            self.dispatch_open(to.clone(), false);
+                        }
+                        self.info_message = Some(format!("Renamed to {}", to.display()));
+                    }
+                    FileOperation::Delete { path } => {
+                        self.info_message = Some(format!("Deleted {}", path.display()));
+                        if self.state.current_file_path() == Some(path) {
+                            if let Some(directory) = self.state.current_directory_path() {
+                                self.dispatch_open_directory(directory);
+                            }
+                        }
+                    }
+                    FileOperation::Copy { from: _, to } => {
+                        self.info_message = Some(format!("Copied to {}", to.display()));
+                    }
+                    FileOperation::Move { from, to } => {
+                        if self.state.current_file_path() == Some(from.clone()) {
+                            self.dispatch_open(to.clone(), false);
+                        }
+                        self.info_message = Some(format!("Moved to {}", to.display()));
+                    }
+                }
+            }
             WorkerResult::ThumbnailDecoded { path, payload } => {
                 self.inflight_thumbnails.remove(&path);
                 let texture = Self::texture_from_rgba(
@@ -589,10 +898,11 @@ impl ImranViewApp {
                 self.thumb_cache.insert(path, texture);
                 log::debug!(
                     target: "imranview::thumb",
-                    "thumbnail decoded {}x{} cache_size={} inflight={}",
+                    "thumbnail decoded {}x{} cache_size={} cache_bytes={} inflight={}",
                     payload.width,
                     payload.height,
                     self.thumb_cache.map.len(),
+                    self.thumb_cache.total_bytes,
                     self.inflight_thumbnails.len()
                 );
             }
@@ -617,15 +927,28 @@ impl ImranViewApp {
                     request_id,
                     error
                 );
+                let error_message = Self::format_worker_error(kind, &error);
                 match (kind, request_id) {
                     (WorkerRequestKind::Open, Some(id)) if id == self.pending.latest_open => {
                         self.pending.open_inflight = false;
                         self.pending.queued_navigation_steps = 0;
-                        self.state.set_error(error);
+                        self.state.set_error(error_message);
                     }
                     (WorkerRequestKind::Save, Some(id)) if id == self.pending.latest_save => {
                         self.pending.save_inflight = false;
-                        self.state.set_error(error);
+                        self.state.set_error(error_message);
+                    }
+                    (WorkerRequestKind::Edit, Some(id)) if id == self.pending.latest_edit => {
+                        self.pending.edit_inflight = false;
+                        self.state.set_error(error_message);
+                    }
+                    (WorkerRequestKind::Batch, Some(id)) if id == self.pending.latest_batch => {
+                        self.pending.batch_inflight = false;
+                        self.state.set_error(error_message);
+                    }
+                    (WorkerRequestKind::File, Some(id)) if id == self.pending.latest_file => {
+                        self.pending.file_inflight = false;
+                        self.state.set_error(error_message);
                     }
                     (WorkerRequestKind::Preload, _) => {
                         // Preload failures are expected for transient/unsupported files.
@@ -669,37 +992,45 @@ impl ImranViewApp {
     }
 
     fn run_shortcuts(&mut self, ctx: &egui::Context) {
-        let ctrl_s = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
-        if ctrl_s {
-            let shift = ctx.input(|i| i.modifiers.shift);
-            if shift {
-                self.open_save_as_dialog();
-            } else {
-                self.dispatch_save(None, false);
-            }
+        if shortcuts::trigger(ctx, ShortcutAction::SaveAs) {
+            self.open_save_as_dialog();
+        } else if shortcuts::trigger(ctx, ShortcutAction::Save) {
+            self.dispatch_save(None, false);
         }
-
-        if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+        if shortcuts::trigger(ctx, ShortcutAction::Open) {
+            self.open_path_dialog();
+        }
+        if shortcuts::trigger(ctx, ShortcutAction::NextImage) {
             self.open_next();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+        if shortcuts::trigger(ctx, ShortcutAction::PreviousImage) {
             self.open_previous();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)) {
+        if shortcuts::trigger(ctx, ShortcutAction::ZoomIn) {
             self.state.zoom_in();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Minus)) {
+        if shortcuts::trigger(ctx, ShortcutAction::ZoomOut) {
             self.state.zoom_out();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Num0)) {
+        if shortcuts::trigger(ctx, ShortcutAction::Fit) {
             self.state.set_zoom_fit();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
+        if shortcuts::trigger(ctx, ShortcutAction::ActualSize) {
             self.state.set_zoom_actual();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            if self.slideshow_running {
+                self.stop_slideshow();
+            } else {
+                self.start_slideshow();
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.stop_slideshow();
         }
 
         let wheel_zoom = ctx.input(|i| {
-            if i.modifiers.ctrl {
+            if i.modifiers.command || i.modifiers.ctrl {
                 i.raw_scroll_delta.y
             } else {
                 0.0
@@ -712,10 +1043,12 @@ impl ImranViewApp {
 
     fn open_next(&mut self) {
         self.queue_navigation_step(1);
+        self.slideshow_last_tick = Instant::now();
     }
 
     fn open_previous(&mut self) {
         self.queue_navigation_step(-1);
+        self.slideshow_last_tick = Instant::now();
     }
 
     fn open_path_dialog(&mut self) {
@@ -763,9 +1096,220 @@ impl ImranViewApp {
         }
     }
 
+    fn open_resize_dialog(&mut self) {
+        if let Some((width, height)) = self.state.original_dimensions() {
+            self.resize_dialog.width = width;
+            self.resize_dialog.height = height;
+        }
+        self.resize_dialog.open = true;
+    }
+
+    fn open_crop_dialog(&mut self) {
+        if let Some((width, height)) = self.state.original_dimensions() {
+            self.crop_dialog.x = 0;
+            self.crop_dialog.y = 0;
+            self.crop_dialog.width = width;
+            self.crop_dialog.height = height;
+        }
+        self.crop_dialog.open = true;
+    }
+
+    fn open_color_dialog(&mut self) {
+        self.color_dialog = ColorDialogState::default();
+        self.color_dialog.open = true;
+    }
+
+    fn open_batch_dialog(&mut self) {
+        let input_dir = self
+            .state
+            .current_directory_path()
+            .or_else(|| self.state.preferred_open_directory());
+        if let Some(input_dir) = input_dir {
+            self.batch_dialog.input_dir = input_dir.display().to_string();
+            self.batch_dialog.output_dir = input_dir.join("output").display().to_string();
+        }
+        self.batch_dialog.open = true;
+    }
+
+    fn open_rename_dialog(&mut self) {
+        let Some(current_path) = self.state.current_file_path() else {
+            self.state.set_error("no image loaded");
+            return;
+        };
+        self.rename_dialog.target_path = Some(current_path.clone());
+        self.rename_dialog.new_name = current_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.rename_dialog.open = true;
+    }
+
+    fn copy_current_to_dialog(&mut self) {
+        let Some(source) = self.state.current_file_path() else {
+            self.state.set_error("no image loaded");
+            return;
+        };
+        let Some(file_name) = source.file_name() else {
+            self.state.set_error("failed to resolve current file name");
+            return;
+        };
+
+        let mut dialog = rfd::FileDialog::new().set_title("Copy image to folder");
+        if let Some(directory) = self.state.current_directory_path() {
+            dialog = dialog.set_directory(directory);
+        }
+        if let Some(destination_dir) = dialog.pick_folder() {
+            let destination = destination_dir.join(file_name);
+            self.dispatch_file_operation(FileOperation::Copy {
+                from: source,
+                to: destination,
+            });
+        }
+    }
+
+    fn move_current_to_dialog(&mut self) {
+        let Some(source) = self.state.current_file_path() else {
+            self.state.set_error("no image loaded");
+            return;
+        };
+        let Some(file_name) = source.file_name() else {
+            self.state.set_error("failed to resolve current file name");
+            return;
+        };
+
+        let mut dialog = rfd::FileDialog::new().set_title("Move image to folder");
+        if let Some(directory) = self.state.current_directory_path() {
+            dialog = dialog.set_directory(directory);
+        }
+        if let Some(destination_dir) = dialog.pick_folder() {
+            let destination = destination_dir.join(file_name);
+            self.dispatch_file_operation(FileOperation::Move {
+                from: source,
+                to: destination,
+            });
+        }
+    }
+
+    fn delete_current_file(&mut self) {
+        let Some(path) = self.state.current_file_path() else {
+            self.state.set_error("no image loaded");
+            return;
+        };
+        self.dispatch_file_operation(FileOperation::Delete { path });
+    }
+
     fn open_about_window(&mut self) {
         self.show_about_window = true;
         self.center_about_window_next_frame = true;
+    }
+
+    fn clear_folder_panel_cache(&mut self) {
+        self.folder_panel_cache = FolderPanelCache::default();
+    }
+
+    fn ensure_folder_panel_cache(&mut self) {
+        let current_directory = self.state.current_directory_path();
+        if self.folder_panel_cache.current_directory == current_directory {
+            return;
+        }
+
+        let mut cache = FolderPanelCache {
+            current_directory: current_directory.clone(),
+            ancestors: Vec::new(),
+            siblings: Vec::new(),
+            children: Vec::new(),
+        };
+
+        if let Some(current) = current_directory {
+            cache.ancestors = path_ancestors(&current);
+            if let Some(parent) = current.parent() {
+                cache.siblings = list_directories(parent, FOLDER_PANEL_LIST_LIMIT);
+            }
+            cache.children = list_directories(&current, FOLDER_PANEL_LIST_LIMIT);
+        }
+
+        self.folder_panel_cache = cache;
+    }
+
+    fn open_directory_from_panel(&mut self, directory: PathBuf) {
+        if self.state.current_directory_path() == Some(directory.clone()) {
+            return;
+        }
+        self.dispatch_open_directory(directory);
+    }
+
+    fn sync_viewport_state(&mut self, ctx: &egui::Context) {
+        let snapshot = Self::capture_viewport_snapshot(ctx);
+        if self.last_viewport_snapshot.as_ref() == Some(&snapshot) {
+            return;
+        }
+        self.last_viewport_snapshot = Some(snapshot.clone());
+        let changed = self.state.update_window_state(
+            snapshot.position,
+            snapshot.inner_size,
+            snapshot.maximized,
+            snapshot.fullscreen,
+        );
+        if changed && !ctx.input(|i| i.pointer.any_down()) {
+            self.persist_settings();
+        }
+    }
+
+    fn capture_viewport_snapshot(ctx: &egui::Context) -> ViewportSnapshot {
+        let quantize = |value: f32| (value * 2.0).round() / 2.0;
+        ctx.input(|input| {
+            let viewport = input.viewport();
+            ViewportSnapshot {
+                position: viewport
+                    .outer_rect
+                    .map(|rect| [quantize(rect.min.x), quantize(rect.min.y)]),
+                inner_size: viewport
+                    .inner_rect
+                    .map(|rect| [quantize(rect.width()), quantize(rect.height())]),
+                maximized: viewport.maximized,
+                fullscreen: viewport.fullscreen,
+            }
+        })
+    }
+
+    fn format_worker_error(kind: WorkerRequestKind, error: &str) -> String {
+        match kind {
+            WorkerRequestKind::Open => format!("Unable to open image: {error}"),
+            WorkerRequestKind::Save => format!("Unable to save image: {error}"),
+            WorkerRequestKind::Edit => format!("Unable to apply edit: {error}"),
+            WorkerRequestKind::Preload => format!("Background preload skipped: {error}"),
+            WorkerRequestKind::Thumbnail => format!("Thumbnail decode failed: {error}"),
+            WorkerRequestKind::Batch => format!("Batch convert failed: {error}"),
+            WorkerRequestKind::File => format!("File operation failed: {error}"),
+        }
+    }
+
+    fn start_slideshow(&mut self) {
+        if !self.state.has_image() {
+            self.state
+                .set_error("open an image before starting slideshow");
+            return;
+        }
+        self.slideshow_running = true;
+        self.slideshow_last_tick = Instant::now();
+    }
+
+    fn stop_slideshow(&mut self) {
+        self.slideshow_running = false;
+    }
+
+    fn run_slideshow_tick(&mut self) {
+        if !self.slideshow_running || !self.state.has_image() || self.pending.open_inflight {
+            return;
+        }
+
+        let interval = Duration::from_secs_f32(self.state.slideshow_interval_secs());
+        if self.slideshow_last_tick.elapsed() < interval {
+            return;
+        }
+
+        self.open_next();
+        self.slideshow_last_tick = Instant::now();
     }
 
     fn should_draw_in_window_menu(&self) -> bool {
@@ -794,6 +1338,13 @@ impl ImranViewApp {
                 NativeMenuAction::Open => self.open_path_dialog(),
                 NativeMenuAction::Save => self.dispatch_save(None, false),
                 NativeMenuAction::SaveAs => self.open_save_as_dialog(),
+                NativeMenuAction::RenameCurrent => self.open_rename_dialog(),
+                NativeMenuAction::CopyCurrentToFolder => self.copy_current_to_dialog(),
+                NativeMenuAction::MoveCurrentToFolder => self.move_current_to_dialog(),
+                NativeMenuAction::DeleteCurrent => {
+                    self.confirm_delete_current = true;
+                }
+                NativeMenuAction::BatchConvert => self.open_batch_dialog(),
                 NativeMenuAction::Exit => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -805,6 +1356,9 @@ impl ImranViewApp {
                 NativeMenuAction::FlipVertical => {
                     self.dispatch_transform(TransformOp::FlipVertical);
                 }
+                NativeMenuAction::Resize => self.open_resize_dialog(),
+                NativeMenuAction::Crop => self.open_crop_dialog(),
+                NativeMenuAction::ColorCorrections => self.open_color_dialog(),
                 NativeMenuAction::ToggleShowToolbar => {
                     self.state.set_show_toolbar(!self.state.show_toolbar());
                     self.persist_settings();
@@ -812,6 +1366,11 @@ impl ImranViewApp {
                 NativeMenuAction::ToggleShowStatusBar => {
                     self.state
                         .set_show_status_bar(!self.state.show_status_bar());
+                    self.persist_settings();
+                }
+                NativeMenuAction::ToggleShowMetadataPanel => {
+                    self.state
+                        .set_show_metadata_panel(!self.state.show_metadata_panel());
                     self.persist_settings();
                 }
                 NativeMenuAction::ToggleThumbnailStrip => {
@@ -835,24 +1394,125 @@ impl ImranViewApp {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open...").clicked() {
+                    if ui
+                        .button(menu_item_label(ctx, ShortcutAction::Open, "Open..."))
+                        .clicked()
+                    {
                         self.open_path_dialog();
                         ui.close_menu();
                     }
                     if ui
-                        .add_enabled(self.state.has_image(), egui::Button::new("Save"))
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new(menu_item_label(ctx, ShortcutAction::Save, "Save")),
+                        )
                         .clicked()
                     {
                         self.dispatch_save(None, false);
                         ui.close_menu();
                     }
                     if ui
-                        .add_enabled(self.state.has_image(), egui::Button::new("Save As..."))
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new(menu_item_label(
+                                ctx,
+                                ShortcutAction::SaveAs,
+                                "Save As...",
+                            )),
+                        )
                         .clicked()
                     {
                         self.open_save_as_dialog();
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Rename current..."),
+                        )
+                        .clicked()
+                    {
+                        self.open_rename_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Copy current to folder..."),
+                        )
+                        .clicked()
+                    {
+                        self.copy_current_to_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Move current to folder..."),
+                        )
+                        .clicked()
+                    {
+                        self.move_current_to_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Delete current..."),
+                        )
+                        .clicked()
+                    {
+                        self.confirm_delete_current = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Batch convert / rename...").clicked() {
+                        self.open_batch_dialog();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.menu_button("Recent files", |ui| {
+                        let recent_files: Vec<PathBuf> = self
+                            .state
+                            .recent_files()
+                            .iter()
+                            .take(RECENT_MENU_LIMIT)
+                            .cloned()
+                            .collect();
+                        if recent_files.is_empty() {
+                            ui.label("No recent files");
+                            return;
+                        }
+                        for path in recent_files {
+                            let label = format_recent_file_label(&path);
+                            let enabled = path.is_file();
+                            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                self.dispatch_open(path, false);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    ui.menu_button("Recent folders", |ui| {
+                        let recent_dirs: Vec<PathBuf> = self
+                            .state
+                            .recent_directories()
+                            .iter()
+                            .take(RECENT_MENU_LIMIT)
+                            .cloned()
+                            .collect();
+                        if recent_dirs.is_empty() {
+                            ui.label("No recent folders");
+                            return;
+                        }
+                        for path in recent_dirs {
+                            let label = format_recent_folder_label(&path);
+                            let enabled = path.is_dir();
+                            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                self.dispatch_open_directory(path);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     ui.separator();
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -888,6 +1548,150 @@ impl ImranViewApp {
                         self.dispatch_transform(TransformOp::FlipVertical);
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Resize / resample..."),
+                        )
+                        .clicked()
+                    {
+                        self.open_resize_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(self.state.has_image(), egui::Button::new("Crop..."))
+                        .clicked()
+                    {
+                        self.open_crop_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Color corrections..."),
+                        )
+                        .clicked()
+                    {
+                        self.open_color_dialog();
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("Image", |ui| {
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new(menu_item_label(
+                                ctx,
+                                ShortcutAction::PreviousImage,
+                                "Previous image",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        self.open_previous();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new(menu_item_label(
+                                ctx,
+                                ShortcutAction::NextImage,
+                                "Next image",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        self.open_next();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new(menu_item_label(
+                                ctx,
+                                ShortcutAction::ZoomIn,
+                                "Zoom in",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        self.state.zoom_in();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new(menu_item_label(
+                                ctx,
+                                ShortcutAction::ZoomOut,
+                                "Zoom out",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        self.state.zoom_out();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new(menu_item_label(
+                                ctx,
+                                ShortcutAction::Fit,
+                                "Fit to window",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        self.state.set_zoom_fit();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new(menu_item_label(
+                                ctx,
+                                ShortcutAction::ActualSize,
+                                "Actual size",
+                            )),
+                        )
+                        .clicked()
+                    {
+                        self.state.set_zoom_actual();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if self.slideshow_running {
+                        if ui.button("Stop slideshow    Space").clicked() {
+                            self.stop_slideshow();
+                            ui.close_menu();
+                        }
+                    } else if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Start slideshow    Space"),
+                        )
+                        .clicked()
+                    {
+                        self.start_slideshow();
+                        ui.close_menu();
+                    }
+                    let mut interval = self.state.slideshow_interval_secs();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut interval, 0.5..=30.0)
+                                .text("Interval (s)")
+                                .fixed_decimals(1),
+                        )
+                        .changed()
+                    {
+                        self.state.set_slideshow_interval_secs(interval);
+                        self.persist_settings();
+                    }
                 });
 
                 ui.menu_button("View", |ui| {
@@ -902,6 +1706,14 @@ impl ImranViewApp {
                     let mut show_toolbar = self.state.show_toolbar();
                     if ui.checkbox(&mut show_toolbar, "Show toolbar").changed() {
                         self.state.set_show_toolbar(show_toolbar);
+                        self.persist_settings();
+                    }
+                    let mut show_metadata_panel = self.state.show_metadata_panel();
+                    if ui
+                        .checkbox(&mut show_metadata_panel, "Metadata panel")
+                        .changed()
+                    {
+                        self.state.set_show_metadata_panel(show_metadata_panel);
                         self.persist_settings();
                     }
                     let mut show_thumbnail_strip = self.state.show_thumbnail_strip();
@@ -1122,6 +1934,9 @@ impl ImranViewApp {
                     ui.separator();
                     ui.label(self.state.image_counter_label());
                     ui.label(self.state.zoom_label());
+                    if self.slideshow_running {
+                        ui.label("Slideshow");
+                    }
                 });
             });
     }
@@ -1135,9 +1950,10 @@ impl ImranViewApp {
         if self.last_logged_thumb_entry_count != Some(entries.len()) {
             log::debug!(
                 target: "imranview::thumb",
-                "thumbnail strip entries={} cache_size={} inflight={}",
+                "thumbnail strip entries={} cache_size={} cache_bytes={} inflight={}",
                 entries.len(),
                 self.thumb_cache.map.len(),
+                self.thumb_cache.total_bytes,
                 self.inflight_thumbnails.len()
             );
             self.last_logged_thumb_entry_count = Some(entries.len());
@@ -1151,7 +1967,7 @@ impl ImranViewApp {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for entry in entries {
-                            self.draw_thumbnail_card(ui, &entry, false);
+                            self.draw_thumbnail_card(ui, &entry, false, THUMB_CARD_WIDTH);
                         }
                     });
                 });
@@ -1159,25 +1975,137 @@ impl ImranViewApp {
     }
 
     fn draw_thumbnail_window(&mut self, ctx: &egui::Context) {
+        self.ensure_folder_panel_cache();
+        let current_directory = self.folder_panel_cache.current_directory.clone();
+        let ancestors = self.folder_panel_cache.ancestors.clone();
+        let siblings = self.folder_panel_cache.siblings.clone();
+        let children = self.folder_panel_cache.children.clone();
+
+        let side_panel = egui::SidePanel::left("thumb-window-folders")
+            .resizable(true)
+            .default_width(self.state.thumbnail_sidebar_width())
+            .width_range(160.0..=420.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Folders");
+                    if ui.small_button("Refresh").clicked() {
+                        self.clear_folder_panel_cache();
+                    }
+                });
+                ui.separator();
+
+                let Some(current_directory) = current_directory.as_ref() else {
+                    ui.label("Open an image to browse folders.");
+                    return;
+                };
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label("Current path");
+                    for path in &ancestors {
+                        let is_current = path == current_directory;
+                        let label = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        if ui.selectable_label(is_current, label).clicked() {
+                            self.open_directory_from_panel(path.clone());
+                        }
+                    }
+                    ui.separator();
+
+                    ui.label("Sibling folders");
+                    if siblings.is_empty() {
+                        ui.label("No sibling folders");
+                    }
+                    for path in &siblings {
+                        let is_current = path == current_directory;
+                        let label = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        if ui.selectable_label(is_current, label).clicked() {
+                            self.open_directory_from_panel(path.clone());
+                        }
+                    }
+                    ui.separator();
+
+                    ui.label("Subfolders");
+                    if children.is_empty() {
+                        ui.label("No subfolders");
+                    }
+                    for path in &children {
+                        let label = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        if ui.selectable_label(false, label).clicked() {
+                            self.open_directory_from_panel(path.clone());
+                        }
+                    }
+                });
+            });
+
+        let panel_width = side_panel.response.rect.width();
+        if (panel_width - self.state.thumbnail_sidebar_width()).abs() > 0.5 {
+            self.state.set_thumbnail_sidebar_width(panel_width);
+            if !ctx.input(|i| i.pointer.any_down()) {
+                self.persist_settings();
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Thumbnails");
                 ui.separator();
                 ui.label(self.state.folder_label());
             });
+            ui.add_space(4.0);
+            let mut card_width = self.state.thumbnail_grid_card_width();
+            if ui
+                .add(egui::Slider::new(&mut card_width, 96.0..=240.0).text("Thumbnail size"))
+                .changed()
+            {
+                self.state.set_thumbnail_grid_card_width(card_width);
+                self.persist_settings();
+            }
             ui.separator();
 
             let entries = self.state.thumbnail_entries();
+            if entries.is_empty() {
+                ui.label("No images in this folder.");
+                return;
+            }
+
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for entry in entries {
-                    self.draw_thumbnail_card(ui, &entry, true);
-                    ui.separator();
+                let spacing = ui.spacing().item_spacing.x.max(6.0);
+                let usable_width = ui.available_width().max(card_width);
+                let columns = ((usable_width + spacing) / (card_width + spacing))
+                    .floor()
+                    .max(1.0) as usize;
+
+                for row in entries.chunks(columns) {
+                    ui.horizontal_top(|ui| {
+                        for entry in row {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(card_width, THUMB_CARD_HEIGHT + 56.0),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| self.draw_thumbnail_card(ui, entry, false, card_width),
+                            );
+                        }
+                    });
+                    ui.add_space(6.0);
                 }
             });
         });
     }
 
-    fn draw_thumbnail_card(&mut self, ui: &mut egui::Ui, entry: &ThumbnailEntry, row_mode: bool) {
+    fn draw_thumbnail_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        entry: &ThumbnailEntry,
+        row_mode: bool,
+        card_width: f32,
+    ) {
         let mut frame = egui::Frame::group(ui.style());
         if entry.current {
             frame = frame.fill(egui::Color32::from_rgb(216, 232, 251));
@@ -1186,7 +2114,7 @@ impl ImranViewApp {
         let response = frame.show(ui, |ui| {
             if row_mode {
                 ui.horizontal(|ui| {
-                    self.draw_thumbnail_image(ui, entry);
+                    self.draw_thumbnail_image(ui, entry, THUMB_CARD_WIDTH);
                     ui.vertical(|ui| {
                         ui.label(&entry.label);
                         if entry.current {
@@ -1195,8 +2123,8 @@ impl ImranViewApp {
                     });
                 });
             } else {
-                ui.set_width(THUMB_CARD_WIDTH);
-                self.draw_thumbnail_image(ui, entry);
+                ui.set_width(card_width);
+                self.draw_thumbnail_image(ui, entry, card_width);
                 ui.label(egui::RichText::new(&entry.label).small());
             }
 
@@ -1219,8 +2147,8 @@ impl ImranViewApp {
         }
     }
 
-    fn draw_thumbnail_image(&mut self, ui: &mut egui::Ui, entry: &ThumbnailEntry) {
-        let max_size = egui::vec2(THUMB_CARD_WIDTH - 8.0, THUMB_CARD_HEIGHT - 8.0);
+    fn draw_thumbnail_image(&mut self, ui: &mut egui::Ui, entry: &ThumbnailEntry, card_width: f32) {
+        let max_size = egui::vec2(card_width.max(36.0) - 8.0, THUMB_CARD_HEIGHT - 8.0);
         if let Some(texture) = self.thumb_cache.get(&entry.path) {
             let [tex_w, tex_h] = texture.size();
             let tex_w = tex_w as f32;
@@ -1338,6 +2266,472 @@ impl ImranViewApp {
         self.show_about_window = open;
     }
 
+    fn draw_error_banner(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.state.error_message().map(str::to_owned) else {
+            return;
+        };
+
+        egui::TopBottomPanel::top("error-banner")
+            .exact_height(30.0)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(71, 18, 18))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(egui::Color32::from_rgb(255, 214, 214), message);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Dismiss").clicked() {
+                                        self.state.clear_error();
+                                    }
+                                    if ui.small_button("Open...").clicked() {
+                                        self.open_path_dialog();
+                                    }
+                                },
+                            );
+                        });
+                    });
+            });
+    }
+
+    fn draw_info_banner(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.info_message.clone() else {
+            return;
+        };
+
+        egui::TopBottomPanel::top("info-banner")
+            .exact_height(28.0)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(20, 49, 28))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(egui::Color32::from_rgb(219, 255, 227), message);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Dismiss").clicked() {
+                                        self.info_message = None;
+                                    }
+                                },
+                            );
+                        });
+                    });
+            });
+    }
+
+    fn draw_resize_dialog(&mut self, ctx: &egui::Context) {
+        if !self.resize_dialog.open {
+            return;
+        }
+
+        let mut open = self.resize_dialog.open;
+        egui::Window::new("Resize / Resample")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let aspect = if let Some((width, height)) = self.state.original_dimensions() {
+                    if height > 0 {
+                        width as f32 / height as f32
+                    } else {
+                        1.0
+                    }
+                } else {
+                    1.0
+                };
+
+                let before_width = self.resize_dialog.width;
+                let before_height = self.resize_dialog.height;
+                ui.horizontal(|ui| {
+                    ui.label("Width:");
+                    ui.add(egui::DragValue::new(&mut self.resize_dialog.width).range(1..=65535));
+                    ui.label("Height:");
+                    ui.add(egui::DragValue::new(&mut self.resize_dialog.height).range(1..=65535));
+                });
+                ui.checkbox(&mut self.resize_dialog.keep_aspect, "Keep aspect ratio");
+                if self.resize_dialog.keep_aspect {
+                    if self.resize_dialog.width != before_width && aspect > 0.0 {
+                        self.resize_dialog.height =
+                            ((self.resize_dialog.width as f32 / aspect).round().max(1.0)) as u32;
+                    } else if self.resize_dialog.height != before_height && aspect > 0.0 {
+                        self.resize_dialog.width =
+                            ((self.resize_dialog.height as f32 * aspect).round().max(1.0)) as u32;
+                    }
+                }
+
+                ui.separator();
+                ui.label("Filter:");
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(
+                        &mut self.resize_dialog.filter,
+                        ResizeFilter::Nearest,
+                        "Nearest",
+                    );
+                    ui.selectable_value(
+                        &mut self.resize_dialog.filter,
+                        ResizeFilter::Triangle,
+                        "Triangle",
+                    );
+                    ui.selectable_value(
+                        &mut self.resize_dialog.filter,
+                        ResizeFilter::CatmullRom,
+                        "CatmullRom",
+                    );
+                    ui.selectable_value(
+                        &mut self.resize_dialog.filter,
+                        ResizeFilter::Gaussian,
+                        "Gaussian",
+                    );
+                    ui.selectable_value(
+                        &mut self.resize_dialog.filter,
+                        ResizeFilter::Lanczos3,
+                        "Lanczos3",
+                    );
+                });
+
+                ui.separator();
+                if ui.button("Apply").clicked() {
+                    self.dispatch_transform(TransformOp::Resize {
+                        width: self.resize_dialog.width.max(1),
+                        height: self.resize_dialog.height.max(1),
+                        filter: self.resize_dialog.filter,
+                    });
+                    self.resize_dialog.open = false;
+                }
+            });
+        self.resize_dialog.open = open;
+    }
+
+    fn draw_crop_dialog(&mut self, ctx: &egui::Context) {
+        if !self.crop_dialog.open {
+            return;
+        }
+
+        let mut open = self.crop_dialog.open;
+        egui::Window::new("Crop")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("X:");
+                    ui.add(egui::DragValue::new(&mut self.crop_dialog.x).range(0..=65535));
+                    ui.label("Y:");
+                    ui.add(egui::DragValue::new(&mut self.crop_dialog.y).range(0..=65535));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Width:");
+                    ui.add(egui::DragValue::new(&mut self.crop_dialog.width).range(1..=65535));
+                    ui.label("Height:");
+                    ui.add(egui::DragValue::new(&mut self.crop_dialog.height).range(1..=65535));
+                });
+
+                if ui.button("Apply").clicked() {
+                    self.dispatch_transform(TransformOp::Crop {
+                        x: self.crop_dialog.x,
+                        y: self.crop_dialog.y,
+                        width: self.crop_dialog.width.max(1),
+                        height: self.crop_dialog.height.max(1),
+                    });
+                    self.crop_dialog.open = false;
+                }
+            });
+        self.crop_dialog.open = open;
+    }
+
+    fn draw_color_dialog(&mut self, ctx: &egui::Context) {
+        if !self.color_dialog.open {
+            return;
+        }
+
+        let mut open = self.color_dialog.open;
+        egui::Window::new("Color Corrections")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.color_dialog.brightness, -255..=255)
+                        .text("Brightness"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.color_dialog.contrast, -100.0..=100.0)
+                        .text("Contrast"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.color_dialog.gamma, 0.1..=5.0)
+                        .text("Gamma")
+                        .fixed_decimals(2),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.color_dialog.saturation, 0.0..=3.0)
+                        .text("Saturation")
+                        .fixed_decimals(2),
+                );
+                ui.checkbox(&mut self.color_dialog.grayscale, "Grayscale");
+
+                if ui.button("Apply").clicked() {
+                    self.dispatch_transform(TransformOp::ColorAdjust(ColorAdjustParams {
+                        brightness: self.color_dialog.brightness,
+                        contrast: self.color_dialog.contrast,
+                        gamma: self.color_dialog.gamma,
+                        saturation: self.color_dialog.saturation,
+                        grayscale: self.color_dialog.grayscale,
+                    }));
+                    self.color_dialog.open = false;
+                }
+            });
+        self.color_dialog.open = open;
+    }
+
+    fn draw_batch_dialog(&mut self, ctx: &egui::Context) {
+        if !self.batch_dialog.open {
+            return;
+        }
+
+        let mut open = self.batch_dialog.open;
+        egui::Window::new("Batch Convert / Rename")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Input directory");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.batch_dialog.input_dir);
+                    if ui.button("Pick...").clicked() {
+                        let dialog = rfd::FileDialog::new().set_title("Batch input directory");
+                        if let Some(path) = dialog.pick_folder() {
+                            self.batch_dialog.input_dir = path.display().to_string();
+                        }
+                    }
+                });
+
+                ui.label("Output directory");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.batch_dialog.output_dir);
+                    if ui.button("Pick...").clicked() {
+                        let dialog = rfd::FileDialog::new().set_title("Batch output directory");
+                        if let Some(path) = dialog.pick_folder() {
+                            self.batch_dialog.output_dir = path.display().to_string();
+                        }
+                    }
+                });
+
+                ui.separator();
+                ui.label("Output format");
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(
+                        &mut self.batch_dialog.output_format,
+                        BatchOutputFormat::Jpeg,
+                        "JPEG",
+                    );
+                    ui.selectable_value(
+                        &mut self.batch_dialog.output_format,
+                        BatchOutputFormat::Png,
+                        "PNG",
+                    );
+                    ui.selectable_value(
+                        &mut self.batch_dialog.output_format,
+                        BatchOutputFormat::Webp,
+                        "WEBP",
+                    );
+                    ui.selectable_value(
+                        &mut self.batch_dialog.output_format,
+                        BatchOutputFormat::Bmp,
+                        "BMP",
+                    );
+                    ui.selectable_value(
+                        &mut self.batch_dialog.output_format,
+                        BatchOutputFormat::Tiff,
+                        "TIFF",
+                    );
+                });
+                if matches!(self.batch_dialog.output_format, BatchOutputFormat::Jpeg) {
+                    ui.add(
+                        egui::Slider::new(&mut self.batch_dialog.jpeg_quality, 1..=100)
+                            .text("JPEG quality"),
+                    );
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Rename prefix");
+                    ui.text_edit_singleline(&mut self.batch_dialog.rename_prefix);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Start index");
+                    ui.add(
+                        egui::DragValue::new(&mut self.batch_dialog.start_index).range(0..=999999),
+                    );
+                });
+
+                ui.separator();
+                if ui.button("Run batch").clicked() {
+                    let input_dir = PathBuf::from(self.batch_dialog.input_dir.trim());
+                    let output_dir = PathBuf::from(self.batch_dialog.output_dir.trim());
+                    if input_dir.as_os_str().is_empty() || output_dir.as_os_str().is_empty() {
+                        self.state
+                            .set_error("input and output directories are required");
+                    } else {
+                        self.dispatch_batch_convert(BatchConvertOptions {
+                            input_dir,
+                            output_dir,
+                            output_format: self.batch_dialog.output_format,
+                            rename_prefix: self.batch_dialog.rename_prefix.clone(),
+                            start_index: self.batch_dialog.start_index,
+                            jpeg_quality: self.batch_dialog.jpeg_quality,
+                        });
+                        self.batch_dialog.open = false;
+                    }
+                }
+            });
+        self.batch_dialog.open = open;
+    }
+
+    fn draw_rename_dialog(&mut self, ctx: &egui::Context) {
+        if !self.rename_dialog.open {
+            return;
+        }
+
+        let mut open = self.rename_dialog.open;
+        egui::Window::new("Rename Current File")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("New file name");
+                ui.text_edit_singleline(&mut self.rename_dialog.new_name);
+                if ui.button("Rename").clicked() {
+                    if let Some(from) = self.rename_dialog.target_path.clone() {
+                        if let Some(parent) = from.parent() {
+                            let to = parent.join(self.rename_dialog.new_name.trim());
+                            self.dispatch_file_operation(FileOperation::Rename { from, to });
+                            self.rename_dialog.open = false;
+                        }
+                    }
+                }
+            });
+        self.rename_dialog.open = open;
+    }
+
+    fn draw_delete_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.confirm_delete_current {
+            return;
+        }
+
+        let mut open = self.confirm_delete_current;
+        egui::Window::new("Delete Current File")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Delete the current image from disk?");
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        self.delete_current_file();
+                        self.confirm_delete_current = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_delete_current = false;
+                    }
+                });
+            });
+        self.confirm_delete_current = open;
+    }
+
+    fn draw_metadata_panel(&mut self, ctx: &egui::Context) {
+        if !self.state.show_metadata_panel() {
+            return;
+        }
+
+        egui::SidePanel::right("metadata-panel")
+            .resizable(true)
+            .default_width(270.0)
+            .width_range(220.0..=460.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Metadata");
+                    if self.slideshow_running {
+                        ui.separator();
+                        ui.label("Slideshow: running");
+                    }
+                });
+                ui.separator();
+
+                let Some(path) = self.state.current_file_path_ref() else {
+                    ui.label("Open an image to inspect metadata.");
+                    return;
+                };
+
+                let original = self
+                    .state
+                    .original_dimensions()
+                    .map(|(w, h)| format!("{w} x {h}"))
+                    .unwrap_or_else(|| "-".to_owned());
+                let preview = self
+                    .state
+                    .preview_dimensions()
+                    .map(|(w, h)| format!("{w} x {h}"))
+                    .unwrap_or_else(|| "-".to_owned());
+                let preview_mode = if self.state.downscaled_for_preview() {
+                    "Downscaled preview"
+                } else {
+                    "Original pixels"
+                };
+                let file_size = fs::metadata(path)
+                    .ok()
+                    .map(|meta| human_file_size(meta.len()))
+                    .unwrap_or_else(|| "-".to_owned());
+                let modified = fs::metadata(path)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .map(format_system_time)
+                    .unwrap_or_else(|| "-".to_owned());
+
+                egui::Grid::new("metadata-grid")
+                    .spacing(egui::vec2(12.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.label("File");
+                        ui.label(path.display().to_string());
+                        ui.end_row();
+
+                        ui.label("Folder");
+                        ui.label(
+                            self.state
+                                .current_directory_path()
+                                .map(|directory| directory.display().to_string())
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                        ui.end_row();
+
+                        ui.label("Original");
+                        ui.label(original);
+                        ui.end_row();
+
+                        ui.label("Preview");
+                        ui.label(preview);
+                        ui.end_row();
+
+                        ui.label("Preview mode");
+                        ui.label(preview_mode);
+                        ui.end_row();
+
+                        ui.label("Zoom");
+                        ui.label(self.state.zoom_label());
+                        ui.end_row();
+
+                        ui.label("File size");
+                        ui.label(file_size);
+                        ui.end_row();
+
+                        ui.label("Modified");
+                        ui.label(modified);
+                        ui.end_row();
+                    });
+            });
+    }
+
     fn draw_status_bar(&mut self, ctx: &egui::Context) {
         if !self.state.show_status_bar() {
             return;
@@ -1368,12 +2762,17 @@ impl eframe::App for ImranViewApp {
         self.poll_worker_results(ctx);
         self.handle_native_menu_events(ctx);
         self.run_shortcuts(ctx);
+        self.run_slideshow_tick();
+        self.sync_viewport_state(ctx);
 
         if self.should_draw_in_window_menu() {
             self.draw_menu(ctx);
         }
         self.draw_toolbar(ctx);
+        self.draw_error_banner(ctx);
+        self.draw_info_banner(ctx);
         self.draw_thumbnail_strip(ctx);
+        self.draw_metadata_panel(ctx);
 
         if self.state.thumbnails_window_mode() {
             self.draw_thumbnail_window(ctx);
@@ -1382,13 +2781,103 @@ impl eframe::App for ImranViewApp {
         }
 
         self.draw_status_bar(ctx);
+        self.draw_resize_dialog(ctx);
+        self.draw_crop_dialog(ctx);
+        self.draw_color_dialog(ctx);
+        self.draw_batch_dialog(ctx);
+        self.draw_rename_dialog(ctx);
+        self.draw_delete_confirmation(ctx);
         self.draw_about_window(ctx);
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.state.window_title()));
 
-        if self.pending.has_inflight() || !self.inflight_thumbnails.is_empty() {
+        if self.pending.has_inflight()
+            || !self.inflight_thumbnails.is_empty()
+            || self.slideshow_running
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+    }
+}
+
+fn path_ancestors(path: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    for ancestor in path.ancestors() {
+        result.push(ancestor.to_path_buf());
+    }
+    result.reverse();
+    result
+}
+
+fn list_directories(path: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let Ok(read_dir) = fs::read_dir(path) else {
+        return directories;
+    };
+
+    for entry in read_dir.flatten() {
+        let candidate = entry.path();
+        if candidate.is_dir() {
+            directories.push(candidate);
+            if directories.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    directories.sort_by_key(|candidate| {
+        candidate
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+    });
+    directories
+}
+
+fn format_recent_file_label(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let parent = path
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_default();
+    if parent.is_empty() {
+        file_name
+    } else {
+        format!("{file_name}   ({parent})")
+    }
+}
+
+fn format_recent_folder_label(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    format!("{name}   ({})", path.display())
+}
+
+fn format_system_time(value: SystemTime) -> String {
+    match value.duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("unix: {}", duration.as_secs()),
+        Err(_) => "unix: <invalid>".to_owned(),
+    }
+}
+
+fn human_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let value = bytes as f64;
+    if value < KB {
+        format!("{bytes} B")
+    } else if value < MB {
+        format!("{:.1} KB", value / KB)
+    } else if value < GB {
+        format!("{:.2} MB", value / MB)
+    } else {
+        format!("{:.2} GB", value / GB)
     }
 }
 
@@ -1402,9 +2891,24 @@ fn init_logging() {
 fn main() -> Result<()> {
     init_logging();
     let cli_path = std::env::args_os().nth(1).map(PathBuf::from);
+    let startup_settings = load_settings();
     log::info!(target: "imranview::startup", "launching ImranView");
 
     let mut native_options = eframe::NativeOptions::default();
+    if let Some([width, height]) = startup_settings.window_inner_size {
+        if width > 0.0 && height > 0.0 {
+            native_options.viewport = native_options.viewport.with_inner_size([width, height]);
+        }
+    }
+    if let Some([x, y]) = startup_settings.window_position {
+        native_options.viewport = native_options.viewport.with_position([x, y]);
+    }
+    if startup_settings.window_maximized {
+        native_options.viewport = native_options.viewport.with_maximized(true);
+    }
+    if startup_settings.window_fullscreen {
+        native_options.viewport = native_options.viewport.with_fullscreen(true);
+    }
     match load_app_icon_data(APP_FAVICON_PNG) {
         Ok(icon_data) => {
             native_options.viewport = native_options.viewport.with_icon(icon_data);
@@ -1418,7 +2922,7 @@ fn main() -> Result<()> {
         native_options,
         Box::new(move |cc| {
             let startup_started = Instant::now();
-            let app = ImranViewApp::new(cc, cli_path.clone());
+            let app = ImranViewApp::new(cc, cli_path.clone(), startup_settings.clone());
             crate::perf::log_timing(
                 "startup",
                 startup_started.elapsed(),

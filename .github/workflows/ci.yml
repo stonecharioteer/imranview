@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Cargo check
+        run: cargo check --all-targets
+
+      - name: Cargo test with perf log capture
+        run: |
+          set -euo pipefail
+          RUST_LOG=imranview::perf=debug cargo test --all-targets -- --nocapture 2>&1 | tee perf.log
+
+      - name: Perf regression gate
+        run: ./scripts/perf_gate.sh perf.log

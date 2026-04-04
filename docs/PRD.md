@@ -1,7 +1,7 @@
 # ImranView Product Requirements Document (PRD)
 
 Version: 1.0  
-Date: 2026-04-02  
+Date: 2026-04-04  
 Owner: ImranView core repo
 
 ## 1) Product summary
@@ -81,26 +81,39 @@ Implemented:
 - EXIF orientation handling on load.
 - Preview downscaling for very large images.
 - Optional thumbnail strip with progressive lazy thumbnail loading.
-- Dedicated thumbnail window mode (list-first baseline).
+- Dedicated thumbnail window mode with folder panel (path/siblings/subfolders) and adaptive grid.
 - Classic shell structure: menu, toolbar, black canvas, segmented status bar.
+- Read-only metadata side panel with viewer/file details.
 - macOS native app menu integration with in-window fallback.
 - OSS toolbar icons (Tabler, MIT).
 - Save and Save As flows.
 - Rotate/flip image operations.
-- Settings persistence for toolbar/status/thumbnail visibility and last-open directory.
+- Resize/resample dialog + operation with interpolation choices.
+- Crop dialog + operation.
+- Basic color corrections dialog (brightness/contrast/gamma/saturation/grayscale).
+- Centralized shortcut map shared by menu labels and keyboard handlers.
+- Recent files and recent folders menu integration with persisted history.
+- Basic slideshow mode (`Space` start/stop, `Esc` stop, configurable interval).
+- Settings persistence for toolbar/status/thumbnail visibility, thumbnail window preferences, last-open directory, and viewport window state.
 - Background workers for open/save/transform plus dedicated thumbnail worker pool.
+- Background folder-open worker command for non-blocking directory navigation from thumbnail window.
 - Neighbor image preload cache for low-latency next/previous navigation.
+- Byte-budget memory governor for thumbnail/preload caches with deterministic eviction.
+- Batch convert/rename workflow (format + quality + prefix/start index).
+- File operations workflow (rename/copy/move/delete).
 - Startup/open/save/edit performance timing logs.
+- Perf gate script to fail runs when timing warnings exceed thresholds.
+- CI workflow that runs check/test and fails on perf-gate warnings.
+- Release workflow + local packaging script for Linux/macOS/Windows artifacts.
 - Error strategy: `thiserror` (typed IO errors) + `anyhow` (context and propagation).
 
 Partial:
 - Some menu categories/commands are still placeholders.
-- Thumbnail window mode lacks grid + directory tree workflow.
-- Settings persistence does not yet include full window state and advanced preferences.
-- Performance instrumentation exists, but CI gating and strict regression enforcement are pending.
+- Metadata panel is baseline-only and does not yet expose EXIF/IPTC/XMP details.
 
 Missing:
-- Resize/crop/color tools, metadata panel, recent items, slideshow, batch pipeline, and packaging pipeline.
+- Rich Save/Save As format-option UX and metadata controls.
+- Deep metadata inspector detail (EXIF/IPTC/XMP fields).
 
 ## 7) Performance budgets (lightweight contract)
 
@@ -142,30 +155,30 @@ Legend:
 | F-002 | Open image (dialog + CLI) | P0 | Done | Keep as baseline |
 | F-003 | Folder navigation next/previous | P0 | Done | Needs prefetch tuning |
 | F-004 | Zoom model (fit, actual, in/out) | P0 | Partial | Add better pan anchoring |
-| F-005 | Segmented status bar details | P0 | Partial | Add metadata fields and toggle persistence |
+| F-005 | Segmented status bar details | P0 | Partial | Core segments exist; advanced metadata details still pending |
 | F-006 | View toggles (toolbar/status/thumbnails) | P0 | Done | Persisted for current visibility flags |
 | F-007 | Thumbnail strip (lazy/windowed) | P0 | Done | Add keyboard focus behavior |
-| F-008 | Dedicated thumbnails window mode | P0 | Partial | Baseline mode exists; grid + directory tree still pending |
-| F-009 | Settings persistence (config file) | P0 | Partial | Visibility flags + last directory done; window state/preferences pending |
-| F-010 | Shortcut map and conflict policy | P0 | Partial | Add centralized mapping and docs |
-| F-011 | Robust error surfaces | P0 | Partial | Better user-facing messages and recovery actions |
-| F-012 | Startup/perf instrumentation hooks | P0 | Partial | Timing logs exist; automated regression gates pending |
+| F-008 | Dedicated thumbnails window mode | P0 | Done | Folder panel + adaptive grid added |
+| F-009 | Settings persistence (config file) | P0 | Done | View toggles + thumbnail prefs + viewport state persisted |
+| F-010 | Shortcut map and conflict policy | P0 | Done | Centralized map powers handlers and menu labels |
+| F-011 | Robust error surfaces | P0 | Done | User-facing error banner with quick recovery actions |
+| F-012 | Startup/perf instrumentation hooks | P0 | Done | Timing logs + CI perf-gate enforcement wired |
 | F-013 | Rotate left/right + flip H/V | P1 | Done | Implemented through background transform worker |
-| F-014 | Resize/resample dialog | P1 | Missing | Include interpolation choices |
-| F-015 | Crop selection tools | P1 | Missing | Rectangle first, then ratio presets |
+| F-014 | Resize/resample dialog | P1 | Done | Interpolation choices shipped |
+| F-015 | Crop selection tools | P1 | Done | Rectangle crop dialog shipped |
 | F-016 | Save / Save As pipeline | P1 | Partial | Save flows exist; richer format/options metadata controls pending |
-| F-017 | Color corrections (basic) | P1 | Missing | Brightness/contrast/gamma/saturation |
-| F-018 | Metadata panel (EXIF/IPTC/XMP) | P1 | Missing | Read-only first |
-| F-019 | Recent files/recent folders | P1 | Missing | Persist and menu integration |
-| F-020 | Slideshow basic mode | P1 | Missing | Keyboard and timer controls |
-| F-021 | Batch convert/rename | P1 | Missing | Core productivity utility value |
-| F-022 | File operations (copy/move/delete/rename) | P1 | Missing | With confirmation and undo-friendly flow |
+| F-017 | Color corrections (basic) | P1 | Done | Brightness/contrast/gamma/saturation/grayscale shipped |
+| F-018 | Metadata panel (EXIF/IPTC/XMP) | P1 | Partial | Read-only metadata panel shipped; deep EXIF/IPTC/XMP pending |
+| F-019 | Recent files/recent folders | P1 | Done | Persisted recents + menu integration shipped |
+| F-020 | Slideshow basic mode | P1 | Done | Keyboard and timer controls shipped |
+| F-021 | Batch convert/rename | P1 | Partial | Conversion/rename shipped; preview summary step still pending |
+| F-022 | File operations (copy/move/delete/rename) | P1 | Done | Dialog-driven rename/copy/move/delete with confirmation |
 | F-023 | Printing flow | P2 | Missing | Optional for first public milestone |
 | F-024 | Compare images mode | P2 | Missing | Split or side-by-side |
 | F-025 | Plugin extension points | P2 | Missing | Internal extension API first |
 | F-026 | Background command execution pipeline | P0 | Done | Open/save/edit/thumbnail work dispatched to worker threads |
-| F-027 | Bounded cache and memory governor | P0 | Partial | Cache caps exist; full memory governor policy still pending |
-| F-028 | Automated performance regression gate | P0 | Missing | CI/perf smoke checks fail on budget regressions |
+| F-027 | Bounded cache and memory governor | P0 | Done | Byte-budget + count-budget eviction on preload/thumb caches |
+| F-028 | Automated performance regression gate | P0 | Done | CI fails on perf warnings via perf-gate script |
 
 ## 9) Detailed requirements by epic
 
@@ -287,8 +300,8 @@ Milestone M1: Fast viewer beta (2-3 weeks)
 - Performance instrumentation in place with baseline measurements captured.
 
 Milestone M2: Utility parity beta (3-5 weeks)
-- Complete F-014 to F-022.
-- Expand settings persistence (window state/preferences) and recent items.
+- Complete remaining F-016/F-018/F-021 items.
+- Expand save/metadata depth while preserving performance budgets.
 
 Milestone M3: Public preview (2-3 weeks)
 - Packaging and CI hardening.
@@ -331,15 +344,15 @@ A feature is done only when all conditions hold:
 ## 14) Immediate execution checklist
 
 - [x] Build dedicated Thumbnails window mode baseline (list mode).
-- [ ] Upgrade Thumbnails window mode with grid + directory tree baseline.
+- [x] Upgrade Thumbnails window mode with grid + directory tree baseline.
 - [x] Add persistent settings file for toolbar/status/thumbnails visibility and last-open directory.
-- [ ] Expand settings persistence to include last window state and advanced preferences.
+- [x] Expand settings persistence to include last window state and advanced preferences.
 - [x] Implement rotate/flip commands.
-- [ ] Implement Resize/Resample dialog and operation.
+- [x] Implement Resize/Resample dialog and operation.
 - [ ] Expand Save/Save As with richer format options and metadata controls.
-- [ ] Add recent files/recent folders.
+- [x] Add recent files/recent folders.
 - [x] Add performance timing logs for startup/open/navigation/save/edit.
-- [ ] Add tests for navigation wrap, zoom state transitions, and error recovery.
+- [x] Add tests for navigation wrap, zoom state transitions, and error recovery.
 - [x] Implement background command queue so open/save/edit/thumbnail decode do not block UI input.
 - [ ] Add full bounded thumbnail/decode cache policy with configurable limits and stronger eviction controls.
 - [ ] Add CI perf smoke checks that gate on startup/open/navigation/memory thresholds.

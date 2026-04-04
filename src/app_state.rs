@@ -25,6 +25,13 @@ const ZOOM_STEP_OUT: f32 = 1.0 / ZOOM_STEP_IN;
 const THUMBNAIL_WINDOW_RADIUS_STRIP: usize = 90;
 const THUMBNAIL_DECODE_RADIUS_STRIP: usize = 12;
 const THUMBNAIL_DECODE_RADIUS_WINDOW_MODE: usize = 36;
+const THUMBNAIL_SIDEBAR_WIDTH_MIN: f32 = 160.0;
+const THUMBNAIL_SIDEBAR_WIDTH_MAX: f32 = 420.0;
+const THUMBNAIL_GRID_CARD_WIDTH_MIN: f32 = 96.0;
+const THUMBNAIL_GRID_CARD_WIDTH_MAX: f32 = 240.0;
+const RECENT_ITEMS_LIMIT: usize = 20;
+const SLIDESHOW_INTERVAL_MIN_SECS: f32 = 0.5;
+const SLIDESHOW_INTERVAL_MAX_SECS: f32 = 30.0;
 
 #[derive(Clone)]
 pub struct ThumbnailEntry {
@@ -73,8 +80,18 @@ pub struct AppState {
     zoom_mode: ZoomMode,
     show_toolbar: bool,
     show_status_bar: bool,
+    show_metadata_panel: bool,
     show_thumbnail_strip: bool,
     thumbnails_window_mode: bool,
+    recent_files: Vec<PathBuf>,
+    recent_directories: Vec<PathBuf>,
+    slideshow_interval_secs: f32,
+    thumbnail_sidebar_width: f32,
+    thumbnail_grid_card_width: f32,
+    window_position: Option<[f32; 2]>,
+    window_inner_size: Option<[f32; 2]>,
+    window_maximized: bool,
+    window_fullscreen: bool,
     last_error: Option<String>,
 }
 
@@ -103,8 +120,24 @@ impl AppState {
             zoom_mode: ZoomMode::Fit,
             show_toolbar: settings.show_toolbar,
             show_status_bar: settings.show_status_bar,
+            show_metadata_panel: settings.show_metadata_panel,
             show_thumbnail_strip,
             thumbnails_window_mode,
+            recent_files: normalize_recent_paths(settings.recent_files),
+            recent_directories: normalize_recent_paths(settings.recent_directories),
+            slideshow_interval_secs: settings
+                .slideshow_interval_secs
+                .clamp(SLIDESHOW_INTERVAL_MIN_SECS, SLIDESHOW_INTERVAL_MAX_SECS),
+            thumbnail_sidebar_width: settings
+                .thumbnail_sidebar_width
+                .clamp(THUMBNAIL_SIDEBAR_WIDTH_MIN, THUMBNAIL_SIDEBAR_WIDTH_MAX),
+            thumbnail_grid_card_width: settings
+                .thumbnail_grid_card_width
+                .clamp(THUMBNAIL_GRID_CARD_WIDTH_MIN, THUMBNAIL_GRID_CARD_WIDTH_MAX),
+            window_position: settings.window_position,
+            window_inner_size: settings.window_inner_size,
+            window_maximized: settings.window_maximized,
+            window_fullscreen: settings.window_fullscreen,
             last_error: None,
         }
     }
@@ -113,8 +146,18 @@ impl AppState {
         PersistedSettings {
             show_toolbar: self.show_toolbar,
             show_status_bar: self.show_status_bar,
+            show_metadata_panel: self.show_metadata_panel,
             show_thumbnail_strip: self.show_thumbnail_strip,
             thumbnails_window_mode: self.thumbnails_window_mode,
+            recent_files: self.recent_files.clone(),
+            recent_directories: self.recent_directories.clone(),
+            slideshow_interval_secs: self.slideshow_interval_secs,
+            thumbnail_sidebar_width: self.thumbnail_sidebar_width,
+            thumbnail_grid_card_width: self.thumbnail_grid_card_width,
+            window_position: self.window_position,
+            window_inner_size: self.window_inner_size,
+            window_maximized: self.window_maximized,
+            window_fullscreen: self.window_fullscreen,
             last_open_directory: self
                 .current_directory
                 .as_ref()
@@ -161,6 +204,12 @@ impl AppState {
         self.images_in_directory = files;
         self.current_index = current_index;
         self.current_image = Some(LoadedImageState::from_payload(payload));
+        if let Some(current_path) = self.current_file.clone() {
+            push_recent_path(&mut self.recent_files, current_path);
+        }
+        if let Some(current_directory) = self.current_directory.clone() {
+            push_recent_path(&mut self.recent_directories, current_directory);
+        }
         self.zoom_mode = ZoomMode::Fit;
         self.last_error = None;
         if first_open && !self.show_thumbnail_strip && !self.thumbnails_window_mode {
@@ -216,6 +265,10 @@ impl AppState {
         self.current_file.clone()
     }
 
+    pub fn current_file_path_ref(&self) -> Option<&Path> {
+        self.current_file.as_deref()
+    }
+
     pub fn set_zoom_fit(&mut self) {
         self.zoom_mode = ZoomMode::Fit;
     }
@@ -250,6 +303,10 @@ impl AppState {
         self.show_status_bar = show;
     }
 
+    pub fn set_show_metadata_panel(&mut self, show: bool) {
+        self.show_metadata_panel = show;
+    }
+
     pub fn toggle_thumbnail_strip(&mut self) {
         self.show_thumbnail_strip = !self.show_thumbnail_strip;
         if self.show_thumbnail_strip {
@@ -278,6 +335,16 @@ impl AppState {
         }
     }
 
+    pub fn set_thumbnail_sidebar_width(&mut self, width: f32) {
+        self.thumbnail_sidebar_width =
+            width.clamp(THUMBNAIL_SIDEBAR_WIDTH_MIN, THUMBNAIL_SIDEBAR_WIDTH_MAX);
+    }
+
+    pub fn set_thumbnail_grid_card_width(&mut self, width: f32) {
+        self.thumbnail_grid_card_width =
+            width.clamp(THUMBNAIL_GRID_CARD_WIDTH_MIN, THUMBNAIL_GRID_CARD_WIDTH_MAX);
+    }
+
     pub fn show_toolbar(&self) -> bool {
         self.show_toolbar
     }
@@ -286,12 +353,41 @@ impl AppState {
         self.show_status_bar
     }
 
+    pub fn show_metadata_panel(&self) -> bool {
+        self.show_metadata_panel
+    }
+
     pub fn show_thumbnail_strip(&self) -> bool {
         self.show_thumbnail_strip
     }
 
     pub fn thumbnails_window_mode(&self) -> bool {
         self.thumbnails_window_mode
+    }
+
+    pub fn thumbnail_sidebar_width(&self) -> f32 {
+        self.thumbnail_sidebar_width
+    }
+
+    pub fn thumbnail_grid_card_width(&self) -> f32 {
+        self.thumbnail_grid_card_width
+    }
+
+    pub fn recent_files(&self) -> &[PathBuf] {
+        &self.recent_files
+    }
+
+    pub fn recent_directories(&self) -> &[PathBuf] {
+        &self.recent_directories
+    }
+
+    pub fn slideshow_interval_secs(&self) -> f32 {
+        self.slideshow_interval_secs
+    }
+
+    pub fn set_slideshow_interval_secs(&mut self, value: f32) {
+        self.slideshow_interval_secs =
+            value.clamp(SLIDESHOW_INTERVAL_MIN_SECS, SLIDESHOW_INTERVAL_MAX_SECS);
     }
 
     pub fn folder_label(&self) -> String {
@@ -308,6 +404,10 @@ impl AppState {
             .cloned()
     }
 
+    pub fn current_directory_path(&self) -> Option<PathBuf> {
+        self.current_directory.clone()
+    }
+
     pub fn suggested_save_name(&self) -> Option<String> {
         self.current_file.as_ref().and_then(|path| {
             path.file_name()
@@ -321,6 +421,10 @@ impl AppState {
 
     pub fn clear_error(&mut self) {
         self.last_error = None;
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     pub fn has_image(&self) -> bool {
@@ -339,6 +443,25 @@ impl AppState {
             .as_ref()
             .map(|image| image.preview_height as f32)
             .unwrap_or(0.0)
+    }
+
+    pub fn original_dimensions(&self) -> Option<(u32, u32)> {
+        self.current_image
+            .as_ref()
+            .map(|image| (image.original_width, image.original_height))
+    }
+
+    pub fn preview_dimensions(&self) -> Option<(u32, u32)> {
+        self.current_image
+            .as_ref()
+            .map(|image| (image.preview_width, image.preview_height))
+    }
+
+    pub fn downscaled_for_preview(&self) -> bool {
+        self.current_image
+            .as_ref()
+            .map(|image| image.downscaled_for_preview)
+            .unwrap_or(false)
     }
 
     pub fn zoom_is_fit(&self) -> bool {
@@ -604,6 +727,37 @@ impl AppState {
             .cloned()
             .context("failed to resolve adjacent image path")
     }
+
+    pub fn update_window_state(
+        &mut self,
+        window_position: Option<[f32; 2]>,
+        window_inner_size: Option<[f32; 2]>,
+        window_maximized: Option<bool>,
+        window_fullscreen: Option<bool>,
+    ) -> bool {
+        let mut changed = false;
+        if self.window_position != window_position {
+            self.window_position = window_position;
+            changed = true;
+        }
+        if self.window_inner_size != window_inner_size {
+            self.window_inner_size = window_inner_size;
+            changed = true;
+        }
+        if let Some(window_maximized) = window_maximized {
+            if self.window_maximized != window_maximized {
+                self.window_maximized = window_maximized;
+                changed = true;
+            }
+        }
+        if let Some(window_fullscreen) = window_fullscreen {
+            if self.window_fullscreen != window_fullscreen {
+                self.window_fullscreen = window_fullscreen;
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 fn wrapped_index(current: usize, len: usize, step: isize) -> usize {
@@ -662,6 +816,22 @@ fn human_file_size(bytes: u64) -> String {
         format!("{:.2} MB", value / MB)
     } else {
         format!("{:.2} GB", value / GB)
+    }
+}
+
+fn normalize_recent_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut normalized = Vec::new();
+    for path in paths {
+        push_recent_path(&mut normalized, path);
+    }
+    normalized
+}
+
+fn push_recent_path(list: &mut Vec<PathBuf>, path: PathBuf) {
+    list.retain(|existing| existing != &path);
+    list.insert(0, path);
+    if list.len() > RECENT_ITEMS_LIMIT {
+        list.truncate(RECENT_ITEMS_LIMIT);
     }
 }
 
@@ -770,5 +940,53 @@ mod tests {
 
         let saved_image = image::open(&saved).expect("failed to open saved file");
         assert_eq!(saved_image.dimensions(), (10, 16));
+    }
+
+    #[test]
+    fn settings_roundtrip_includes_viewport_and_thumbnail_preferences() {
+        let mut state = AppState::new();
+        state.set_thumbnail_sidebar_width(999.0);
+        state.set_thumbnail_grid_card_width(40.0);
+        state.set_show_metadata_panel(true);
+        state.set_slideshow_interval_secs(99.0);
+        state.update_window_state(
+            Some([10.5, 14.0]),
+            Some([1280.0, 720.0]),
+            Some(true),
+            Some(false),
+        );
+
+        let settings = state.to_settings();
+        assert_eq!(settings.thumbnail_sidebar_width, 420.0);
+        assert_eq!(settings.thumbnail_grid_card_width, 96.0);
+        assert!(settings.show_metadata_panel);
+        assert_eq!(settings.slideshow_interval_secs, 30.0);
+        assert_eq!(settings.window_position, Some([10.5, 14.0]));
+        assert_eq!(settings.window_inner_size, Some([1280.0, 720.0]));
+        assert!(settings.window_maximized);
+        assert!(!settings.window_fullscreen);
+    }
+
+    #[test]
+    fn opening_image_updates_recent_files_and_folders() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let first = dir.path().join("first.png");
+        let second = dir.path().join("second.png");
+        write_test_png(&first, 8, 8, [255, 0, 0, 255]);
+        write_test_png(&second, 8, 8, [0, 255, 0, 255]);
+
+        let mut state = AppState::new();
+        state
+            .open_image(&first)
+            .expect("failed to open first image");
+        state
+            .open_image(&second)
+            .expect("failed to open second image");
+
+        assert_eq!(state.recent_files().first(), Some(&second));
+        assert_eq!(
+            state.recent_directories().first(),
+            Some(&dir.path().to_path_buf())
+        );
     }
 }

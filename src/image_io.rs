@@ -1,12 +1,13 @@
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use exif::{In, Tag};
+use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImageView, ImageReader};
+use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
 use thiserror::Error;
 
 pub type ImageIoResult<T> = std::result::Result<T, ImageIoError>;
@@ -55,6 +56,27 @@ pub struct ThumbnailPayload {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum SaveFormat {
+    Png,
+    Jpeg { quality: u8 },
+    Webp,
+    Bmp,
+    Tiff,
+}
+
+impl SaveFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            SaveFormat::Png => "png",
+            SaveFormat::Jpeg { .. } => "jpg",
+            SaveFormat::Webp => "webp",
+            SaveFormat::Bmp => "bmp",
+            SaveFormat::Tiff => "tiff",
+        }
+    }
+}
+
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "avif", "bmp", "gif", "hdr", "heic", "heif", "ico", "jpeg", "jpg", "pbm", "pgm", "png", "pnm",
     "ppm", "qoi", "tif", "tiff", "webp",
@@ -63,11 +85,15 @@ const PREVIEW_MAX_DIMENSION: u32 = 4096;
 const THUMBNAIL_MAX_DIMENSION: u32 = 192;
 
 pub fn load_image_payload(path: &Path) -> ImageIoResult<LoadedImagePayload> {
-    let working_image = decode_oriented_image(path).map_err(|source| ImageIoError::LoadImage {
+    let working_image = load_working_image(path)?;
+    Ok(payload_from_working_image(Arc::new(working_image)))
+}
+
+pub fn load_working_image(path: &Path) -> ImageIoResult<DynamicImage> {
+    decode_oriented_image(path).map_err(|source| ImageIoError::LoadImage {
         path: path.to_path_buf(),
         source,
-    })?;
-    Ok(payload_from_working_image(Arc::new(working_image)))
+    })
 }
 
 pub fn payload_from_working_image(working_image: Arc<DynamicImage>) -> LoadedImagePayload {
@@ -107,6 +133,44 @@ pub fn save_image(path: &Path, image: &DynamicImage) -> ImageIoResult<()> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+pub fn save_image_with_format(
+    path: &Path,
+    image: &DynamicImage,
+    format: SaveFormat,
+) -> ImageIoResult<()> {
+    let save_result = (|| -> Result<()> {
+        match format {
+            SaveFormat::Png => image
+                .save_with_format(path, ImageFormat::Png)
+                .with_context(|| format!("failed to save {}", path.display()))?,
+            SaveFormat::Jpeg { quality } => {
+                let file = File::create(path)
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+                let mut writer = BufWriter::new(file);
+                let mut encoder = JpegEncoder::new_with_quality(&mut writer, quality);
+                encoder
+                    .encode_image(image)
+                    .with_context(|| format!("failed to encode jpeg {}", path.display()))?;
+            }
+            SaveFormat::Webp => image
+                .save_with_format(path, ImageFormat::WebP)
+                .with_context(|| format!("failed to save {}", path.display()))?,
+            SaveFormat::Bmp => image
+                .save_with_format(path, ImageFormat::Bmp)
+                .with_context(|| format!("failed to save {}", path.display()))?,
+            SaveFormat::Tiff => image
+                .save_with_format(path, ImageFormat::Tiff)
+                .with_context(|| format!("failed to save {}", path.display()))?,
+        }
+        Ok(())
+    })();
+
+    save_result.map_err(|source| ImageIoError::SaveImage {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub fn collect_images_in_directory(dir: &Path) -> ImageIoResult<Vec<PathBuf>> {

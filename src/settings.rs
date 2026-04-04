@@ -6,12 +6,23 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PersistedSettings {
     pub show_toolbar: bool,
     pub show_status_bar: bool,
+    pub show_metadata_panel: bool,
     pub show_thumbnail_strip: bool,
     pub thumbnails_window_mode: bool,
     pub last_open_directory: Option<PathBuf>,
+    pub recent_files: Vec<PathBuf>,
+    pub recent_directories: Vec<PathBuf>,
+    pub slideshow_interval_secs: f32,
+    pub thumbnail_sidebar_width: f32,
+    pub thumbnail_grid_card_width: f32,
+    pub window_position: Option<[f32; 2]>,
+    pub window_inner_size: Option<[f32; 2]>,
+    pub window_maximized: bool,
+    pub window_fullscreen: bool,
 }
 
 impl Default for PersistedSettings {
@@ -19,9 +30,19 @@ impl Default for PersistedSettings {
         Self {
             show_toolbar: true,
             show_status_bar: true,
+            show_metadata_panel: false,
             show_thumbnail_strip: false,
             thumbnails_window_mode: false,
             last_open_directory: None,
+            recent_files: Vec::new(),
+            recent_directories: Vec::new(),
+            slideshow_interval_secs: 2.5,
+            thumbnail_sidebar_width: 220.0,
+            thumbnail_grid_card_width: 128.0,
+            window_position: None,
+            window_inner_size: None,
+            window_maximized: false,
+            window_fullscreen: false,
         }
     }
 }
