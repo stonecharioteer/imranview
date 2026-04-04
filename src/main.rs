@@ -37,9 +37,118 @@ const THUMB_TEXTURE_CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
 const THUMB_CARD_WIDTH: f32 = 120.0;
 const THUMB_CARD_HEIGHT: f32 = 100.0;
 const TOOLBAR_ICON_SIZE: f32 = 18.0;
+const TOOLBAR_PANEL_HEIGHT: f32 = 38.0;
+const STATUS_PANEL_HEIGHT: f32 = 26.0;
 const APP_FAVICON_PNG: &[u8] = include_bytes!("../assets/branding/favicon.png");
 const FOLDER_PANEL_LIST_LIMIT: usize = 256;
 const RECENT_MENU_LIMIT: usize = 12;
+
+const fn platform_window_corner_radius() -> u8 {
+    #[cfg(target_os = "macos")]
+    {
+        12
+    }
+    #[cfg(target_os = "windows")]
+    {
+        8
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        7
+    }
+}
+
+const fn platform_widget_corner_radius() -> u8 {
+    #[cfg(target_os = "macos")]
+    {
+        9
+    }
+    #[cfg(target_os = "windows")]
+    {
+        6
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        6
+    }
+}
+
+fn apply_native_look(ctx: &egui::Context) {
+    ctx.set_theme(egui::ThemePreference::System);
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        style.spacing.interact_size.y = 24.0;
+        style.spacing.menu_margin = egui::Margin::symmetric(8, 6);
+        style.spacing.window_margin = egui::Margin::symmetric(10, 8);
+        style.spacing.combo_width = style.spacing.combo_width.max(120.0);
+        style.spacing.slider_width = style.spacing.slider_width.max(140.0);
+
+        if let Some(body) = style.text_styles.get_mut(&egui::TextStyle::Body) {
+            body.size = body.size.clamp(13.0, 15.0);
+        }
+        if let Some(button) = style.text_styles.get_mut(&egui::TextStyle::Button) {
+            button.size = button.size.clamp(13.0, 15.0);
+        }
+        if let Some(small) = style.text_styles.get_mut(&egui::TextStyle::Small) {
+            small.size = small.size.clamp(11.0, 13.0);
+        }
+
+        let visuals = &mut style.visuals;
+        let (window_fill, panel_fill, extreme_bg, border_color, shadow_color) = if visuals.dark_mode
+        {
+            (
+                egui::Color32::from_rgb(30, 31, 34),
+                egui::Color32::from_rgb(37, 38, 42),
+                egui::Color32::from_rgb(24, 25, 27),
+                egui::Color32::from_gray(72),
+                egui::Color32::from_black_alpha(110),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(250, 250, 252),
+                egui::Color32::from_rgb(242, 242, 246),
+                egui::Color32::from_rgb(255, 255, 255),
+                egui::Color32::from_rgb(198, 198, 205),
+                egui::Color32::from_black_alpha(44),
+            )
+        };
+
+        let window_radius = platform_window_corner_radius();
+        let widget_radius = platform_widget_corner_radius();
+
+        visuals.window_corner_radius = egui::CornerRadius::same(window_radius);
+        visuals.menu_corner_radius = egui::CornerRadius::same(widget_radius);
+        visuals.window_fill = window_fill;
+        visuals.panel_fill = panel_fill;
+        visuals.faint_bg_color = panel_fill;
+        visuals.extreme_bg_color = extreme_bg;
+        visuals.window_stroke = egui::Stroke::new(1.0, border_color);
+        visuals.window_shadow = egui::Shadow {
+            offset: [0, 2],
+            blur: 16,
+            spread: 0,
+            color: shadow_color,
+        };
+        visuals.popup_shadow = visuals.window_shadow;
+        visuals.interact_cursor = None;
+        visuals.button_frame = true;
+        visuals.collapsing_header_frame = false;
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border_color);
+        visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(widget_radius);
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(widget_radius);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(widget_radius);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(widget_radius);
+        visuals.widgets.open.corner_radius = egui::CornerRadius::same(widget_radius);
+    });
+}
+
+fn centered_dialog_window(title: &'static str) -> egui::Window<'static> {
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+}
 
 #[derive(Clone)]
 struct ToolbarIcons {
@@ -439,7 +548,6 @@ struct ImranViewApp {
     slideshow_running: bool,
     slideshow_last_tick: Instant,
     show_about_window: bool,
-    center_about_window_next_frame: bool,
     #[cfg(target_os = "macos")]
     native_menu: Option<NativeMenu>,
 }
@@ -450,6 +558,7 @@ impl ImranViewApp {
         cli_path: Option<PathBuf>,
         settings: PersistedSettings,
     ) -> Self {
+        apply_native_look(&cc.egui_ctx);
         let state = AppState::new_with_settings(settings);
         let thumb_cache_entry_cap = state.thumb_cache_entry_cap();
         let thumb_cache_max_bytes = state.thumb_cache_max_mb().saturating_mul(1024 * 1024);
@@ -521,7 +630,6 @@ impl ImranViewApp {
             slideshow_running: false,
             slideshow_last_tick: Instant::now(),
             show_about_window: false,
-            center_about_window_next_frame: false,
             #[cfg(target_os = "macos")]
             native_menu,
         };
@@ -1551,7 +1659,6 @@ impl ImranViewApp {
 
     fn open_about_window(&mut self) {
         self.show_about_window = true;
-        self.center_about_window_next_frame = true;
     }
 
     fn open_performance_dialog(&mut self) {
@@ -1789,415 +1896,518 @@ impl ImranViewApp {
     #[cfg(not(target_os = "macos"))]
     fn handle_native_menu_events(&mut self, _ctx: &egui::Context) {}
 
+    fn native_selected_surface(visuals: &egui::Visuals) -> egui::Color32 {
+        let accent = visuals.selection.bg_fill;
+        let alpha = if visuals.dark_mode { 112 } else { 70 };
+        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha)
+    }
+
+    fn native_bar_frame(ctx: &egui::Context) -> egui::Frame {
+        egui::Frame::new()
+            .fill(ctx.style().visuals.panel_fill)
+            .inner_margin(egui::Margin::symmetric(8, 2))
+    }
+
+    fn dialog_viewport_builder(
+        ctx: &egui::Context,
+        title: &'static str,
+        size: egui::Vec2,
+    ) -> egui::ViewportBuilder {
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size(size)
+            .with_min_inner_size(size)
+            .with_resizable(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false)
+            .with_close_button(true)
+            .with_active(true);
+
+        if let Some(root_outer) = ctx.input(|i| i.viewport().outer_rect) {
+            let centered = egui::pos2(
+                root_outer.center().x - size.x * 0.5,
+                root_outer.center().y - size.y * 0.5,
+            );
+            builder = builder.with_position(centered);
+        }
+
+        builder
+    }
+
+    fn show_popup_window(
+        &mut self,
+        ctx: &egui::Context,
+        id_source: &'static str,
+        title: &'static str,
+        size: egui::Vec2,
+        open: &mut bool,
+        mut add_contents: impl FnMut(&mut Self, &egui::Context, &mut egui::Ui, &mut bool),
+    ) {
+        let viewport_id = egui::ViewportId::from_hash_of(id_source);
+
+        if !*open {
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+            return;
+        }
+
+        let builder = Self::dialog_viewport_builder(ctx, title, size);
+        ctx.show_viewport_immediate(viewport_id, builder, |viewport_ctx, class| {
+            if viewport_ctx.input(|i| i.viewport().close_requested()) {
+                *open = false;
+                return;
+            }
+
+            match class {
+                egui::ViewportClass::Embedded => {
+                    let mut embedded_open = *open;
+                    let mut requested_close = false;
+                    centered_dialog_window(title)
+                        .open(&mut embedded_open)
+                        .default_size(size)
+                        .show(viewport_ctx, |ui| {
+                            let mut content_open = true;
+                            add_contents(self, viewport_ctx, ui, &mut content_open);
+                            if !content_open {
+                                requested_close = true;
+                            }
+                        });
+                    *open = embedded_open && !requested_close;
+                }
+                egui::ViewportClass::Root
+                | egui::ViewportClass::Deferred
+                | egui::ViewportClass::Immediate => {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)))
+                        .show(viewport_ctx, |ui| {
+                            add_contents(self, viewport_ctx, ui, open);
+                        });
+                }
+            }
+        });
+
+        if !*open {
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+        }
+    }
+
     fn draw_menu(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui
-                        .button(menu_item_label(ctx, ShortcutAction::Open, "Open..."))
-                        .clicked()
-                    {
-                        self.open_path_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new(menu_item_label(ctx, ShortcutAction::Save, "Save")),
-                        )
-                        .clicked()
-                    {
-                        self.dispatch_save(None, false, self.default_save_options());
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new(menu_item_label(
-                                ctx,
-                                ShortcutAction::SaveAs,
-                                "Save As...",
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.open_save_as_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Save with options..."),
-                        )
-                        .clicked()
-                    {
-                        self.open_save_as_dialog();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Rename current..."),
-                        )
-                        .clicked()
-                    {
-                        self.open_rename_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Copy current to folder..."),
-                        )
-                        .clicked()
-                    {
-                        self.copy_current_to_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Move current to folder..."),
-                        )
-                        .clicked()
-                    {
-                        self.move_current_to_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Delete current..."),
-                        )
-                        .clicked()
-                    {
-                        self.confirm_delete_current = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("Batch convert / rename...").clicked() {
-                        self.open_batch_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Print current..."),
-                        )
-                        .clicked()
-                    {
-                        self.dispatch_print_current();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    ui.menu_button("Recent files", |ui| {
-                        let recent_files: Vec<PathBuf> = self
-                            .state
-                            .recent_files()
-                            .iter()
-                            .take(RECENT_MENU_LIMIT)
-                            .cloned()
-                            .collect();
-                        if recent_files.is_empty() {
-                            ui.label("No recent files");
-                            return;
-                        }
-                        for path in recent_files {
-                            let label = format_recent_file_label(&path);
-                            let enabled = path.is_file();
-                            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                                self.dispatch_open(path, false);
-                                ui.close_menu();
-                            }
-                        }
-                    });
-                    ui.menu_button("Recent folders", |ui| {
-                        let recent_dirs: Vec<PathBuf> = self
-                            .state
-                            .recent_directories()
-                            .iter()
-                            .take(RECENT_MENU_LIMIT)
-                            .cloned()
-                            .collect();
-                        if recent_dirs.is_empty() {
-                            ui.label("No recent folders");
-                            return;
-                        }
-                        for path in recent_dirs {
-                            let label = format_recent_folder_label(&path);
-                            let enabled = path.is_dir();
-                            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                                self.dispatch_open_directory(path);
-                                ui.close_menu();
-                            }
-                        }
-                    });
-                    ui.separator();
-                    if ui.button("Exit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-
-                ui.menu_button("Edit", |ui| {
-                    if ui
-                        .add_enabled(self.state.has_image(), egui::Button::new("Rotate Left"))
-                        .clicked()
-                    {
-                        self.dispatch_transform(TransformOp::RotateLeft);
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(self.state.has_image(), egui::Button::new("Rotate Right"))
-                        .clicked()
-                    {
-                        self.dispatch_transform(TransformOp::RotateRight);
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(self.state.has_image(), egui::Button::new("Flip Horizontal"))
-                        .clicked()
-                    {
-                        self.dispatch_transform(TransformOp::FlipHorizontal);
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(self.state.has_image(), egui::Button::new("Flip Vertical"))
-                        .clicked()
-                    {
-                        self.dispatch_transform(TransformOp::FlipVertical);
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Resize / resample..."),
-                        )
-                        .clicked()
-                    {
-                        self.open_resize_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(self.state.has_image(), egui::Button::new("Crop..."))
-                        .clicked()
-                    {
-                        self.open_crop_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Color corrections..."),
-                        )
-                        .clicked()
-                    {
-                        self.open_color_dialog();
-                        ui.close_menu();
-                    }
-                });
-
-                ui.menu_button("Image", |ui| {
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new(menu_item_label(
-                                ctx,
-                                ShortcutAction::PreviousImage,
-                                "Previous image",
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.open_previous();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new(menu_item_label(
-                                ctx,
-                                ShortcutAction::NextImage,
-                                "Next image",
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.open_next();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new(menu_item_label(
-                                ctx,
-                                ShortcutAction::ZoomIn,
-                                "Zoom in",
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.zoom_in();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new(menu_item_label(
-                                ctx,
-                                ShortcutAction::ZoomOut,
-                                "Zoom out",
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.zoom_out();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new(menu_item_label(
-                                ctx,
-                                ShortcutAction::Fit,
-                                "Fit to window",
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.zoom_fit();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new(menu_item_label(
-                                ctx,
-                                ShortcutAction::ActualSize,
-                                "Actual size",
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.zoom_actual();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if self.slideshow_running {
-                        if ui.button("Stop slideshow    Space").clicked() {
-                            self.stop_slideshow();
+        egui::TopBottomPanel::top("menu")
+            .frame(Self::native_bar_frame(ctx))
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui
+                            .button(menu_item_label(ctx, ShortcutAction::Open, "Open..."))
+                            .clicked()
+                        {
+                            self.open_path_dialog();
                             ui.close_menu();
                         }
-                    } else if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Start slideshow    Space"),
-                        )
-                        .clicked()
-                    {
-                        self.start_slideshow();
-                        ui.close_menu();
-                    }
-                    let mut interval = self.state.slideshow_interval_secs();
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut interval, 0.5..=30.0)
-                                .text("Interval (s)")
-                                .fixed_decimals(1),
-                        )
-                        .changed()
-                    {
-                        self.state.set_slideshow_interval_secs(interval);
-                        self.persist_settings();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.state.has_image(),
-                            egui::Button::new("Load compare image..."),
-                        )
-                        .clicked()
-                    {
-                        self.open_compare_path_dialog();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.compare_image.is_some(),
-                            egui::Button::new("Toggle compare mode"),
-                        )
-                        .clicked()
-                    {
-                        self.compare_mode = !self.compare_mode;
-                        ui.close_menu();
-                    }
-                });
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new(menu_item_label(
+                                    ctx,
+                                    ShortcutAction::Save,
+                                    "Save",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.dispatch_save(None, false, self.default_save_options());
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new(menu_item_label(
+                                    ctx,
+                                    ShortcutAction::SaveAs,
+                                    "Save As...",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.open_save_as_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Save with options..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_save_as_dialog();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Rename current..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_rename_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Copy current to folder..."),
+                            )
+                            .clicked()
+                        {
+                            self.copy_current_to_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Move current to folder..."),
+                            )
+                            .clicked()
+                        {
+                            self.move_current_to_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Delete current..."),
+                            )
+                            .clicked()
+                        {
+                            self.confirm_delete_current = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Batch convert / rename...").clicked() {
+                            self.open_batch_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Print current..."),
+                            )
+                            .clicked()
+                        {
+                            self.dispatch_print_current();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.menu_button("Recent files", |ui| {
+                            let recent_files: Vec<PathBuf> = self
+                                .state
+                                .recent_files()
+                                .iter()
+                                .take(RECENT_MENU_LIMIT)
+                                .cloned()
+                                .collect();
+                            if recent_files.is_empty() {
+                                ui.label("No recent files");
+                                return;
+                            }
+                            for path in recent_files {
+                                let label = format_recent_file_label(&path);
+                                let enabled = path.is_file();
+                                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                    self.dispatch_open(path, false);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.menu_button("Recent folders", |ui| {
+                            let recent_dirs: Vec<PathBuf> = self
+                                .state
+                                .recent_directories()
+                                .iter()
+                                .take(RECENT_MENU_LIMIT)
+                                .cloned()
+                                .collect();
+                            if recent_dirs.is_empty() {
+                                ui.label("No recent folders");
+                                return;
+                            }
+                            for path in recent_dirs {
+                                let label = format_recent_folder_label(&path);
+                                let enabled = path.is_dir();
+                                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                    self.dispatch_open_directory(path);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.separator();
+                        if ui.button("Exit").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
 
-                ui.menu_button("View", |ui| {
-                    let mut show_status_bar = self.state.show_status_bar();
-                    if ui
-                        .checkbox(&mut show_status_bar, "Show status bar")
-                        .changed()
-                    {
-                        self.state.set_show_status_bar(show_status_bar);
-                        self.persist_settings();
-                    }
-                    let mut show_toolbar = self.state.show_toolbar();
-                    if ui.checkbox(&mut show_toolbar, "Show toolbar").changed() {
-                        self.state.set_show_toolbar(show_toolbar);
-                        self.persist_settings();
-                    }
-                    let mut show_metadata_panel = self.state.show_metadata_panel();
-                    if ui
-                        .checkbox(&mut show_metadata_panel, "Metadata panel")
-                        .changed()
-                    {
-                        self.state.set_show_metadata_panel(show_metadata_panel);
-                        self.persist_settings();
-                    }
-                    let mut show_thumbnail_strip = self.state.show_thumbnail_strip();
-                    if ui
-                        .checkbox(&mut show_thumbnail_strip, "Thumbnail strip")
-                        .changed()
-                    {
-                        self.state.set_show_thumbnail_strip(show_thumbnail_strip);
-                        self.persist_settings();
-                    }
-                    let mut show_thumbnail_window = self.state.thumbnails_window_mode();
-                    if ui
-                        .checkbox(&mut show_thumbnail_window, "Thumbnail window")
-                        .changed()
-                    {
-                        self.state.set_thumbnails_window_mode(show_thumbnail_window);
-                        self.persist_settings();
-                    }
-                });
+                    ui.menu_button("Edit", |ui| {
+                        if ui
+                            .add_enabled(self.state.has_image(), egui::Button::new("Rotate Left"))
+                            .clicked()
+                        {
+                            self.dispatch_transform(TransformOp::RotateLeft);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(self.state.has_image(), egui::Button::new("Rotate Right"))
+                            .clicked()
+                        {
+                            self.dispatch_transform(TransformOp::RotateRight);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Flip Horizontal"),
+                            )
+                            .clicked()
+                        {
+                            self.dispatch_transform(TransformOp::FlipHorizontal);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(self.state.has_image(), egui::Button::new("Flip Vertical"))
+                            .clicked()
+                        {
+                            self.dispatch_transform(TransformOp::FlipVertical);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Resize / resample..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_resize_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(self.state.has_image(), egui::Button::new("Crop..."))
+                            .clicked()
+                        {
+                            self.open_crop_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Color corrections..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_color_dialog();
+                            ui.close_menu();
+                        }
+                    });
 
-                ui.menu_button("Options", |ui| {
-                    if ui.button("Performance / cache...").clicked() {
-                        self.open_performance_dialog();
-                        ui.close_menu();
-                    }
-                    if ui.button("Clear runtime caches").clicked() {
-                        self.clear_runtime_caches();
-                        ui.close_menu();
-                    }
-                });
+                    ui.menu_button("Image", |ui| {
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new(menu_item_label(
+                                    ctx,
+                                    ShortcutAction::PreviousImage,
+                                    "Previous image",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.open_previous();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new(menu_item_label(
+                                    ctx,
+                                    ShortcutAction::NextImage,
+                                    "Next image",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.open_next();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new(menu_item_label(
+                                    ctx,
+                                    ShortcutAction::ZoomIn,
+                                    "Zoom in",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.zoom_in();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new(menu_item_label(
+                                    ctx,
+                                    ShortcutAction::ZoomOut,
+                                    "Zoom out",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.zoom_out();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new(menu_item_label(
+                                    ctx,
+                                    ShortcutAction::Fit,
+                                    "Fit to window",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.zoom_fit();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new(menu_item_label(
+                                    ctx,
+                                    ShortcutAction::ActualSize,
+                                    "Actual size",
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.zoom_actual();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if self.slideshow_running {
+                            if ui.button("Stop slideshow    Space").clicked() {
+                                self.stop_slideshow();
+                                ui.close_menu();
+                            }
+                        } else if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Start slideshow    Space"),
+                            )
+                            .clicked()
+                        {
+                            self.start_slideshow();
+                            ui.close_menu();
+                        }
+                        let mut interval = self.state.slideshow_interval_secs();
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut interval, 0.5..=30.0)
+                                    .text("Interval (s)")
+                                    .fixed_decimals(1),
+                            )
+                            .changed()
+                        {
+                            self.state.set_slideshow_interval_secs(interval);
+                            self.persist_settings();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.state.has_image(),
+                                egui::Button::new("Load compare image..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_compare_path_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.compare_image.is_some(),
+                                egui::Button::new("Toggle compare mode"),
+                            )
+                            .clicked()
+                        {
+                            self.compare_mode = !self.compare_mode;
+                            ui.close_menu();
+                        }
+                    });
 
-                ui.menu_button("Plugins", |ui| {
-                    let context = self.plugin_context();
-                    self.plugin_host.menu_ui(ui, &context);
-                });
+                    ui.menu_button("View", |ui| {
+                        let mut show_status_bar = self.state.show_status_bar();
+                        if ui
+                            .checkbox(&mut show_status_bar, "Show status bar")
+                            .changed()
+                        {
+                            self.state.set_show_status_bar(show_status_bar);
+                            self.persist_settings();
+                        }
+                        let mut show_toolbar = self.state.show_toolbar();
+                        if ui.checkbox(&mut show_toolbar, "Show toolbar").changed() {
+                            self.state.set_show_toolbar(show_toolbar);
+                            self.persist_settings();
+                        }
+                        let mut show_metadata_panel = self.state.show_metadata_panel();
+                        if ui
+                            .checkbox(&mut show_metadata_panel, "Metadata panel")
+                            .changed()
+                        {
+                            self.state.set_show_metadata_panel(show_metadata_panel);
+                            self.persist_settings();
+                        }
+                        let mut show_thumbnail_strip = self.state.show_thumbnail_strip();
+                        if ui
+                            .checkbox(&mut show_thumbnail_strip, "Thumbnail strip")
+                            .changed()
+                        {
+                            self.state.set_show_thumbnail_strip(show_thumbnail_strip);
+                            self.persist_settings();
+                        }
+                        let mut show_thumbnail_window = self.state.thumbnails_window_mode();
+                        if ui
+                            .checkbox(&mut show_thumbnail_window, "Thumbnail window")
+                            .changed()
+                        {
+                            self.state.set_thumbnails_window_mode(show_thumbnail_window);
+                            self.persist_settings();
+                        }
+                    });
 
-                ui.menu_button("Help", |ui| {
-                    if ui.button("About ImranView").clicked() {
-                        self.open_about_window();
-                        ui.close_menu();
-                    }
+                    ui.menu_button("Options", |ui| {
+                        if ui.button("Performance / cache...").clicked() {
+                            self.open_performance_dialog();
+                            ui.close_menu();
+                        }
+                        if ui.button("Clear runtime caches").clicked() {
+                            self.clear_runtime_caches();
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.menu_button("Plugins", |ui| {
+                        let context = self.plugin_context();
+                        self.plugin_host.menu_ui(ui, &context);
+                    });
+
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("About ImranView").clicked() {
+                            self.open_about_window();
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
-        });
     }
 
     fn toolbar_icon_button(
@@ -2209,9 +2419,9 @@ impl ImranViewApp {
     ) -> egui::Response {
         let icon_size = egui::vec2(TOOLBAR_ICON_SIZE, TOOLBAR_ICON_SIZE);
         let image = egui::Image::new((icon.id(), icon_size));
-        let mut button = egui::Button::image(image);
+        let mut button = egui::Button::image(image).min_size(egui::vec2(28.0, 24.0));
         if selected {
-            button = button.fill(egui::Color32::from_rgb(216, 232, 251));
+            button = button.fill(Self::native_selected_surface(ui.visuals()));
         }
         ui.add_enabled(enabled, button).on_hover_text(tooltip)
     }
@@ -2222,8 +2432,10 @@ impl ImranViewApp {
         }
 
         egui::TopBottomPanel::top("toolbar")
-            .exact_height(34.0)
+            .frame(Self::native_bar_frame(ctx))
+            .exact_height(TOOLBAR_PANEL_HEIGHT)
             .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
                 ui.horizontal(|ui| {
                     let has_image = self.state.has_image();
 
@@ -2416,6 +2628,7 @@ impl ImranViewApp {
         }
 
         egui::TopBottomPanel::bottom("thumbnail-strip")
+            .frame(Self::native_bar_frame(ctx))
             .resizable(true)
             .min_height(112.0)
             .default_height(146.0)
@@ -2562,9 +2775,13 @@ impl ImranViewApp {
         row_mode: bool,
         card_width: f32,
     ) {
-        let mut frame = egui::Frame::group(ui.style());
+        let mut frame = egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(6, 5))
+            .fill(ui.visuals().extreme_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(egui::CornerRadius::same(platform_widget_corner_radius()));
         if entry.current {
-            frame = frame.fill(egui::Color32::from_rgb(216, 232, 251));
+            frame = frame.fill(Self::native_selected_surface(ui.visuals()));
         }
 
         let response = frame.show(ui, |ui| {
@@ -2756,55 +2973,44 @@ impl ImranViewApp {
         }
 
         let mut open = self.show_about_window;
-        let mut window = egui::Window::new("About ImranView")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false);
-
-        if self.center_about_window_next_frame {
-            window = window.anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO);
-            self.center_about_window_next_frame = false;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            // Keep the popup frame subtle on macOS to avoid heavy non-native looking borders.
-            let frame = egui::Frame::window(&ctx.style())
-                .stroke(egui::Stroke::new(0.5, egui::Color32::from_gray(110)));
-            window = window.frame(frame);
-        }
-
-        window.show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(icon) = &self.about_icon_texture {
-                    ui.add(egui::Image::new((icon.id(), egui::vec2(64.0, 64.0))));
-                }
-                ui.vertical(|ui| {
-                    ui.heading("ImranView");
-                    ui.label("Imran, brother of Irfan");
-                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+        self.show_popup_window(
+            ctx,
+            "popup.about",
+            "About ImranView",
+            egui::vec2(440.0, 260.0),
+            &mut open,
+            |app, _ctx, ui, _open| {
+                ui.horizontal(|ui| {
+                    if let Some(icon) = &app.about_icon_texture {
+                        ui.add(egui::Image::new((icon.id(), egui::vec2(64.0, 64.0))));
+                    }
+                    ui.vertical(|ui| {
+                        ui.heading("ImranView");
+                        ui.label("Imran, brother of Irfan");
+                        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    });
                 });
-            });
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Twitter:");
-                ui.hyperlink_to("@stonecharioteer", "https://twitter.com/stonecharioteer");
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Website:");
-                ui.hyperlink_to(
-                    "tech.stonecharioteer.com",
-                    "https://tech.stonecharioteer.com",
-                );
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Source:");
-                ui.hyperlink_to(
-                    "github.com/stonecharioteer/imranview",
-                    "https://github.com/stonecharioteer/imranview",
-                );
-            });
-        });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Twitter:");
+                    ui.hyperlink_to("@stonecharioteer", "https://twitter.com/stonecharioteer");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Website:");
+                    ui.hyperlink_to(
+                        "tech.stonecharioteer.com",
+                        "https://tech.stonecharioteer.com",
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Source:");
+                    ui.hyperlink_to(
+                        "github.com/stonecharioteer/imranview",
+                        "https://github.com/stonecharioteer/imranview",
+                    );
+                });
+            },
+        );
 
         self.show_about_window = open;
     }
@@ -2870,12 +3076,14 @@ impl ImranViewApp {
         }
 
         let mut open = self.resize_dialog.open;
-        egui::Window::new("Resize / Resample")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                let aspect = if let Some((width, height)) = self.state.original_dimensions() {
+        self.show_popup_window(
+            ctx,
+            "popup.resize",
+            "Resize / Resample",
+            egui::vec2(460.0, 280.0),
+            &mut open,
+            |app, _ctx, ui, open_state| {
+                let aspect = if let Some((width, height)) = app.state.original_dimensions() {
                     if height > 0 {
                         width as f32 / height as f32
                     } else {
@@ -2885,22 +3093,22 @@ impl ImranViewApp {
                     1.0
                 };
 
-                let before_width = self.resize_dialog.width;
-                let before_height = self.resize_dialog.height;
+                let before_width = app.resize_dialog.width;
+                let before_height = app.resize_dialog.height;
                 ui.horizontal(|ui| {
                     ui.label("Width:");
-                    ui.add(egui::DragValue::new(&mut self.resize_dialog.width).range(1..=65535));
+                    ui.add(egui::DragValue::new(&mut app.resize_dialog.width).range(1..=65535));
                     ui.label("Height:");
-                    ui.add(egui::DragValue::new(&mut self.resize_dialog.height).range(1..=65535));
+                    ui.add(egui::DragValue::new(&mut app.resize_dialog.height).range(1..=65535));
                 });
-                ui.checkbox(&mut self.resize_dialog.keep_aspect, "Keep aspect ratio");
-                if self.resize_dialog.keep_aspect {
-                    if self.resize_dialog.width != before_width && aspect > 0.0 {
-                        self.resize_dialog.height =
-                            ((self.resize_dialog.width as f32 / aspect).round().max(1.0)) as u32;
-                    } else if self.resize_dialog.height != before_height && aspect > 0.0 {
-                        self.resize_dialog.width =
-                            ((self.resize_dialog.height as f32 * aspect).round().max(1.0)) as u32;
+                ui.checkbox(&mut app.resize_dialog.keep_aspect, "Keep aspect ratio");
+                if app.resize_dialog.keep_aspect {
+                    if app.resize_dialog.width != before_width && aspect > 0.0 {
+                        app.resize_dialog.height =
+                            ((app.resize_dialog.width as f32 / aspect).round().max(1.0)) as u32;
+                    } else if app.resize_dialog.height != before_height && aspect > 0.0 {
+                        app.resize_dialog.width =
+                            ((app.resize_dialog.height as f32 * aspect).round().max(1.0)) as u32;
                     }
                 }
 
@@ -2908,27 +3116,27 @@ impl ImranViewApp {
                 ui.label("Filter:");
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(
-                        &mut self.resize_dialog.filter,
+                        &mut app.resize_dialog.filter,
                         ResizeFilter::Nearest,
                         "Nearest",
                     );
                     ui.selectable_value(
-                        &mut self.resize_dialog.filter,
+                        &mut app.resize_dialog.filter,
                         ResizeFilter::Triangle,
                         "Triangle",
                     );
                     ui.selectable_value(
-                        &mut self.resize_dialog.filter,
+                        &mut app.resize_dialog.filter,
                         ResizeFilter::CatmullRom,
                         "CatmullRom",
                     );
                     ui.selectable_value(
-                        &mut self.resize_dialog.filter,
+                        &mut app.resize_dialog.filter,
                         ResizeFilter::Gaussian,
                         "Gaussian",
                     );
                     ui.selectable_value(
-                        &mut self.resize_dialog.filter,
+                        &mut app.resize_dialog.filter,
                         ResizeFilter::Lanczos3,
                         "Lanczos3",
                     );
@@ -2936,14 +3144,15 @@ impl ImranViewApp {
 
                 ui.separator();
                 if ui.button("Apply").clicked() {
-                    self.dispatch_transform(TransformOp::Resize {
-                        width: self.resize_dialog.width.max(1),
-                        height: self.resize_dialog.height.max(1),
-                        filter: self.resize_dialog.filter,
+                    app.dispatch_transform(TransformOp::Resize {
+                        width: app.resize_dialog.width.max(1),
+                        height: app.resize_dialog.height.max(1),
+                        filter: app.resize_dialog.filter,
                     });
-                    self.resize_dialog.open = false;
+                    *open_state = false;
                 }
-            });
+            },
+        );
         self.resize_dialog.open = open;
     }
 
@@ -2953,34 +3162,37 @@ impl ImranViewApp {
         }
 
         let mut open = self.crop_dialog.open;
-        egui::Window::new("Crop")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        self.show_popup_window(
+            ctx,
+            "popup.crop",
+            "Crop",
+            egui::vec2(420.0, 180.0),
+            &mut open,
+            |app, _ctx, ui, open_state| {
                 ui.horizontal(|ui| {
                     ui.label("X:");
-                    ui.add(egui::DragValue::new(&mut self.crop_dialog.x).range(0..=65535));
+                    ui.add(egui::DragValue::new(&mut app.crop_dialog.x).range(0..=65535));
                     ui.label("Y:");
-                    ui.add(egui::DragValue::new(&mut self.crop_dialog.y).range(0..=65535));
+                    ui.add(egui::DragValue::new(&mut app.crop_dialog.y).range(0..=65535));
                 });
                 ui.horizontal(|ui| {
                     ui.label("Width:");
-                    ui.add(egui::DragValue::new(&mut self.crop_dialog.width).range(1..=65535));
+                    ui.add(egui::DragValue::new(&mut app.crop_dialog.width).range(1..=65535));
                     ui.label("Height:");
-                    ui.add(egui::DragValue::new(&mut self.crop_dialog.height).range(1..=65535));
+                    ui.add(egui::DragValue::new(&mut app.crop_dialog.height).range(1..=65535));
                 });
 
                 if ui.button("Apply").clicked() {
-                    self.dispatch_transform(TransformOp::Crop {
-                        x: self.crop_dialog.x,
-                        y: self.crop_dialog.y,
-                        width: self.crop_dialog.width.max(1),
-                        height: self.crop_dialog.height.max(1),
+                    app.dispatch_transform(TransformOp::Crop {
+                        x: app.crop_dialog.x,
+                        y: app.crop_dialog.y,
+                        width: app.crop_dialog.width.max(1),
+                        height: app.crop_dialog.height.max(1),
                     });
-                    self.crop_dialog.open = false;
+                    *open_state = false;
                 }
-            });
+            },
+        );
         self.crop_dialog.open = open;
     }
 
@@ -2990,42 +3202,45 @@ impl ImranViewApp {
         }
 
         let mut open = self.color_dialog.open;
-        egui::Window::new("Color Corrections")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        self.show_popup_window(
+            ctx,
+            "popup.color",
+            "Color Corrections",
+            egui::vec2(460.0, 260.0),
+            &mut open,
+            |app, _ctx, ui, open_state| {
                 ui.add(
-                    egui::Slider::new(&mut self.color_dialog.brightness, -255..=255)
+                    egui::Slider::new(&mut app.color_dialog.brightness, -255..=255)
                         .text("Brightness"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.color_dialog.contrast, -100.0..=100.0)
+                    egui::Slider::new(&mut app.color_dialog.contrast, -100.0..=100.0)
                         .text("Contrast"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.color_dialog.gamma, 0.1..=5.0)
+                    egui::Slider::new(&mut app.color_dialog.gamma, 0.1..=5.0)
                         .text("Gamma")
                         .fixed_decimals(2),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.color_dialog.saturation, 0.0..=3.0)
+                    egui::Slider::new(&mut app.color_dialog.saturation, 0.0..=3.0)
                         .text("Saturation")
                         .fixed_decimals(2),
                 );
-                ui.checkbox(&mut self.color_dialog.grayscale, "Grayscale");
+                ui.checkbox(&mut app.color_dialog.grayscale, "Grayscale");
 
                 if ui.button("Apply").clicked() {
-                    self.dispatch_transform(TransformOp::ColorAdjust(ColorAdjustParams {
-                        brightness: self.color_dialog.brightness,
-                        contrast: self.color_dialog.contrast,
-                        gamma: self.color_dialog.gamma,
-                        saturation: self.color_dialog.saturation,
-                        grayscale: self.color_dialog.grayscale,
+                    app.dispatch_transform(TransformOp::ColorAdjust(ColorAdjustParams {
+                        brightness: app.color_dialog.brightness,
+                        contrast: app.color_dialog.contrast,
+                        gamma: app.color_dialog.gamma,
+                        saturation: app.color_dialog.saturation,
+                        grayscale: app.color_dialog.grayscale,
                     }));
-                    self.color_dialog.open = false;
+                    *open_state = false;
                 }
-            });
+            },
+        );
         self.color_dialog.open = open;
     }
 
@@ -3035,29 +3250,31 @@ impl ImranViewApp {
         }
 
         let mut open = self.batch_dialog.open;
-        egui::Window::new("Batch Convert / Rename")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        self.show_popup_window(
+            ctx,
+            "popup.batch",
+            "Batch Convert / Rename",
+            egui::vec2(760.0, 620.0),
+            &mut open,
+            |app, _ctx, ui, open_state| {
                 ui.label("Input directory");
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.batch_dialog.input_dir);
+                    ui.text_edit_singleline(&mut app.batch_dialog.input_dir);
                     if ui.button("Pick...").clicked() {
                         let dialog = rfd::FileDialog::new().set_title("Batch input directory");
                         if let Some(path) = dialog.pick_folder() {
-                            self.batch_dialog.input_dir = path.display().to_string();
+                            app.batch_dialog.input_dir = path.display().to_string();
                         }
                     }
                 });
 
                 ui.label("Output directory");
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.batch_dialog.output_dir);
+                    ui.text_edit_singleline(&mut app.batch_dialog.output_dir);
                     if ui.button("Pick...").clicked() {
                         let dialog = rfd::FileDialog::new().set_title("Batch output directory");
                         if let Some(path) = dialog.pick_folder() {
-                            self.batch_dialog.output_dir = path.display().to_string();
+                            app.batch_dialog.output_dir = path.display().to_string();
                         }
                     }
                 });
@@ -3066,108 +3283,109 @@ impl ImranViewApp {
                 ui.label("Output format");
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(
-                        &mut self.batch_dialog.output_format,
+                        &mut app.batch_dialog.output_format,
                         BatchOutputFormat::Jpeg,
                         "JPEG",
                     );
                     ui.selectable_value(
-                        &mut self.batch_dialog.output_format,
+                        &mut app.batch_dialog.output_format,
                         BatchOutputFormat::Png,
                         "PNG",
                     );
                     ui.selectable_value(
-                        &mut self.batch_dialog.output_format,
+                        &mut app.batch_dialog.output_format,
                         BatchOutputFormat::Webp,
                         "WEBP",
                     );
                     ui.selectable_value(
-                        &mut self.batch_dialog.output_format,
+                        &mut app.batch_dialog.output_format,
                         BatchOutputFormat::Bmp,
                         "BMP",
                     );
                     ui.selectable_value(
-                        &mut self.batch_dialog.output_format,
+                        &mut app.batch_dialog.output_format,
                         BatchOutputFormat::Tiff,
                         "TIFF",
                     );
                 });
-                if matches!(self.batch_dialog.output_format, BatchOutputFormat::Jpeg) {
+                if matches!(app.batch_dialog.output_format, BatchOutputFormat::Jpeg) {
                     ui.add(
-                        egui::Slider::new(&mut self.batch_dialog.jpeg_quality, 1..=100)
+                        egui::Slider::new(&mut app.batch_dialog.jpeg_quality, 1..=100)
                             .text("JPEG quality"),
                     );
                 }
 
                 ui.horizontal(|ui| {
                     ui.label("Rename prefix");
-                    ui.text_edit_singleline(&mut self.batch_dialog.rename_prefix);
+                    ui.text_edit_singleline(&mut app.batch_dialog.rename_prefix);
                 });
                 ui.horizontal(|ui| {
                     ui.label("Start index");
                     ui.add(
-                        egui::DragValue::new(&mut self.batch_dialog.start_index).range(0..=999999),
+                        egui::DragValue::new(&mut app.batch_dialog.start_index).range(0..=999999),
                     );
                 });
 
                 ui.separator();
                 if ui.button("Preview summary").clicked() {
-                    let input_dir = PathBuf::from(self.batch_dialog.input_dir.trim());
+                    let input_dir = PathBuf::from(app.batch_dialog.input_dir.trim());
                     if input_dir.as_os_str().is_empty() {
-                        self.batch_dialog.preview_error =
+                        app.batch_dialog.preview_error =
                             Some("input directory is required for preview".to_owned());
-                        self.batch_dialog.preview_count = None;
+                        app.batch_dialog.preview_count = None;
                     } else {
                         match collect_images_in_directory(&input_dir) {
                             Ok(files) => {
-                                self.batch_dialog.preview_count = Some(files.len());
-                                self.batch_dialog.preview_for_input =
-                                    self.batch_dialog.input_dir.trim().to_owned();
-                                self.batch_dialog.preview_error = None;
+                                app.batch_dialog.preview_count = Some(files.len());
+                                app.batch_dialog.preview_for_input =
+                                    app.batch_dialog.input_dir.trim().to_owned();
+                                app.batch_dialog.preview_error = None;
                             }
                             Err(err) => {
-                                self.batch_dialog.preview_count = None;
-                                self.batch_dialog.preview_for_input.clear();
-                                self.batch_dialog.preview_error = Some(err.to_string());
+                                app.batch_dialog.preview_count = None;
+                                app.batch_dialog.preview_for_input.clear();
+                                app.batch_dialog.preview_error = Some(err.to_string());
                             }
                         }
                     }
                 }
 
-                if let Some(error) = &self.batch_dialog.preview_error {
+                if let Some(error) = &app.batch_dialog.preview_error {
                     ui.colored_label(egui::Color32::from_rgb(255, 190, 190), error);
-                } else if let Some(count) = self.batch_dialog.preview_count {
+                } else if let Some(count) = app.batch_dialog.preview_count {
                     ui.label(format!(
                         "Preview: {} image(s), output format {:?}, start index {}",
-                        count, self.batch_dialog.output_format, self.batch_dialog.start_index
+                        count, app.batch_dialog.output_format, app.batch_dialog.start_index
                     ));
                 } else {
                     ui.label("Preview required before running batch.");
                 }
 
-                let preview_ready = self.batch_dialog.preview_count.is_some()
-                    && self.batch_dialog.preview_for_input == self.batch_dialog.input_dir.trim();
+                let preview_ready = app.batch_dialog.preview_count.is_some()
+                    && app.batch_dialog.preview_for_input == app.batch_dialog.input_dir.trim();
                 if ui
                     .add_enabled(preview_ready, egui::Button::new("Run batch"))
                     .clicked()
                 {
-                    let input_dir = PathBuf::from(self.batch_dialog.input_dir.trim());
-                    let output_dir = PathBuf::from(self.batch_dialog.output_dir.trim());
+                    let input_dir = PathBuf::from(app.batch_dialog.input_dir.trim());
+                    let output_dir = PathBuf::from(app.batch_dialog.output_dir.trim());
                     if input_dir.as_os_str().is_empty() || output_dir.as_os_str().is_empty() {
-                        self.state
+                        app.state
                             .set_error("input and output directories are required");
                     } else {
-                        self.dispatch_batch_convert(BatchConvertOptions {
+                        app.dispatch_batch_convert(BatchConvertOptions {
                             input_dir,
                             output_dir,
-                            output_format: self.batch_dialog.output_format,
-                            rename_prefix: self.batch_dialog.rename_prefix.clone(),
-                            start_index: self.batch_dialog.start_index,
-                            jpeg_quality: self.batch_dialog.jpeg_quality,
+                            output_format: app.batch_dialog.output_format,
+                            rename_prefix: app.batch_dialog.rename_prefix.clone(),
+                            start_index: app.batch_dialog.start_index,
+                            jpeg_quality: app.batch_dialog.jpeg_quality,
                         });
-                        self.batch_dialog.open = false;
+                        *open_state = false;
                     }
                 }
-            });
+            },
+        );
         self.batch_dialog.open = open;
     }
 
@@ -3177,24 +3395,26 @@ impl ImranViewApp {
         }
 
         let mut open = self.save_dialog.open;
-        egui::Window::new("Save Image")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        self.show_popup_window(
+            ctx,
+            "popup.save",
+            "Save Image",
+            egui::vec2(760.0, 480.0),
+            &mut open,
+            |app, _ctx, ui, open_state| {
                 ui.label("Output path");
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.save_dialog.path);
+                    ui.text_edit_singleline(&mut app.save_dialog.path);
                     if ui.button("Pick...").clicked() {
                         let mut dialog = rfd::FileDialog::new().set_title("Save image as");
-                        if let Some(directory) = self.state.preferred_open_directory() {
+                        if let Some(directory) = app.state.preferred_open_directory() {
                             dialog = dialog.set_directory(directory);
                         }
-                        if let Some(file_name) = self.state.suggested_save_name() {
+                        if let Some(file_name) = app.state.suggested_save_name() {
                             dialog = dialog.set_file_name(file_name);
                         }
                         if let Some(path) = dialog.save_file() {
-                            self.save_dialog.path = path.display().to_string();
+                            app.save_dialog.path = path.display().to_string();
                         }
                     }
                 });
@@ -3203,39 +3423,39 @@ impl ImranViewApp {
                 ui.label("Format");
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(
-                        &mut self.save_dialog.output_format,
+                        &mut app.save_dialog.output_format,
                         SaveOutputFormat::Auto,
                         "Auto (from extension)",
                     );
                     ui.selectable_value(
-                        &mut self.save_dialog.output_format,
+                        &mut app.save_dialog.output_format,
                         SaveOutputFormat::Jpeg,
                         "JPEG",
                     );
                     ui.selectable_value(
-                        &mut self.save_dialog.output_format,
+                        &mut app.save_dialog.output_format,
                         SaveOutputFormat::Png,
                         "PNG",
                     );
                     ui.selectable_value(
-                        &mut self.save_dialog.output_format,
+                        &mut app.save_dialog.output_format,
                         SaveOutputFormat::Webp,
                         "WEBP",
                     );
                     ui.selectable_value(
-                        &mut self.save_dialog.output_format,
+                        &mut app.save_dialog.output_format,
                         SaveOutputFormat::Bmp,
                         "BMP",
                     );
                     ui.selectable_value(
-                        &mut self.save_dialog.output_format,
+                        &mut app.save_dialog.output_format,
                         SaveOutputFormat::Tiff,
                         "TIFF",
                     );
                 });
-                if matches!(self.save_dialog.output_format, SaveOutputFormat::Jpeg) {
+                if matches!(app.save_dialog.output_format, SaveOutputFormat::Jpeg) {
                     ui.add(
-                        egui::Slider::new(&mut self.save_dialog.jpeg_quality, 1..=100)
+                        egui::Slider::new(&mut app.save_dialog.jpeg_quality, 1..=100)
                             .text("JPEG quality"),
                     );
                 }
@@ -3243,17 +3463,17 @@ impl ImranViewApp {
                 ui.separator();
                 ui.label("Metadata policy");
                 ui.radio_value(
-                    &mut self.save_dialog.metadata_policy,
+                    &mut app.save_dialog.metadata_policy,
                     SaveMetadataPolicy::PreserveIfPossible,
                     "Preserve if possible",
                 );
                 ui.radio_value(
-                    &mut self.save_dialog.metadata_policy,
+                    &mut app.save_dialog.metadata_policy,
                     SaveMetadataPolicy::Strip,
                     "Strip metadata",
                 );
                 if matches!(
-                    self.save_dialog.metadata_policy,
+                    app.save_dialog.metadata_policy,
                     SaveMetadataPolicy::PreserveIfPossible
                 ) {
                     ui.small("Current best-effort preservation supports JPEG output.");
@@ -3261,16 +3481,17 @@ impl ImranViewApp {
 
                 ui.separator();
                 if ui.button("Save").clicked() {
-                    let path = PathBuf::from(self.save_dialog.path.trim());
+                    let path = PathBuf::from(app.save_dialog.path.trim());
                     if path.as_os_str().is_empty() {
-                        self.state.set_error("save path is required");
+                        app.state.set_error("save path is required");
                     } else {
-                        let options = self.build_save_options_from_dialog();
-                        self.dispatch_save(Some(path), self.save_dialog.reopen_after_save, options);
-                        self.save_dialog.open = false;
+                        let options = app.build_save_options_from_dialog();
+                        app.dispatch_save(Some(path), app.save_dialog.reopen_after_save, options);
+                        *open_state = false;
                     }
                 }
-            });
+            },
+        );
         self.save_dialog.open = open;
     }
 
@@ -3280,23 +3501,25 @@ impl ImranViewApp {
         }
 
         let mut open = self.performance_dialog.open;
-        egui::Window::new("Performance / Cache Settings")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        self.show_popup_window(
+            ctx,
+            "popup.performance",
+            "Performance / Cache Settings",
+            egui::vec2(520.0, 300.0),
+            &mut open,
+            |app, _ctx, ui, open_state| {
                 ui.label("Thumbnail texture cache");
                 ui.horizontal(|ui| {
                     ui.label("Entry cap");
                     ui.add(
-                        egui::DragValue::new(&mut self.performance_dialog.thumb_cache_entry_cap)
+                        egui::DragValue::new(&mut app.performance_dialog.thumb_cache_entry_cap)
                             .range(64..=4096),
                     );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Memory cap (MB)");
                     ui.add(
-                        egui::DragValue::new(&mut self.performance_dialog.thumb_cache_max_mb)
+                        egui::DragValue::new(&mut app.performance_dialog.thumb_cache_max_mb)
                             .range(16..=1024),
                     );
                 });
@@ -3306,24 +3529,25 @@ impl ImranViewApp {
                 ui.horizontal(|ui| {
                     ui.label("Entry cap");
                     ui.add(
-                        egui::DragValue::new(&mut self.performance_dialog.preload_cache_entry_cap)
+                        egui::DragValue::new(&mut app.performance_dialog.preload_cache_entry_cap)
                             .range(1..=64),
                     );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Memory cap (MB)");
                     ui.add(
-                        egui::DragValue::new(&mut self.performance_dialog.preload_cache_max_mb)
+                        egui::DragValue::new(&mut app.performance_dialog.preload_cache_max_mb)
                             .range(32..=2048),
                     );
                 });
 
                 ui.separator();
                 if ui.button("Apply").clicked() {
-                    self.apply_performance_settings();
-                    self.performance_dialog.open = false;
+                    app.apply_performance_settings();
+                    *open_state = false;
                 }
-            });
+            },
+        );
         self.performance_dialog.open = open;
     }
 
@@ -3333,23 +3557,26 @@ impl ImranViewApp {
         }
 
         let mut open = self.rename_dialog.open;
-        egui::Window::new("Rename Current File")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        self.show_popup_window(
+            ctx,
+            "popup.rename",
+            "Rename Current File",
+            egui::vec2(420.0, 160.0),
+            &mut open,
+            |app, _ctx, ui, open_state| {
                 ui.label("New file name");
-                ui.text_edit_singleline(&mut self.rename_dialog.new_name);
+                ui.text_edit_singleline(&mut app.rename_dialog.new_name);
                 if ui.button("Rename").clicked() {
-                    if let Some(from) = self.rename_dialog.target_path.clone() {
+                    if let Some(from) = app.rename_dialog.target_path.clone() {
                         if let Some(parent) = from.parent() {
-                            let to = parent.join(self.rename_dialog.new_name.trim());
-                            self.dispatch_file_operation(FileOperation::Rename { from, to });
-                            self.rename_dialog.open = false;
+                            let to = parent.join(app.rename_dialog.new_name.trim());
+                            app.dispatch_file_operation(FileOperation::Rename { from, to });
+                            *open_state = false;
                         }
                     }
                 }
-            });
+            },
+        );
         self.rename_dialog.open = open;
     }
 
@@ -3359,22 +3586,25 @@ impl ImranViewApp {
         }
 
         let mut open = self.confirm_delete_current;
-        egui::Window::new("Delete Current File")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        self.show_popup_window(
+            ctx,
+            "popup.delete",
+            "Delete Current File",
+            egui::vec2(420.0, 150.0),
+            &mut open,
+            |app, _ctx, ui, open_state| {
                 ui.label("Delete the current image from disk?");
                 ui.horizontal(|ui| {
                     if ui.button("Delete").clicked() {
-                        self.delete_current_file();
-                        self.confirm_delete_current = false;
+                        app.delete_current_file();
+                        *open_state = false;
                     }
                     if ui.button("Cancel").clicked() {
-                        self.confirm_delete_current = false;
+                        *open_state = false;
                     }
                 });
-            });
+            },
+        );
         self.confirm_delete_current = open;
     }
 
@@ -3553,7 +3783,8 @@ impl ImranViewApp {
         }
 
         egui::TopBottomPanel::bottom("status")
-            .exact_height(24.0)
+            .frame(Self::native_bar_frame(ctx))
+            .exact_height(STATUS_PANEL_HEIGHT)
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(self.state.status_dimensions());

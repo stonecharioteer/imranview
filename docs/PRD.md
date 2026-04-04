@@ -118,7 +118,12 @@ Partial:
 - Metadata preservation is best-effort and currently strongest on JPEG output paths.
 
 Missing:
-- None in P0/P1 core backlog for current milestone.
+- Advanced drawing/edit overlays: text, shapes, border/frame, overlay/watermark, canvas size.
+- Advanced pixel/selection operations: fine rotation, round/custom selection workflows, replace color, alpha-layer editing.
+- Effects and stylization stack: effect presets and stronger filter catalog.
+- Productivity tooling parity: screenshot capture, file search, multipage workflows, contact sheet/HTML export.
+- Advanced utility workflows: OCR, panorama stitching, perspective correction, zoom magnifier.
+- Settings-surface parity: richer options pages (color management, file handling, viewing/editing/fullscreen profiles).
 
 ## 7) Performance budgets (lightweight contract)
 
@@ -184,6 +189,28 @@ Legend:
 | F-026 | Background command execution pipeline | P0 | Done | Open/save/edit/thumbnail work dispatched to worker threads |
 | F-027 | Bounded cache and memory governor | P0 | Done | Byte-budget + count-budget eviction on preload/thumb caches |
 | F-028 | Automated performance regression gate | P0 | Done | CI fails on perf warnings via perf-gate script |
+| F-029 | Add text tool | P1 | Missing | Font, color, stroke, and placement controls |
+| F-030 | Draw shapes toolset | P1 | Missing | Rect/ellipse/arrow/line + fill/stroke/shadow controls |
+| F-031 | Add border/frame | P1 | Missing | Inner/outer border and frame presets |
+| F-032 | Add overlay/watermark | P1 | Missing | Image/text overlays with opacity and anchor controls |
+| F-033 | Canvas size dialog | P1 | Missing | Extend/crop canvas without resampling image content |
+| F-034 | Fine rotation (arbitrary angle) | P1 | Missing | Angle + interpolation/background fill options |
+| F-035 | Advanced selection workflows | P1 | Missing | Round/custom selection, cut-outside, selection crop |
+| F-036 | Replace color tool | P1 | Missing | Source/target color + tolerance previews |
+| F-037 | Alpha layer editing | P1 | Missing | Alpha inspection and edit operations |
+| F-038 | Effects dialog and filter stack | P2 | Missing | Broader effect catalog with preview |
+| F-039 | Screenshot capture dialog | P2 | Missing | Delay/region/window capture flow |
+| F-040 | Search files workflow | P2 | Missing | Folder-scoped file search with filters |
+| F-041 | Multipage TIFF preview | P2 | Missing | Page navigation and extract/export actions |
+| F-042 | Multipage PDF creation | P2 | Missing | Compose ordered image set to PDF |
+| F-043 | Batch scan workflow | P2 | Missing | Scanner-to-batch pipeline integration |
+| F-044 | OCR workflow | P2 | Missing | Text extraction to clipboard/file |
+| F-045 | Panorama stitch workflow | P2 | Missing | Multi-image alignment + export |
+| F-046 | Perspective correction tool | P2 | Missing | Corner handles and transform preview |
+| F-047 | Zoom magnifier tool | P2 | Missing | Lens zoom and sampling controls |
+| F-048 | Thumbnail contact sheet export | P2 | Missing | Grid export with labels and sizing |
+| F-049 | Thumbnail HTML export | P2 | Missing | Static gallery export with links |
+| F-050 | Advanced options/settings pages | P2 | Missing | Viewing/editing/fullscreen/color-management/file-handling panels |
 
 ## 9) Detailed requirements by epic
 
@@ -313,6 +340,14 @@ Milestone M3: Public preview (2-3 weeks)
 - Cross-platform QA pass.
 - Documentation and onboarding polish.
 
+Milestone M4: Tooling parity wave (4-8 weeks)
+- Deliver F-029 to F-037 (high-value editing/drawing operations).
+- Keep all added workflows behind existing performance budgets and background execution rules.
+
+Milestone M5: Productivity and advanced workflows (4-8 weeks)
+- Deliver F-038 to F-050 (effects/productivity/advanced options surfaces).
+- Prioritize lightweight defaults and optional/opt-in heavy workflows.
+
 ## 11) Technical strategy
 
 - Keep decode/transforms in Rust core modules.
@@ -361,3 +396,15 @@ A feature is done only when all conditions hold:
 - [x] Implement background command queue so open/save/edit/thumbnail decode do not block UI input.
 - [x] Add full bounded thumbnail/decode cache policy with configurable limits and stronger eviction controls.
 - [x] Add CI perf smoke checks that gate on startup/open/navigation/memory thresholds.
+- [ ] Add text tool.
+- [ ] Add shape drawing toolset.
+- [ ] Add border/frame and overlay/watermark operations.
+- [ ] Add canvas size and fine-rotation dialogs.
+- [ ] Add advanced selection workflows and replace-color.
+- [ ] Add alpha-layer editing support.
+- [ ] Add effects dialog/filter stack.
+- [ ] Add screenshot capture and file-search workflows.
+- [ ] Add multipage TIFF preview + multipage PDF creation.
+- [ ] Add OCR/panorama/perspective/zoom-magnifier utilities.
+- [ ] Add thumbnail contact-sheet and HTML export.
+- [ ] Add advanced options/settings pages parity.
