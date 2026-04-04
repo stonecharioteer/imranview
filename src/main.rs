@@ -3,6 +3,7 @@ mod image_io;
 #[cfg(target_os = "macos")]
 mod native_menu;
 mod perf;
+mod plugin;
 mod settings;
 mod shortcuts;
 mod worker;
@@ -18,13 +19,17 @@ use anyhow::{Result, anyhow};
 use eframe::egui;
 
 use crate::app_state::{AppState, ThumbnailEntry};
+use crate::image_io::MetadataSummary;
+use crate::image_io::collect_images_in_directory;
 #[cfg(target_os = "macos")]
 use crate::native_menu::{NativeMenu, NativeMenuAction};
+use crate::plugin::{PluginContext, PluginEvent, PluginHost};
 use crate::settings::{PersistedSettings, load_settings, save_settings};
 use crate::shortcuts::{ShortcutAction, menu_item_label};
 use crate::worker::{
     BatchConvertOptions, BatchOutputFormat, ColorAdjustParams, FileOperation, ResizeFilter,
-    TransformOp, WorkerCommand, WorkerRequestKind, WorkerResult,
+    SaveImageOptions, SaveMetadataPolicy, SaveOutputFormat, TransformOp, WorkerCommand,
+    WorkerRequestKind, WorkerResult,
 };
 
 const THUMB_TEXTURE_CACHE_CAP: usize = 320;
@@ -139,11 +144,15 @@ struct PendingRequests {
     latest_edit: u64,
     latest_batch: u64,
     latest_file: u64,
+    latest_compare: u64,
+    latest_print: u64,
     open_inflight: bool,
     save_inflight: bool,
     edit_inflight: bool,
     batch_inflight: bool,
     file_inflight: bool,
+    compare_inflight: bool,
+    print_inflight: bool,
     queued_navigation_steps: i32,
 }
 
@@ -154,6 +163,8 @@ impl PendingRequests {
             || self.edit_inflight
             || self.batch_inflight
             || self.file_inflight
+            || self.compare_inflight
+            || self.print_inflight
     }
 }
 
@@ -235,6 +246,9 @@ struct BatchDialogState {
     rename_prefix: String,
     start_index: u32,
     jpeg_quality: u8,
+    preview_count: Option<usize>,
+    preview_for_input: String,
+    preview_error: Option<String>,
 }
 
 impl Default for BatchDialogState {
@@ -247,6 +261,53 @@ impl Default for BatchDialogState {
             rename_prefix: String::new(),
             start_index: 1,
             jpeg_quality: 90,
+            preview_count: None,
+            preview_for_input: String::new(),
+            preview_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SaveDialogState {
+    open: bool,
+    path: String,
+    output_format: SaveOutputFormat,
+    jpeg_quality: u8,
+    metadata_policy: SaveMetadataPolicy,
+    reopen_after_save: bool,
+}
+
+impl Default for SaveDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            path: String::new(),
+            output_format: SaveOutputFormat::Auto,
+            jpeg_quality: 92,
+            metadata_policy: SaveMetadataPolicy::PreserveIfPossible,
+            reopen_after_save: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PerformanceDialogState {
+    open: bool,
+    thumb_cache_entry_cap: usize,
+    thumb_cache_max_mb: usize,
+    preload_cache_entry_cap: usize,
+    preload_cache_max_mb: usize,
+}
+
+impl Default for PerformanceDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            thumb_cache_entry_cap: THUMB_TEXTURE_CACHE_CAP,
+            thumb_cache_max_mb: THUMB_TEXTURE_CACHE_MAX_BYTES / (1024 * 1024),
+            preload_cache_entry_cap: 6,
+            preload_cache_max_mb: 192,
         }
     }
 }
@@ -265,6 +326,14 @@ struct ThumbTextureCache {
     capacity: usize,
     max_bytes: usize,
     total_bytes: usize,
+}
+
+struct CompareImageState {
+    path: PathBuf,
+    texture: egui::TextureHandle,
+    width: u32,
+    height: u32,
+    metadata: MetadataSummary,
 }
 
 impl ThumbTextureCache {
@@ -335,6 +404,7 @@ impl ThumbTextureCache {
 
 struct ImranViewApp {
     state: AppState,
+    current_metadata: Option<MetadataSummary>,
     worker_tx: Sender<WorkerCommand>,
     thumbnail_tx: Sender<PathBuf>,
     worker_rx: Receiver<WorkerResult>,
@@ -342,6 +412,12 @@ struct ImranViewApp {
     pending: PendingRequests,
     main_texture: Option<egui::TextureHandle>,
     main_texture_generation: u64,
+    main_scroll_offset: egui::Vec2,
+    main_viewport_size: egui::Vec2,
+    compare_image: Option<CompareImageState>,
+    compare_texture_generation: u64,
+    compare_mode: bool,
+    plugin_host: PluginHost,
     thumb_cache: ThumbTextureCache,
     inflight_thumbnails: HashSet<PathBuf>,
     inflight_preloads: HashSet<PathBuf>,
@@ -355,6 +431,8 @@ struct ImranViewApp {
     crop_dialog: CropDialogState,
     color_dialog: ColorDialogState,
     batch_dialog: BatchDialogState,
+    save_dialog: SaveDialogState,
+    performance_dialog: PerformanceDialogState,
     rename_dialog: RenameDialogState,
     confirm_delete_current: bool,
     info_message: Option<String>,
@@ -373,10 +451,22 @@ impl ImranViewApp {
         settings: PersistedSettings,
     ) -> Self {
         let state = AppState::new_with_settings(settings);
+        let thumb_cache_entry_cap = state.thumb_cache_entry_cap();
+        let thumb_cache_max_bytes = state.thumb_cache_max_mb().saturating_mul(1024 * 1024);
         let (worker_tx, worker_thread_rx) = mpsc::channel::<WorkerCommand>();
         let (thumbnail_tx, thumbnail_rx) = mpsc::channel::<PathBuf>();
         let (worker_thread_tx, worker_rx) = mpsc::channel::<WorkerResult>();
-        worker::spawn_workers(worker_thread_rx, thumbnail_rx, worker_thread_tx);
+        let worker_config = worker::WorkerConfig {
+            preload_cache_cap: state.preload_cache_entry_cap(),
+            preload_cache_max_bytes: state.preload_cache_max_mb().saturating_mul(1024 * 1024),
+            thumbnail_workers: 0,
+        };
+        worker::spawn_workers(
+            worker_thread_rx,
+            thumbnail_rx,
+            worker_thread_tx,
+            worker_config,
+        );
         #[cfg(target_os = "macos")]
         let native_menu = match NativeMenu::install() {
             Ok(menu) => Some(menu),
@@ -391,6 +481,7 @@ impl ImranViewApp {
 
         let mut app = Self {
             state,
+            current_metadata: None,
             worker_tx,
             thumbnail_tx,
             worker_rx,
@@ -398,7 +489,13 @@ impl ImranViewApp {
             pending: PendingRequests::default(),
             main_texture: None,
             main_texture_generation: 1,
-            thumb_cache: ThumbTextureCache::new(THUMB_TEXTURE_CACHE_CAP, THUMB_TEXTURE_CACHE_MAX_BYTES),
+            main_scroll_offset: egui::Vec2::ZERO,
+            main_viewport_size: egui::Vec2::ZERO,
+            compare_image: None,
+            compare_texture_generation: 1,
+            compare_mode: false,
+            plugin_host: PluginHost::new_with_builtins(),
+            thumb_cache: ThumbTextureCache::new(thumb_cache_entry_cap, thumb_cache_max_bytes),
             inflight_thumbnails: HashSet::new(),
             inflight_preloads: HashSet::new(),
             toolbar_icons: ToolbarIcons::try_load(&cc.egui_ctx),
@@ -416,6 +513,8 @@ impl ImranViewApp {
             crop_dialog: CropDialogState::default(),
             color_dialog: ColorDialogState::default(),
             batch_dialog: BatchDialogState::default(),
+            save_dialog: SaveDialogState::default(),
+            performance_dialog: PerformanceDialogState::default(),
             rename_dialog: RenameDialogState::default(),
             confirm_delete_current: false,
             info_message: None,
@@ -503,7 +602,13 @@ impl ImranViewApp {
         }
     }
 
-    fn dispatch_save(&mut self, path: Option<PathBuf>, reopen_after_save: bool) {
+    fn dispatch_save(
+        &mut self,
+        path: Option<PathBuf>,
+        reopen_after_save: bool,
+        options: SaveImageOptions,
+    ) {
+        let source_path = self.state.current_file_path();
         let Some(path) = path.or_else(|| self.state.current_file_path()) else {
             self.state.set_error("no image loaded to save");
             return;
@@ -522,10 +627,12 @@ impl ImranViewApp {
         self.pending.save_inflight = true;
         log::debug!(
             target: "imranview::ui",
-            "queue save request_id={} path={} reopen_after_save={}",
+            "queue save request_id={} path={} reopen_after_save={} format={:?} metadata_policy={:?}",
             request_id,
             path.display(),
-            reopen_after_save
+            reopen_after_save,
+            options.output_format,
+            options.metadata_policy
         );
 
         if self
@@ -533,8 +640,10 @@ impl ImranViewApp {
             .send(WorkerCommand::SaveImage {
                 request_id,
                 path,
+                source_path,
                 image,
                 reopen_after_save,
+                options,
             })
             .is_err()
         {
@@ -542,6 +651,78 @@ impl ImranViewApp {
             log::error!(target: "imranview::ui", "failed to queue save-image command");
             self.state.set_error("failed to queue save-image command");
         }
+    }
+
+    fn default_save_options(&self) -> SaveImageOptions {
+        SaveImageOptions {
+            output_format: SaveOutputFormat::Auto,
+            jpeg_quality: 92,
+            metadata_policy: SaveMetadataPolicy::PreserveIfPossible,
+        }
+    }
+
+    fn plugin_context(&self) -> PluginContext {
+        PluginContext {
+            has_image: self.state.has_image(),
+            current_file: self.state.current_file_path(),
+            compare_mode: self.compare_mode,
+        }
+    }
+
+    fn apply_zoom_change<F>(&mut self, zoom_change: F)
+    where
+        F: FnOnce(&mut AppState),
+    {
+        let old_zoom = if self.state.zoom_is_fit() {
+            None
+        } else {
+            Some(self.state.zoom_factor())
+        };
+        let old_offset = self.main_scroll_offset;
+        let viewport_size = self.main_viewport_size;
+
+        zoom_change(&mut self.state);
+
+        let Some(old_zoom) = old_zoom else {
+            if self.state.zoom_is_fit() {
+                self.main_scroll_offset = egui::Vec2::ZERO;
+            }
+            return;
+        };
+        if self.state.zoom_is_fit() {
+            self.main_scroll_offset = egui::Vec2::ZERO;
+            return;
+        }
+
+        let new_zoom = self.state.zoom_factor();
+        if (new_zoom - old_zoom).abs() < f32::EPSILON
+            || viewport_size.x <= 0.0
+            || viewport_size.y <= 0.0
+        {
+            return;
+        }
+
+        let old_center = old_offset + viewport_size * 0.5;
+        let scale = new_zoom / old_zoom;
+        self.main_scroll_offset = old_center * scale - viewport_size * 0.5;
+        self.main_scroll_offset.x = self.main_scroll_offset.x.max(0.0);
+        self.main_scroll_offset.y = self.main_scroll_offset.y.max(0.0);
+    }
+
+    fn zoom_in(&mut self) {
+        self.apply_zoom_change(|state| state.zoom_in());
+    }
+
+    fn zoom_out(&mut self) {
+        self.apply_zoom_change(|state| state.zoom_out());
+    }
+
+    fn zoom_fit(&mut self) {
+        self.apply_zoom_change(|state| state.set_zoom_fit());
+    }
+
+    fn zoom_actual(&mut self) {
+        self.apply_zoom_change(|state| state.set_zoom_actual());
     }
 
     fn dispatch_transform(&mut self, op: TransformOp) {
@@ -627,6 +808,51 @@ impl ImranViewApp {
             self.pending.file_inflight = false;
             self.state
                 .set_error("failed to queue file operation command");
+        }
+    }
+
+    fn dispatch_compare_open(&mut self, path: PathBuf) {
+        let request_id = self.next_request_id();
+        self.pending.latest_compare = request_id;
+        self.pending.compare_inflight = true;
+        log::debug!(
+            target: "imranview::ui",
+            "queue compare load request_id={} path={}",
+            request_id,
+            path.display()
+        );
+        if self
+            .worker_tx
+            .send(WorkerCommand::LoadCompareImage { request_id, path })
+            .is_err()
+        {
+            self.pending.compare_inflight = false;
+            self.state
+                .set_error("failed to queue compare-image command");
+        }
+    }
+
+    fn dispatch_print_current(&mut self) {
+        let Some(path) = self.state.current_file_path() else {
+            self.state.set_error("no image loaded");
+            return;
+        };
+        let request_id = self.next_request_id();
+        self.pending.latest_print = request_id;
+        self.pending.print_inflight = true;
+        log::debug!(
+            target: "imranview::ui",
+            "queue print request_id={} path={}",
+            request_id,
+            path.display()
+        );
+        if self
+            .worker_tx
+            .send(WorkerCommand::PrintImage { request_id, path })
+            .is_err()
+        {
+            self.pending.print_inflight = false;
+            self.state.set_error("failed to queue print command");
         }
     }
 
@@ -756,6 +982,7 @@ impl ImranViewApp {
                 directory,
                 files,
                 loaded,
+                metadata,
             } => {
                 if request_id != self.pending.latest_open {
                     log::debug!(
@@ -769,6 +996,7 @@ impl ImranViewApp {
                 self.pending.open_inflight = false;
                 self.state
                     .apply_open_payload(path, directory, files, loaded);
+                self.current_metadata = Some(metadata);
                 self.clear_folder_panel_cache();
                 self.update_main_texture_from_state(ctx);
                 self.scroll_thumbnail_to_current = true;
@@ -783,6 +1011,11 @@ impl ImranViewApp {
                 );
                 self.persist_settings();
                 self.dispatch_queued_navigation_step();
+                if let Some(current_path) = self.state.current_file_path() {
+                    let context = self.plugin_context();
+                    self.plugin_host
+                        .emit(PluginEvent::ImageOpened(current_path), &context);
+                }
             }
             WorkerResult::Saved {
                 request_id,
@@ -805,6 +1038,9 @@ impl ImranViewApp {
                     log::debug!(target: "imranview::worker", "save applied request_id={request_id}");
                     self.state.clear_error();
                     self.persist_settings();
+                    let context = self.plugin_context();
+                    self.plugin_host
+                        .emit(PluginEvent::ImageSaved(path), &context);
                 }
             }
             WorkerResult::Transformed { request_id, loaded } => {
@@ -822,6 +1058,11 @@ impl ImranViewApp {
                     self.state.set_error(err.to_string());
                 }
                 self.update_main_texture_from_state(ctx);
+                let context = self.plugin_context();
+                self.plugin_host.emit(
+                    PluginEvent::TransformApplied("image-transform".to_owned()),
+                    &context,
+                );
             }
             WorkerResult::BatchCompleted {
                 request_id,
@@ -845,6 +1086,9 @@ impl ImranViewApp {
                     failed,
                     output_dir.display()
                 ));
+                let context = self.plugin_context();
+                self.plugin_host
+                    .emit(PluginEvent::BatchCompleted { processed, failed }, &context);
             }
             WorkerResult::FileOperationCompleted {
                 request_id,
@@ -866,25 +1110,94 @@ impl ImranViewApp {
                             self.dispatch_open(to.clone(), false);
                         }
                         self.info_message = Some(format!("Renamed to {}", to.display()));
+                        let context = self.plugin_context();
+                        self.plugin_host.emit(
+                            PluginEvent::FileOperation(format!(
+                                "rename {} -> {}",
+                                from.display(),
+                                to.display()
+                            )),
+                            &context,
+                        );
                     }
                     FileOperation::Delete { path } => {
                         self.info_message = Some(format!("Deleted {}", path.display()));
-                        if self.state.current_file_path() == Some(path) {
+                        if self.state.current_file_path() == Some(path.clone()) {
                             if let Some(directory) = self.state.current_directory_path() {
                                 self.dispatch_open_directory(directory);
                             }
                         }
+                        let context = self.plugin_context();
+                        self.plugin_host.emit(
+                            PluginEvent::FileOperation(format!("delete {}", path.display())),
+                            &context,
+                        );
                     }
                     FileOperation::Copy { from: _, to } => {
                         self.info_message = Some(format!("Copied to {}", to.display()));
+                        let context = self.plugin_context();
+                        self.plugin_host.emit(
+                            PluginEvent::FileOperation(format!("copy -> {}", to.display())),
+                            &context,
+                        );
                     }
                     FileOperation::Move { from, to } => {
                         if self.state.current_file_path() == Some(from.clone()) {
                             self.dispatch_open(to.clone(), false);
                         }
                         self.info_message = Some(format!("Moved to {}", to.display()));
+                        let context = self.plugin_context();
+                        self.plugin_host.emit(
+                            PluginEvent::FileOperation(format!(
+                                "move {} -> {}",
+                                from.display(),
+                                to.display()
+                            )),
+                            &context,
+                        );
                     }
                 }
+            }
+            WorkerResult::CompareLoaded {
+                request_id,
+                path,
+                loaded,
+                metadata,
+            } => {
+                if request_id != self.pending.latest_compare {
+                    return;
+                }
+                self.pending.compare_inflight = false;
+                let texture = Self::texture_from_rgba(
+                    ctx,
+                    format!("compare-image-{}", self.compare_texture_generation),
+                    &loaded.preview_rgba,
+                    loaded.preview_width,
+                    loaded.preview_height,
+                );
+                self.compare_texture_generation = self.compare_texture_generation.saturating_add(1);
+                self.compare_image = Some(CompareImageState {
+                    path: path.clone(),
+                    texture,
+                    width: loaded.preview_width,
+                    height: loaded.preview_height,
+                    metadata,
+                });
+                self.compare_mode = true;
+                self.info_message = Some(format!("Loaded compare image {}", path.display()));
+                let context = self.plugin_context();
+                self.plugin_host
+                    .emit(PluginEvent::CompareLoaded(path), &context);
+            }
+            WorkerResult::Printed { request_id, path } => {
+                if request_id != self.pending.latest_print {
+                    return;
+                }
+                self.pending.print_inflight = false;
+                self.info_message = Some(format!("Print job submitted for {}", path.display()));
+                let context = self.plugin_context();
+                self.plugin_host
+                    .emit(PluginEvent::PrintSubmitted(path), &context);
             }
             WorkerResult::ThumbnailDecoded { path, payload } => {
                 self.inflight_thumbnails.remove(&path);
@@ -950,6 +1263,14 @@ impl ImranViewApp {
                         self.pending.file_inflight = false;
                         self.state.set_error(error_message);
                     }
+                    (WorkerRequestKind::Compare, Some(id)) if id == self.pending.latest_compare => {
+                        self.pending.compare_inflight = false;
+                        self.state.set_error(error_message);
+                    }
+                    (WorkerRequestKind::Print, Some(id)) if id == self.pending.latest_print => {
+                        self.pending.print_inflight = false;
+                        self.state.set_error(error_message);
+                    }
                     (WorkerRequestKind::Preload, _) => {
                         // Preload failures are expected for transient/unsupported files.
                     }
@@ -995,7 +1316,7 @@ impl ImranViewApp {
         if shortcuts::trigger(ctx, ShortcutAction::SaveAs) {
             self.open_save_as_dialog();
         } else if shortcuts::trigger(ctx, ShortcutAction::Save) {
-            self.dispatch_save(None, false);
+            self.dispatch_save(None, false, self.default_save_options());
         }
         if shortcuts::trigger(ctx, ShortcutAction::Open) {
             self.open_path_dialog();
@@ -1007,16 +1328,16 @@ impl ImranViewApp {
             self.open_previous();
         }
         if shortcuts::trigger(ctx, ShortcutAction::ZoomIn) {
-            self.state.zoom_in();
+            self.zoom_in();
         }
         if shortcuts::trigger(ctx, ShortcutAction::ZoomOut) {
-            self.state.zoom_out();
+            self.zoom_out();
         }
         if shortcuts::trigger(ctx, ShortcutAction::Fit) {
-            self.state.set_zoom_fit();
+            self.zoom_fit();
         }
         if shortcuts::trigger(ctx, ShortcutAction::ActualSize) {
-            self.state.set_zoom_actual();
+            self.zoom_actual();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             if self.slideshow_running {
@@ -1037,7 +1358,11 @@ impl ImranViewApp {
             }
         });
         if wheel_zoom != 0.0 {
-            self.state.zoom_from_wheel_delta(wheel_zoom);
+            if wheel_zoom > 0.0 {
+                self.zoom_in();
+            } else if wheel_zoom < 0.0 {
+                self.zoom_out();
+            }
         }
     }
 
@@ -1070,12 +1395,10 @@ impl ImranViewApp {
         }
     }
 
-    fn open_save_as_dialog(&mut self) {
+    fn open_compare_path_dialog(&mut self) {
         let preferred_directory = self.state.preferred_open_directory();
-        let suggested_name = self.state.suggested_save_name();
-
         let mut dialog = rfd::FileDialog::new()
-            .set_title("Save image as")
+            .set_title("Open compare image")
             .add_filter(
                 "Images",
                 &[
@@ -1083,16 +1406,41 @@ impl ImranViewApp {
                     "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
                 ],
             );
-
         if let Some(directory) = preferred_directory {
             dialog = dialog.set_directory(directory);
         }
-        if let Some(file_name) = suggested_name {
-            dialog = dialog.set_file_name(file_name);
+        if let Some(path) = dialog.pick_file() {
+            self.dispatch_compare_open(path);
         }
+    }
 
-        if let Some(path) = dialog.save_file() {
-            self.dispatch_save(Some(path), true);
+    fn open_save_as_dialog(&mut self) {
+        if let Some(path) = self.state.current_file_path() {
+            self.save_dialog.path = path.display().to_string();
+        } else {
+            let directory = self
+                .state
+                .preferred_open_directory()
+                .unwrap_or_else(|| PathBuf::from("."));
+            let suggested_name = self
+                .state
+                .suggested_save_name()
+                .unwrap_or_else(|| "image.jpg".to_owned());
+            self.save_dialog.path = directory.join(suggested_name).display().to_string();
+        }
+        let defaults = self.default_save_options();
+        self.save_dialog.output_format = defaults.output_format;
+        self.save_dialog.jpeg_quality = defaults.jpeg_quality;
+        self.save_dialog.metadata_policy = defaults.metadata_policy;
+        self.save_dialog.reopen_after_save = true;
+        self.save_dialog.open = true;
+    }
+
+    fn build_save_options_from_dialog(&self) -> SaveImageOptions {
+        SaveImageOptions {
+            output_format: self.save_dialog.output_format,
+            jpeg_quality: self.save_dialog.jpeg_quality,
+            metadata_policy: self.save_dialog.metadata_policy,
         }
     }
 
@@ -1128,6 +1476,9 @@ impl ImranViewApp {
             self.batch_dialog.input_dir = input_dir.display().to_string();
             self.batch_dialog.output_dir = input_dir.join("output").display().to_string();
         }
+        self.batch_dialog.preview_count = None;
+        self.batch_dialog.preview_for_input.clear();
+        self.batch_dialog.preview_error = None;
         self.batch_dialog.open = true;
     }
 
@@ -1201,6 +1552,45 @@ impl ImranViewApp {
     fn open_about_window(&mut self) {
         self.show_about_window = true;
         self.center_about_window_next_frame = true;
+    }
+
+    fn open_performance_dialog(&mut self) {
+        self.performance_dialog.thumb_cache_entry_cap = self.state.thumb_cache_entry_cap();
+        self.performance_dialog.thumb_cache_max_mb = self.state.thumb_cache_max_mb();
+        self.performance_dialog.preload_cache_entry_cap = self.state.preload_cache_entry_cap();
+        self.performance_dialog.preload_cache_max_mb = self.state.preload_cache_max_mb();
+        self.performance_dialog.open = true;
+    }
+
+    fn clear_runtime_caches(&mut self) {
+        self.thumb_cache = ThumbTextureCache::new(
+            self.state.thumb_cache_entry_cap(),
+            self.state.thumb_cache_max_mb().saturating_mul(1024 * 1024),
+        );
+        self.inflight_thumbnails.clear();
+        self.inflight_preloads.clear();
+        self.info_message = Some("Cleared thumbnail and preload caches".to_owned());
+    }
+
+    fn apply_performance_settings(&mut self) {
+        self.state
+            .set_thumb_cache_entry_cap(self.performance_dialog.thumb_cache_entry_cap);
+        self.state
+            .set_thumb_cache_max_mb(self.performance_dialog.thumb_cache_max_mb);
+        self.state
+            .set_preload_cache_entry_cap(self.performance_dialog.preload_cache_entry_cap);
+        self.state
+            .set_preload_cache_max_mb(self.performance_dialog.preload_cache_max_mb);
+
+        self.clear_runtime_caches();
+        let _ = self.worker_tx.send(WorkerCommand::UpdateCachePolicy {
+            preload_cache_cap: self.state.preload_cache_entry_cap(),
+            preload_cache_max_bytes: self
+                .state
+                .preload_cache_max_mb()
+                .saturating_mul(1024 * 1024),
+        });
+        self.persist_settings();
     }
 
     fn clear_folder_panel_cache(&mut self) {
@@ -1281,6 +1671,8 @@ impl ImranViewApp {
             WorkerRequestKind::Thumbnail => format!("Thumbnail decode failed: {error}"),
             WorkerRequestKind::Batch => format!("Batch convert failed: {error}"),
             WorkerRequestKind::File => format!("File operation failed: {error}"),
+            WorkerRequestKind::Print => format!("Print failed: {error}"),
+            WorkerRequestKind::Compare => format!("Compare load failed: {error}"),
         }
     }
 
@@ -1336,7 +1728,9 @@ impl ImranViewApp {
             match action {
                 NativeMenuAction::About => self.open_about_window(),
                 NativeMenuAction::Open => self.open_path_dialog(),
-                NativeMenuAction::Save => self.dispatch_save(None, false),
+                NativeMenuAction::Save => {
+                    self.dispatch_save(None, false, self.default_save_options())
+                }
                 NativeMenuAction::SaveAs => self.open_save_as_dialog(),
                 NativeMenuAction::RenameCurrent => self.open_rename_dialog(),
                 NativeMenuAction::CopyCurrentToFolder => self.copy_current_to_dialog(),
@@ -1345,6 +1739,11 @@ impl ImranViewApp {
                     self.confirm_delete_current = true;
                 }
                 NativeMenuAction::BatchConvert => self.open_batch_dialog(),
+                NativeMenuAction::PrintCurrent => self.dispatch_print_current(),
+                NativeMenuAction::LoadCompareImage => self.open_compare_path_dialog(),
+                NativeMenuAction::ToggleCompareMode => {
+                    self.compare_mode = !self.compare_mode;
+                }
                 NativeMenuAction::Exit => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1408,7 +1807,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                     {
-                        self.dispatch_save(None, false);
+                        self.dispatch_save(None, false, self.default_save_options());
                         ui.close_menu();
                     }
                     if ui
@@ -1419,6 +1818,16 @@ impl ImranViewApp {
                                 ShortcutAction::SaveAs,
                                 "Save As...",
                             )),
+                        )
+                        .clicked()
+                    {
+                        self.open_save_as_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Save with options..."),
                         )
                         .clicked()
                     {
@@ -1468,6 +1877,16 @@ impl ImranViewApp {
                     }
                     if ui.button("Batch convert / rename...").clicked() {
                         self.open_batch_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Print current..."),
+                        )
+                        .clicked()
+                    {
+                        self.dispatch_print_current();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -1619,7 +2038,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                     {
-                        self.state.zoom_in();
+                        self.zoom_in();
                         ui.close_menu();
                     }
                     if ui
@@ -1633,7 +2052,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                     {
-                        self.state.zoom_out();
+                        self.zoom_out();
                         ui.close_menu();
                     }
                     if ui
@@ -1647,7 +2066,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                     {
-                        self.state.set_zoom_fit();
+                        self.zoom_fit();
                         ui.close_menu();
                     }
                     if ui
@@ -1661,7 +2080,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                     {
-                        self.state.set_zoom_actual();
+                        self.zoom_actual();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -1691,6 +2110,27 @@ impl ImranViewApp {
                     {
                         self.state.set_slideshow_interval_secs(interval);
                         self.persist_settings();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.state.has_image(),
+                            egui::Button::new("Load compare image..."),
+                        )
+                        .clicked()
+                    {
+                        self.open_compare_path_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.compare_image.is_some(),
+                            egui::Button::new("Toggle compare mode"),
+                        )
+                        .clicked()
+                    {
+                        self.compare_mode = !self.compare_mode;
+                        ui.close_menu();
                     }
                 });
 
@@ -1732,6 +2172,22 @@ impl ImranViewApp {
                         self.state.set_thumbnails_window_mode(show_thumbnail_window);
                         self.persist_settings();
                     }
+                });
+
+                ui.menu_button("Options", |ui| {
+                    if ui.button("Performance / cache...").clicked() {
+                        self.open_performance_dialog();
+                        ui.close_menu();
+                    }
+                    if ui.button("Clear runtime caches").clicked() {
+                        self.clear_runtime_caches();
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("Plugins", |ui| {
+                    let context = self.plugin_context();
+                    self.plugin_host.menu_ui(ui, &context);
                 });
 
                 ui.menu_button("Help", |ui| {
@@ -1811,7 +2267,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                         {
-                            self.state.zoom_out();
+                            self.zoom_out();
                         }
                         if Self::toolbar_icon_button(
                             ui,
@@ -1822,7 +2278,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                         {
-                            self.state.zoom_in();
+                            self.zoom_in();
                         }
                         if Self::toolbar_icon_button(
                             ui,
@@ -1834,7 +2290,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                         {
-                            self.state.set_zoom_actual();
+                            self.zoom_actual();
                         }
                         if Self::toolbar_icon_button(
                             ui,
@@ -1845,7 +2301,7 @@ impl ImranViewApp {
                         )
                         .clicked()
                         {
-                            self.state.set_zoom_fit();
+                            self.zoom_fit();
                         }
 
                         ui.separator();
@@ -1898,25 +2354,25 @@ impl ImranViewApp {
                             .add_enabled(self.state.has_image(), egui::Button::new("-"))
                             .clicked()
                         {
-                            self.state.zoom_out();
+                            self.zoom_out();
                         }
                         if ui
                             .add_enabled(self.state.has_image(), egui::Button::new("+"))
                             .clicked()
                         {
-                            self.state.zoom_in();
+                            self.zoom_in();
                         }
                         if ui
                             .add_enabled(self.state.has_image(), egui::Button::new("1:1"))
                             .clicked()
                         {
-                            self.state.set_zoom_actual();
+                            self.zoom_actual();
                         }
                         if ui
                             .add_enabled(self.state.has_image(), egui::Button::new("Fit"))
                             .clicked()
                         {
-                            self.state.set_zoom_fit();
+                            self.zoom_fit();
                         }
 
                         ui.separator();
@@ -2176,12 +2632,94 @@ impl ImranViewApp {
 
     fn draw_main_viewer(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(texture) = &self.main_texture {
+            if self.compare_mode {
+                if let (Some(primary), Some(compare)) = (&self.main_texture, &self.compare_image) {
+                    ui.columns(2, |columns| {
+                        columns[0].heading("Primary");
+                        columns[0].small(
+                            self.state
+                                .current_file_path_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                        columns[0].separator();
+
+                        columns[1].heading("Compare");
+                        columns[1].small(compare.path.display().to_string());
+                        if let Some((_, model)) = compare
+                            .metadata
+                            .exif_fields
+                            .iter()
+                            .find(|(key, _)| key == "Model")
+                        {
+                            columns[1].small(format!("Camera: {model}"));
+                        }
+                        columns[1].separator();
+
+                        if self.state.zoom_is_fit() {
+                            let available_left = columns[0].available_size();
+                            let available_right = columns[1].available_size();
+                            let base_left =
+                                egui::vec2(self.state.image_width(), self.state.image_height());
+                            let base_right =
+                                egui::vec2(compare.width as f32, compare.height as f32);
+
+                            let scale_left = if base_left.x > 0.0 && base_left.y > 0.0 {
+                                (available_left.x / base_left.x)
+                                    .min(available_left.y / base_left.y)
+                                    .max(0.01)
+                            } else {
+                                1.0
+                            };
+                            let scale_right = if base_right.x > 0.0 && base_right.y > 0.0 {
+                                (available_right.x / base_right.x)
+                                    .min(available_right.y / base_right.y)
+                                    .max(0.01)
+                            } else {
+                                1.0
+                            };
+
+                            let left_size = base_left * scale_left;
+                            let right_size = base_right * scale_right;
+
+                            columns[0].centered_and_justified(|ui| {
+                                ui.add(egui::Image::new((primary.id(), left_size)));
+                            });
+                            columns[1].centered_and_justified(|ui| {
+                                ui.add(egui::Image::new((compare.texture.id(), right_size)));
+                            });
+                        } else {
+                            let zoom = self.state.zoom_factor();
+                            let left_size =
+                                egui::vec2(self.state.image_width(), self.state.image_height())
+                                    * zoom;
+                            let right_size =
+                                egui::vec2(compare.width as f32, compare.height as f32) * zoom;
+                            egui::ScrollArea::both()
+                                .id_salt("compare-scroll-left")
+                                .show(&mut columns[0], |ui| {
+                                    ui.add(egui::Image::new((primary.id(), left_size)));
+                                });
+                            egui::ScrollArea::both()
+                                .id_salt("compare-scroll-right")
+                                .show(&mut columns[1], |ui| {
+                                    ui.add(egui::Image::new((compare.texture.id(), right_size)));
+                                });
+                        }
+                    });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Load a compare image from Image > Load compare image...");
+                    });
+                }
+            } else if let Some(texture) = &self.main_texture {
                 let mut desired_size =
                     egui::vec2(self.state.image_width(), self.state.image_height());
 
                 if self.state.zoom_is_fit() {
+                    self.main_scroll_offset = egui::Vec2::ZERO;
                     let available = ui.available_size();
+                    self.main_viewport_size = available;
                     let fit_scale = if desired_size.x > 0.0 && desired_size.y > 0.0 {
                         (available.x / desired_size.x)
                             .min(available.y / desired_size.y)
@@ -2195,9 +2733,14 @@ impl ImranViewApp {
                     });
                 } else {
                     desired_size *= self.state.zoom_factor();
-                    egui::ScrollArea::both().show(ui, |ui| {
-                        ui.add(egui::Image::new((texture.id(), desired_size)));
-                    });
+                    let output = egui::ScrollArea::both()
+                        .id_salt("main-viewer-scroll")
+                        .scroll_offset(self.main_scroll_offset)
+                        .show(ui, |ui| {
+                            ui.add(egui::Image::new((texture.id(), desired_size)));
+                        });
+                    self.main_scroll_offset = output.state.offset;
+                    self.main_viewport_size = output.inner_rect.size();
                 }
             } else {
                 ui.centered_and_justified(|ui| {
@@ -2567,7 +3110,46 @@ impl ImranViewApp {
                 });
 
                 ui.separator();
-                if ui.button("Run batch").clicked() {
+                if ui.button("Preview summary").clicked() {
+                    let input_dir = PathBuf::from(self.batch_dialog.input_dir.trim());
+                    if input_dir.as_os_str().is_empty() {
+                        self.batch_dialog.preview_error =
+                            Some("input directory is required for preview".to_owned());
+                        self.batch_dialog.preview_count = None;
+                    } else {
+                        match collect_images_in_directory(&input_dir) {
+                            Ok(files) => {
+                                self.batch_dialog.preview_count = Some(files.len());
+                                self.batch_dialog.preview_for_input =
+                                    self.batch_dialog.input_dir.trim().to_owned();
+                                self.batch_dialog.preview_error = None;
+                            }
+                            Err(err) => {
+                                self.batch_dialog.preview_count = None;
+                                self.batch_dialog.preview_for_input.clear();
+                                self.batch_dialog.preview_error = Some(err.to_string());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(error) = &self.batch_dialog.preview_error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 190, 190), error);
+                } else if let Some(count) = self.batch_dialog.preview_count {
+                    ui.label(format!(
+                        "Preview: {} image(s), output format {:?}, start index {}",
+                        count, self.batch_dialog.output_format, self.batch_dialog.start_index
+                    ));
+                } else {
+                    ui.label("Preview required before running batch.");
+                }
+
+                let preview_ready = self.batch_dialog.preview_count.is_some()
+                    && self.batch_dialog.preview_for_input == self.batch_dialog.input_dir.trim();
+                if ui
+                    .add_enabled(preview_ready, egui::Button::new("Run batch"))
+                    .clicked()
+                {
                     let input_dir = PathBuf::from(self.batch_dialog.input_dir.trim());
                     let output_dir = PathBuf::from(self.batch_dialog.output_dir.trim());
                     if input_dir.as_os_str().is_empty() || output_dir.as_os_str().is_empty() {
@@ -2587,6 +3169,162 @@ impl ImranViewApp {
                 }
             });
         self.batch_dialog.open = open;
+    }
+
+    fn draw_save_dialog(&mut self, ctx: &egui::Context) {
+        if !self.save_dialog.open {
+            return;
+        }
+
+        let mut open = self.save_dialog.open;
+        egui::Window::new("Save Image")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Output path");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.save_dialog.path);
+                    if ui.button("Pick...").clicked() {
+                        let mut dialog = rfd::FileDialog::new().set_title("Save image as");
+                        if let Some(directory) = self.state.preferred_open_directory() {
+                            dialog = dialog.set_directory(directory);
+                        }
+                        if let Some(file_name) = self.state.suggested_save_name() {
+                            dialog = dialog.set_file_name(file_name);
+                        }
+                        if let Some(path) = dialog.save_file() {
+                            self.save_dialog.path = path.display().to_string();
+                        }
+                    }
+                });
+
+                ui.separator();
+                ui.label("Format");
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(
+                        &mut self.save_dialog.output_format,
+                        SaveOutputFormat::Auto,
+                        "Auto (from extension)",
+                    );
+                    ui.selectable_value(
+                        &mut self.save_dialog.output_format,
+                        SaveOutputFormat::Jpeg,
+                        "JPEG",
+                    );
+                    ui.selectable_value(
+                        &mut self.save_dialog.output_format,
+                        SaveOutputFormat::Png,
+                        "PNG",
+                    );
+                    ui.selectable_value(
+                        &mut self.save_dialog.output_format,
+                        SaveOutputFormat::Webp,
+                        "WEBP",
+                    );
+                    ui.selectable_value(
+                        &mut self.save_dialog.output_format,
+                        SaveOutputFormat::Bmp,
+                        "BMP",
+                    );
+                    ui.selectable_value(
+                        &mut self.save_dialog.output_format,
+                        SaveOutputFormat::Tiff,
+                        "TIFF",
+                    );
+                });
+                if matches!(self.save_dialog.output_format, SaveOutputFormat::Jpeg) {
+                    ui.add(
+                        egui::Slider::new(&mut self.save_dialog.jpeg_quality, 1..=100)
+                            .text("JPEG quality"),
+                    );
+                }
+
+                ui.separator();
+                ui.label("Metadata policy");
+                ui.radio_value(
+                    &mut self.save_dialog.metadata_policy,
+                    SaveMetadataPolicy::PreserveIfPossible,
+                    "Preserve if possible",
+                );
+                ui.radio_value(
+                    &mut self.save_dialog.metadata_policy,
+                    SaveMetadataPolicy::Strip,
+                    "Strip metadata",
+                );
+                if matches!(
+                    self.save_dialog.metadata_policy,
+                    SaveMetadataPolicy::PreserveIfPossible
+                ) {
+                    ui.small("Current best-effort preservation supports JPEG output.");
+                }
+
+                ui.separator();
+                if ui.button("Save").clicked() {
+                    let path = PathBuf::from(self.save_dialog.path.trim());
+                    if path.as_os_str().is_empty() {
+                        self.state.set_error("save path is required");
+                    } else {
+                        let options = self.build_save_options_from_dialog();
+                        self.dispatch_save(Some(path), self.save_dialog.reopen_after_save, options);
+                        self.save_dialog.open = false;
+                    }
+                }
+            });
+        self.save_dialog.open = open;
+    }
+
+    fn draw_performance_dialog(&mut self, ctx: &egui::Context) {
+        if !self.performance_dialog.open {
+            return;
+        }
+
+        let mut open = self.performance_dialog.open;
+        egui::Window::new("Performance / Cache Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Thumbnail texture cache");
+                ui.horizontal(|ui| {
+                    ui.label("Entry cap");
+                    ui.add(
+                        egui::DragValue::new(&mut self.performance_dialog.thumb_cache_entry_cap)
+                            .range(64..=4096),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Memory cap (MB)");
+                    ui.add(
+                        egui::DragValue::new(&mut self.performance_dialog.thumb_cache_max_mb)
+                            .range(16..=1024),
+                    );
+                });
+
+                ui.separator();
+                ui.label("Preload cache");
+                ui.horizontal(|ui| {
+                    ui.label("Entry cap");
+                    ui.add(
+                        egui::DragValue::new(&mut self.performance_dialog.preload_cache_entry_cap)
+                            .range(1..=64),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Memory cap (MB)");
+                    ui.add(
+                        egui::DragValue::new(&mut self.performance_dialog.preload_cache_max_mb)
+                            .range(32..=2048),
+                    );
+                });
+
+                ui.separator();
+                if ui.button("Apply").clicked() {
+                    self.apply_performance_settings();
+                    self.performance_dialog.open = false;
+                }
+            });
+        self.performance_dialog.open = open;
     }
 
     fn draw_rename_dialog(&mut self, ctx: &egui::Context) {
@@ -2729,7 +3467,84 @@ impl ImranViewApp {
                         ui.label(modified);
                         ui.end_row();
                     });
+
+                if let Some(metadata) = &self.current_metadata {
+                    ui.separator();
+                    if metadata.exif_fields.is_empty()
+                        && metadata.iptc_fields.is_empty()
+                        && metadata.xmp_fields.is_empty()
+                    {
+                        ui.label("No EXIF/IPTC/XMP fields detected.");
+                    } else {
+                        egui::CollapsingHeader::new(format!(
+                            "EXIF ({})",
+                            metadata.exif_fields.len()
+                        ))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for (key, value) in &metadata.exif_fields {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!("{key}:"));
+                                    ui.label(value);
+                                });
+                            }
+                        });
+                        egui::CollapsingHeader::new(format!(
+                            "IPTC ({})",
+                            metadata.iptc_fields.len()
+                        ))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for (key, value) in &metadata.iptc_fields {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!("{key}:"));
+                                    ui.label(value);
+                                });
+                            }
+                        });
+                        egui::CollapsingHeader::new(format!("XMP ({})", metadata.xmp_fields.len()))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for (key, value) in &metadata.xmp_fields {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(format!("{key}:"));
+                                        ui.label(value);
+                                    });
+                                }
+                            });
+                    }
+                }
             });
+    }
+
+    fn primary_camera_metadata(&self) -> Option<String> {
+        let metadata = self.current_metadata.as_ref()?;
+        for key in ["Model", "LensModel", "Make"] {
+            if let Some(value) = metadata
+                .exif_fields
+                .iter()
+                .find(|(field, _)| field == key)
+                .map(|(_, value)| value.clone())
+            {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn primary_capture_metadata(&self) -> Option<String> {
+        let metadata = self.current_metadata.as_ref()?;
+        for key in ["DateTimeOriginal", "DateTime", "CreateDate"] {
+            if let Some(value) = metadata
+                .exif_fields
+                .iter()
+                .find(|(field, _)| field == key)
+                .map(|(_, value)| value.clone())
+            {
+                return Some(value);
+            }
+        }
+        None
     }
 
     fn draw_status_bar(&mut self, ctx: &egui::Context) {
@@ -2752,6 +3567,14 @@ impl ImranViewApp {
                     ui.label(self.state.status_preview());
                     ui.separator();
                     ui.label(self.state.status_name());
+                    if let Some(camera) = self.primary_camera_metadata() {
+                        ui.separator();
+                        ui.label(format!("Camera: {camera}"));
+                    }
+                    if let Some(captured) = self.primary_capture_metadata() {
+                        ui.separator();
+                        ui.label(format!("Captured: {captured}"));
+                    }
                 });
             });
     }
@@ -2785,6 +3608,8 @@ impl eframe::App for ImranViewApp {
         self.draw_crop_dialog(ctx);
         self.draw_color_dialog(ctx);
         self.draw_batch_dialog(ctx);
+        self.draw_save_dialog(ctx);
+        self.draw_performance_dialog(ctx);
         self.draw_rename_dialog(ctx);
         self.draw_delete_confirmation(ctx);
         self.draw_about_window(ctx);

@@ -15,9 +15,14 @@ This repository now contains a working desktop viewer slice with:
 - Optional thumbnail strip and dedicated thumbnail window mode with folder panel + adaptive grid
 - Recent files/recent folders in the File menu
 - Metadata panel (read-only viewer/session + file metadata)
+- Deep metadata inspector sections for EXIF/IPTC/XMP fields
 - Edit tools: rotate/flip, resize/resample, crop, color corrections
 - File operations: rename, copy/move to folder, delete with confirmation
 - Batch convert/rename dialog (PNG/JPEG/WEBP/BMP/TIFF, JPEG quality)
+- Batch preview summary before execution (input scan + count)
+- Compare mode (load a second image and view side-by-side)
+- Print current image (OS print command)
+- Save dialog with format/quality and metadata policy controls
 - Basic slideshow mode with keyboard start/stop and configurable interval
 - Zoom controls: fit, actual size, in/out
 - Shortcuts: `Cmd/Ctrl+O`, `Cmd/Ctrl+S`, `Cmd/Ctrl+Shift+S`, `Left/Right`, `+/-`, `0` (fit), `1` (actual), `Space` (slideshow), `Esc` (stop slideshow), `Cmd/Ctrl + Mouse Wheel`
@@ -27,6 +32,7 @@ This repository now contains a working desktop viewer slice with:
 - Background workers for open/save/edit/thumbnail tasks to keep UI responsive
 - Folder-navigation open actions run asynchronously on worker threads
 - Batch and file operations execute on background workers
+- Internal plugin host with event hooks + Plugins menu (extension API baseline)
 
 Lightweight guardrails currently in place:
 
@@ -34,8 +40,9 @@ Lightweight guardrails currently in place:
 - Navigation preloads neighboring images to reduce next/previous latency
 - Image decoding/downscaling stays in Rust background workers, UI thread remains thin
 - Cache eviction is bounded by entry count and byte budgets (thumbnail textures + preload images)
+- Runtime Performance/Cache options expose configurable cache limits and cache reset
 - Optional perf-gate tooling can fail when timing warnings cross budget thresholds
-- CI runs check/test and enforces perf-gate from captured logs
+- CI runs check/test, executes perf smoke (startup/open/navigation/memory), and enforces perf-gate from logs
 - Cross-platform release packaging workflow publishes Linux/macOS/Windows artifacts on version tags
 
 ## Run locally

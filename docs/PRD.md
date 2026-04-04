@@ -87,6 +87,7 @@ Implemented:
 - macOS native app menu integration with in-window fallback.
 - OSS toolbar icons (Tabler, MIT).
 - Save and Save As flows.
+- Save dialog with output format/quality options and metadata policy controls.
 - Rotate/flip image operations.
 - Resize/resample dialog + operation with interpolation choices.
 - Crop dialog + operation.
@@ -100,20 +101,24 @@ Implemented:
 - Neighbor image preload cache for low-latency next/previous navigation.
 - Byte-budget memory governor for thumbnail/preload caches with deterministic eviction.
 - Batch convert/rename workflow (format + quality + prefix/start index).
+- Batch preview summary step before execution.
 - File operations workflow (rename/copy/move/delete).
+- Compare mode (load secondary image and view side-by-side).
+- Print current-image workflow.
+- Internal plugin extension host API (plugin events + plugin menu surface).
+- Runtime performance/cache settings (configurable cache caps + cache reset).
 - Startup/open/save/edit performance timing logs.
 - Perf gate script to fail runs when timing warnings exceed thresholds.
 - CI workflow that runs check/test and fails on perf-gate warnings.
+- Perf smoke test in CI for startup/open/navigation/memory budget logging.
 - Release workflow + local packaging script for Linux/macOS/Windows artifacts.
 - Error strategy: `thiserror` (typed IO errors) + `anyhow` (context and propagation).
 
 Partial:
-- Some menu categories/commands are still placeholders.
-- Metadata panel is baseline-only and does not yet expose EXIF/IPTC/XMP details.
+- Metadata preservation is best-effort and currently strongest on JPEG output paths.
 
 Missing:
-- Rich Save/Save As format-option UX and metadata controls.
-- Deep metadata inspector detail (EXIF/IPTC/XMP fields).
+- None in P0/P1 core backlog for current milestone.
 
 ## 7) Performance budgets (lightweight contract)
 
@@ -151,11 +156,11 @@ Legend:
 
 | ID | Feature | Priority | Status | Notes |
 |---|---|---|---|---|
-| F-001 | Classic main shell (menu/toolbar/canvas/status) | P0 | Partial | Built; needs stronger parity and polish |
+| F-001 | Classic main shell (menu/toolbar/canvas/status) | P0 | Done | Menu/toolbar/status shell + parity-oriented options wired |
 | F-002 | Open image (dialog + CLI) | P0 | Done | Keep as baseline |
 | F-003 | Folder navigation next/previous | P0 | Done | Needs prefetch tuning |
-| F-004 | Zoom model (fit, actual, in/out) | P0 | Partial | Add better pan anchoring |
-| F-005 | Segmented status bar details | P0 | Partial | Core segments exist; advanced metadata details still pending |
+| F-004 | Zoom model (fit, actual, in/out) | P0 | Done | Pan anchoring improved for manual zoom transitions |
+| F-005 | Segmented status bar details | P0 | Done | Includes core image stats + metadata-derived camera/capture details |
 | F-006 | View toggles (toolbar/status/thumbnails) | P0 | Done | Persisted for current visibility flags |
 | F-007 | Thumbnail strip (lazy/windowed) | P0 | Done | Add keyboard focus behavior |
 | F-008 | Dedicated thumbnails window mode | P0 | Done | Folder panel + adaptive grid added |
@@ -166,16 +171,16 @@ Legend:
 | F-013 | Rotate left/right + flip H/V | P1 | Done | Implemented through background transform worker |
 | F-014 | Resize/resample dialog | P1 | Done | Interpolation choices shipped |
 | F-015 | Crop selection tools | P1 | Done | Rectangle crop dialog shipped |
-| F-016 | Save / Save As pipeline | P1 | Partial | Save flows exist; richer format/options metadata controls pending |
+| F-016 | Save / Save As pipeline | P1 | Done | Save dialog ships format/quality and metadata policy controls |
 | F-017 | Color corrections (basic) | P1 | Done | Brightness/contrast/gamma/saturation/grayscale shipped |
-| F-018 | Metadata panel (EXIF/IPTC/XMP) | P1 | Partial | Read-only metadata panel shipped; deep EXIF/IPTC/XMP pending |
+| F-018 | Metadata panel (EXIF/IPTC/XMP) | P1 | Done | EXIF/IPTC/XMP sections and field lists shipped |
 | F-019 | Recent files/recent folders | P1 | Done | Persisted recents + menu integration shipped |
 | F-020 | Slideshow basic mode | P1 | Done | Keyboard and timer controls shipped |
-| F-021 | Batch convert/rename | P1 | Partial | Conversion/rename shipped; preview summary step still pending |
+| F-021 | Batch convert/rename | P1 | Done | Conversion/rename plus preview summary gate before run |
 | F-022 | File operations (copy/move/delete/rename) | P1 | Done | Dialog-driven rename/copy/move/delete with confirmation |
-| F-023 | Printing flow | P2 | Missing | Optional for first public milestone |
-| F-024 | Compare images mode | P2 | Missing | Split or side-by-side |
-| F-025 | Plugin extension points | P2 | Missing | Internal extension API first |
+| F-023 | Printing flow | P2 | Done | Print command dispatches to OS print pipeline |
+| F-024 | Compare images mode | P2 | Done | Side-by-side compare mode with secondary image load |
+| F-025 | Plugin extension points | P2 | Done | Internal plugin host API + event hooks + plugin menu |
 | F-026 | Background command execution pipeline | P0 | Done | Open/save/edit/thumbnail work dispatched to worker threads |
 | F-027 | Bounded cache and memory governor | P0 | Done | Byte-budget + count-budget eviction on preload/thumb caches |
 | F-028 | Automated performance regression gate | P0 | Done | CI fails on perf warnings via perf-gate script |
@@ -300,8 +305,8 @@ Milestone M1: Fast viewer beta (2-3 weeks)
 - Performance instrumentation in place with baseline measurements captured.
 
 Milestone M2: Utility parity beta (3-5 weeks)
-- Complete remaining F-016/F-018/F-021 items.
-- Expand save/metadata depth while preserving performance budgets.
+- Complete remaining metadata-preservation robustness and UI polish while preserving performance budgets.
+- Continue UX hardening for compare/print/plugin surfaces.
 
 Milestone M3: Public preview (2-3 weeks)
 - Packaging and CI hardening.
@@ -349,10 +354,10 @@ A feature is done only when all conditions hold:
 - [x] Expand settings persistence to include last window state and advanced preferences.
 - [x] Implement rotate/flip commands.
 - [x] Implement Resize/Resample dialog and operation.
-- [ ] Expand Save/Save As with richer format options and metadata controls.
+- [x] Expand Save/Save As with richer format options and metadata controls.
 - [x] Add recent files/recent folders.
 - [x] Add performance timing logs for startup/open/navigation/save/edit.
 - [x] Add tests for navigation wrap, zoom state transitions, and error recovery.
 - [x] Implement background command queue so open/save/edit/thumbnail decode do not block UI input.
-- [ ] Add full bounded thumbnail/decode cache policy with configurable limits and stronger eviction controls.
-- [ ] Add CI perf smoke checks that gate on startup/open/navigation/memory thresholds.
+- [x] Add full bounded thumbnail/decode cache policy with configurable limits and stronger eviction controls.
+- [x] Add CI perf smoke checks that gate on startup/open/navigation/memory thresholds.

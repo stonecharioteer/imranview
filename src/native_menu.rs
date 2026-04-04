@@ -12,6 +12,9 @@ const ID_FILE_COPY_CURRENT: &str = "menu.file.copy_current";
 const ID_FILE_MOVE_CURRENT: &str = "menu.file.move_current";
 const ID_FILE_DELETE_CURRENT: &str = "menu.file.delete_current";
 const ID_FILE_BATCH_CONVERT: &str = "menu.file.batch_convert";
+const ID_FILE_PRINT_CURRENT: &str = "menu.file.print_current";
+const ID_FILE_LOAD_COMPARE: &str = "menu.file.load_compare";
+const ID_FILE_TOGGLE_COMPARE: &str = "menu.file.toggle_compare";
 const ID_FILE_EXIT: &str = "menu.file.exit";
 const ID_APP_ABOUT: &str = "menu.app.about";
 const ID_HELP_ABOUT: &str = "menu.help.about";
@@ -39,6 +42,9 @@ pub enum NativeMenuAction {
     MoveCurrentToFolder,
     DeleteCurrent,
     BatchConvert,
+    PrintCurrent,
+    LoadCompareImage,
+    ToggleCompareMode,
     Exit,
     RotateLeft,
     RotateRight,
@@ -62,6 +68,9 @@ pub struct NativeMenu {
     file_copy_current: MenuItem,
     file_move_current: MenuItem,
     file_delete_current: MenuItem,
+    file_print_current: MenuItem,
+    file_load_compare: MenuItem,
+    file_toggle_compare: MenuItem,
     edit_rotate_left: MenuItem,
     edit_rotate_right: MenuItem,
     edit_flip_horizontal: MenuItem,
@@ -144,6 +153,12 @@ impl NativeMenu {
             true,
             None,
         );
+        let file_print_current =
+            MenuItem::with_id(ID_FILE_PRINT_CURRENT, "Print Current...", false, None);
+        let file_load_compare =
+            MenuItem::with_id(ID_FILE_LOAD_COMPARE, "Load Compare Image...", true, None);
+        let file_toggle_compare =
+            MenuItem::with_id(ID_FILE_TOGGLE_COMPARE, "Toggle Compare Mode", true, None);
         let file_exit = MenuItem::with_id(
             ID_FILE_EXIT,
             "Exit",
@@ -162,6 +177,9 @@ impl NativeMenu {
                 &file_delete_current,
                 &PredefinedMenuItem::separator(),
                 &file_batch_convert,
+                &file_print_current,
+                &file_load_compare,
+                &file_toggle_compare,
                 &PredefinedMenuItem::separator(),
                 &file_exit,
             ])
@@ -262,6 +280,9 @@ impl NativeMenu {
             file_copy_current,
             file_move_current,
             file_delete_current,
+            file_print_current,
+            file_load_compare,
+            file_toggle_compare,
             edit_rotate_left,
             edit_rotate_right,
             edit_flip_horizontal,
@@ -285,6 +306,9 @@ impl NativeMenu {
         self.file_copy_current.set_enabled(has_image);
         self.file_move_current.set_enabled(has_image);
         self.file_delete_current.set_enabled(has_image);
+        self.file_print_current.set_enabled(has_image);
+        self.file_load_compare.set_enabled(has_image);
+        self.file_toggle_compare.set_enabled(has_image);
         self.edit_rotate_left.set_enabled(has_image);
         self.edit_rotate_right.set_enabled(has_image);
         self.edit_flip_horizontal.set_enabled(has_image);
@@ -317,6 +341,9 @@ impl NativeMenu {
                 ID_FILE_MOVE_CURRENT => Some(NativeMenuAction::MoveCurrentToFolder),
                 ID_FILE_DELETE_CURRENT => Some(NativeMenuAction::DeleteCurrent),
                 ID_FILE_BATCH_CONVERT => Some(NativeMenuAction::BatchConvert),
+                ID_FILE_PRINT_CURRENT => Some(NativeMenuAction::PrintCurrent),
+                ID_FILE_LOAD_COMPARE => Some(NativeMenuAction::LoadCompareImage),
+                ID_FILE_TOGGLE_COMPARE => Some(NativeMenuAction::ToggleCompareMode),
                 ID_FILE_EXIT => Some(NativeMenuAction::Exit),
                 ID_EDIT_ROTATE_LEFT => Some(NativeMenuAction::RotateLeft),
                 ID_EDIT_ROTATE_RIGHT => Some(NativeMenuAction::RotateRight),

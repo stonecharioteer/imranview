@@ -12,14 +12,32 @@ use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 
 use crate::image_io::{
-    LoadedImagePayload, SaveFormat, ThumbnailPayload, collect_images_in_directory,
-    load_image_payload, load_thumbnail_payload, load_working_image, payload_from_working_image,
-    save_image, save_image_with_format,
+    LoadedImagePayload, MetadataSummary, SaveFormat, ThumbnailPayload, collect_images_in_directory,
+    extract_metadata_summary, infer_save_format, load_image_payload, load_thumbnail_payload,
+    load_working_image, payload_from_working_image, preserve_metadata_best_effort,
+    save_image_with_format,
 };
 use crate::perf::{EDIT_IMAGE_BUDGET, OPEN_IMAGE_BUDGET, SAVE_IMAGE_BUDGET, log_timing};
 
 const PRELOAD_CACHE_CAP: usize = 6;
 const PRELOAD_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct WorkerConfig {
+    pub preload_cache_cap: usize,
+    pub preload_cache_max_bytes: usize,
+    pub thumbnail_workers: usize,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            preload_cache_cap: PRELOAD_CACHE_CAP,
+            preload_cache_max_bytes: PRELOAD_CACHE_MAX_BYTES,
+            thumbnail_workers: 0,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum WorkerRequestKind {
@@ -30,6 +48,8 @@ pub enum WorkerRequestKind {
     Thumbnail,
     Batch,
     File,
+    Print,
+    Compare,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +135,56 @@ pub struct BatchConvertOptions {
     pub jpeg_quality: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveOutputFormat {
+    Auto,
+    Png,
+    Jpeg,
+    Webp,
+    Bmp,
+    Tiff,
+}
+
+impl SaveOutputFormat {
+    fn to_save_format(self, path: &Path, jpeg_quality: u8) -> Result<SaveFormat> {
+        match self {
+            SaveOutputFormat::Auto => {
+                infer_save_format(path, jpeg_quality).map_err(|err| anyhow!(err.to_string()))
+            }
+            SaveOutputFormat::Png => Ok(SaveFormat::Png),
+            SaveOutputFormat::Jpeg => Ok(SaveFormat::Jpeg {
+                quality: jpeg_quality.clamp(1, 100),
+            }),
+            SaveOutputFormat::Webp => Ok(SaveFormat::Webp),
+            SaveOutputFormat::Bmp => Ok(SaveFormat::Bmp),
+            SaveOutputFormat::Tiff => Ok(SaveFormat::Tiff),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveMetadataPolicy {
+    Strip,
+    PreserveIfPossible,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SaveImageOptions {
+    pub output_format: SaveOutputFormat,
+    pub jpeg_quality: u8,
+    pub metadata_policy: SaveMetadataPolicy,
+}
+
+impl Default for SaveImageOptions {
+    fn default() -> Self {
+        Self {
+            output_format: SaveOutputFormat::Auto,
+            jpeg_quality: 92,
+            metadata_policy: SaveMetadataPolicy::PreserveIfPossible,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum FileOperation {
     Rename { from: PathBuf, to: PathBuf },
@@ -135,8 +205,10 @@ pub enum WorkerCommand {
     SaveImage {
         request_id: u64,
         path: PathBuf,
+        source_path: Option<PathBuf>,
         image: Arc<DynamicImage>,
         reopen_after_save: bool,
+        options: SaveImageOptions,
     },
     TransformImage {
         request_id: u64,
@@ -154,6 +226,18 @@ pub enum WorkerCommand {
         request_id: u64,
         operation: FileOperation,
     },
+    LoadCompareImage {
+        request_id: u64,
+        path: PathBuf,
+    },
+    PrintImage {
+        request_id: u64,
+        path: PathBuf,
+    },
+    UpdateCachePolicy {
+        preload_cache_cap: usize,
+        preload_cache_max_bytes: usize,
+    },
 }
 
 pub enum WorkerResult {
@@ -163,6 +247,7 @@ pub enum WorkerResult {
         directory: PathBuf,
         files: Vec<PathBuf>,
         loaded: LoadedImagePayload,
+        metadata: MetadataSummary,
     },
     Saved {
         request_id: u64,
@@ -189,6 +274,16 @@ pub enum WorkerResult {
     FileOperationCompleted {
         request_id: u64,
         operation: FileOperation,
+    },
+    CompareLoaded {
+        request_id: u64,
+        path: PathBuf,
+        loaded: LoadedImagePayload,
+        metadata: MetadataSummary,
+    },
+    Printed {
+        request_id: u64,
+        path: PathBuf,
     },
     Failed {
         request_id: Option<u64>,
@@ -275,20 +370,25 @@ pub fn spawn_workers(
     command_rx: Receiver<WorkerCommand>,
     thumbnail_rx: Receiver<PathBuf>,
     result_tx: Sender<WorkerResult>,
+    config: WorkerConfig,
 ) {
     log::debug!(target: "imranview::worker", "spawning primary worker thread");
     let _ = thread::Builder::new()
         .name("imranview-worker".to_owned())
         .spawn({
             let result_tx = result_tx.clone();
-            move || run_worker(command_rx, result_tx)
+            move || run_worker(command_rx, result_tx, config)
         });
 
-    spawn_thumbnail_workers(thumbnail_rx, result_tx);
+    spawn_thumbnail_workers(thumbnail_rx, result_tx, config.thumbnail_workers);
 }
 
-fn spawn_thumbnail_workers(thumbnail_rx: Receiver<PathBuf>, result_tx: Sender<WorkerResult>) {
-    let workers = thumbnail_worker_count();
+fn spawn_thumbnail_workers(
+    thumbnail_rx: Receiver<PathBuf>,
+    result_tx: Sender<WorkerResult>,
+    configured_workers: usize,
+) {
+    let workers = thumbnail_worker_count(configured_workers);
     let shared_rx = Arc::new(Mutex::new(thumbnail_rx));
     log::debug!(
         target: "imranview::thumb",
@@ -305,16 +405,24 @@ fn spawn_thumbnail_workers(thumbnail_rx: Receiver<PathBuf>, result_tx: Sender<Wo
     }
 }
 
-fn thumbnail_worker_count() -> usize {
+fn thumbnail_worker_count(configured_workers: usize) -> usize {
+    if configured_workers > 0 {
+        return configured_workers.clamp(1, 4);
+    }
     let logical_cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
     logical_cores.saturating_sub(1).clamp(1, 2)
 }
 
-fn run_worker(command_rx: Receiver<WorkerCommand>, result_tx: Sender<WorkerResult>) {
+fn run_worker(
+    command_rx: Receiver<WorkerCommand>,
+    result_tx: Sender<WorkerResult>,
+    config: WorkerConfig,
+) {
     log::debug!(target: "imranview::worker", "worker thread started");
-    let mut preload_cache = PreloadCache::new(PRELOAD_CACHE_CAP, PRELOAD_CACHE_MAX_BYTES);
+    let mut preload_cache =
+        PreloadCache::new(config.preload_cache_cap, config.preload_cache_max_bytes);
     while let Ok(command) = command_rx.recv() {
         let result = match command {
             WorkerCommand::OpenImage { request_id, path } => {
@@ -331,9 +439,18 @@ fn run_worker(command_rx: Receiver<WorkerCommand>, result_tx: Sender<WorkerResul
             WorkerCommand::SaveImage {
                 request_id,
                 path,
+                source_path,
                 image,
                 reopen_after_save,
-            } => Some(run_save(request_id, path, image, reopen_after_save)),
+                options,
+            } => Some(run_save(
+                request_id,
+                path,
+                source_path,
+                image,
+                reopen_after_save,
+                options,
+            )),
             WorkerCommand::TransformImage {
                 request_id,
                 op,
@@ -348,6 +465,24 @@ fn run_worker(command_rx: Receiver<WorkerCommand>, result_tx: Sender<WorkerResul
                 request_id,
                 operation,
             } => Some(run_file_operation(request_id, operation)),
+            WorkerCommand::LoadCompareImage { request_id, path } => {
+                Some(run_load_compare(request_id, path))
+            }
+            WorkerCommand::PrintImage { request_id, path } => Some(run_print(request_id, path)),
+            WorkerCommand::UpdateCachePolicy {
+                preload_cache_cap,
+                preload_cache_max_bytes,
+            } => {
+                preload_cache =
+                    PreloadCache::new(preload_cache_cap.max(1), preload_cache_max_bytes.max(1));
+                log::debug!(
+                    target: "imranview::worker",
+                    "updated preload cache policy cap={} max_bytes={}",
+                    preload_cache_cap,
+                    preload_cache_max_bytes
+                );
+                None
+            }
         };
 
         if let Some(result) = result {
@@ -426,12 +561,14 @@ fn run_open(request_id: u64, path: PathBuf, preload_cache: &mut PreloadCache) ->
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let files = collect_images_in_directory(&directory)?;
+        let metadata = extract_metadata_summary(&path);
         Ok(WorkerResult::Opened {
             request_id,
             path,
             directory,
             files,
             loaded,
+            metadata,
         })
     })();
 
@@ -472,12 +609,14 @@ fn run_open_directory(
         } else {
             load_image_payload(&path)?
         };
+        let metadata = extract_metadata_summary(&path);
         Ok(WorkerResult::Opened {
             request_id,
             path,
             directory,
             files,
             loaded,
+            metadata,
         })
     })();
 
@@ -519,8 +658,10 @@ fn run_preload(path: PathBuf, preload_cache: &mut PreloadCache) -> Option<Worker
 fn run_save(
     request_id: u64,
     path: PathBuf,
+    source_path: Option<PathBuf>,
     image: Arc<DynamicImage>,
     reopen_after_save: bool,
+    options: SaveImageOptions,
 ) -> WorkerResult {
     log::debug!(
         target: "imranview::worker",
@@ -530,18 +671,146 @@ fn run_save(
         reopen_after_save
     );
     let started = Instant::now();
-    let output = save_image(&path, image.as_ref())
-        .with_context(|| format!("failed to save {}", path.display()))
-        .map(|_| WorkerResult::Saved {
+    let output = (|| -> Result<WorkerResult> {
+        let save_format = options
+            .output_format
+            .to_save_format(&path, options.jpeg_quality)?;
+        let preserve_metadata = matches!(
+            options.metadata_policy,
+            SaveMetadataPolicy::PreserveIfPossible
+        );
+        if preserve_metadata {
+            let source = source_path
+                .as_ref()
+                .context("metadata preservation requires a source image path")?;
+            if source == &path {
+                let temp_output = temporary_save_path(&path);
+                save_image_with_format(&temp_output, image.as_ref(), save_format)
+                    .with_context(|| format!("failed to save {}", temp_output.display()))?;
+                preserve_metadata_best_effort(source, &temp_output, save_format).with_context(
+                    || {
+                        format!(
+                            "metadata preservation failed for {} (choose metadata policy: Strip to bypass)",
+                            path.display()
+                        )
+                    },
+                )?;
+                fs::rename(&temp_output, &path).with_context(|| {
+                    format!(
+                        "failed to replace original file after metadata-preserving save {}",
+                        path.display()
+                    )
+                })?;
+            } else {
+                save_image_with_format(&path, image.as_ref(), save_format)
+                    .with_context(|| format!("failed to save {}", path.display()))?;
+                preserve_metadata_best_effort(source, &path, save_format).with_context(|| {
+                    format!(
+                        "metadata preservation failed for {} (choose metadata policy: Strip to bypass)",
+                        path.display()
+                    )
+                })?;
+            }
+        } else {
+            save_image_with_format(&path, image.as_ref(), save_format)
+                .with_context(|| format!("failed to save {}", path.display()))?;
+        }
+
+        Ok(WorkerResult::Saved {
             request_id,
             path,
             reopen_after_save,
-        });
+        })
+    })();
 
     log_timing("save_image", started.elapsed(), SAVE_IMAGE_BUDGET);
     output.unwrap_or_else(|err| WorkerResult::Failed {
         request_id: Some(request_id),
         kind: WorkerRequestKind::Save,
+        error: err.to_string(),
+    })
+}
+
+fn temporary_save_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".to_owned());
+    let temp_name = format!("{file_name}.imranview.tmp");
+    path.with_file_name(temp_name)
+}
+
+fn run_load_compare(request_id: u64, path: PathBuf) -> WorkerResult {
+    let output = (|| -> Result<WorkerResult> {
+        let loaded = load_image_payload(&path)?;
+        let metadata = extract_metadata_summary(&path);
+        Ok(WorkerResult::CompareLoaded {
+            request_id,
+            path,
+            loaded,
+            metadata,
+        })
+    })();
+
+    output.unwrap_or_else(|err| WorkerResult::Failed {
+        request_id: Some(request_id),
+        kind: WorkerRequestKind::Compare,
+        error: err.to_string(),
+    })
+}
+
+fn run_print(request_id: u64, path: PathBuf) -> WorkerResult {
+    let output = (|| -> Result<WorkerResult> {
+        if !path.exists() {
+            return Err(anyhow!("cannot print missing file {}", path.display()));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("lp")
+                .arg(&path)
+                .status()
+                .context("failed to execute lp print command")?;
+            if !status.success() {
+                return Err(anyhow!("lp print command failed with status {}", status));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::process::Command::new("lp")
+                .arg(&path)
+                .status()
+                .context("failed to execute lp print command")?;
+            if !status.success() {
+                return Err(anyhow!("lp print command failed with status {}", status));
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let status = std::process::Command::new("rundll32.exe")
+                .args([
+                    "C:\\Windows\\System32\\shimgvw.dll,ImageView_PrintTo",
+                    "/pt",
+                ])
+                .arg(&path)
+                .status()
+                .context("failed to execute Windows print command")?;
+            if !status.success() {
+                return Err(anyhow!(
+                    "Windows print command failed with status {}",
+                    status
+                ));
+            }
+        }
+
+        Ok(WorkerResult::Printed { request_id, path })
+    })();
+
+    output.unwrap_or_else(|err| WorkerResult::Failed {
+        request_id: Some(request_id),
+        kind: WorkerRequestKind::Print,
         error: err.to_string(),
     })
 }

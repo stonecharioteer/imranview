@@ -20,7 +20,7 @@ jobs:
       - name: Cargo check
         run: cargo check --all-targets
 
-      - name: Cargo test with perf log capture
+      - name: Cargo test (includes perf smoke) with perf log capture
         run: |
           set -euo pipefail
           RUST_LOG=imranview::perf=debug cargo test --all-targets -- --nocapture 2>&1 | tee perf.log

@@ -32,6 +32,14 @@ const THUMBNAIL_GRID_CARD_WIDTH_MAX: f32 = 240.0;
 const RECENT_ITEMS_LIMIT: usize = 20;
 const SLIDESHOW_INTERVAL_MIN_SECS: f32 = 0.5;
 const SLIDESHOW_INTERVAL_MAX_SECS: f32 = 30.0;
+const THUMB_CACHE_ENTRY_CAP_MIN: usize = 64;
+const THUMB_CACHE_ENTRY_CAP_MAX: usize = 4096;
+const THUMB_CACHE_MAX_MB_MIN: usize = 16;
+const THUMB_CACHE_MAX_MB_MAX: usize = 1024;
+const PRELOAD_CACHE_ENTRY_CAP_MIN: usize = 1;
+const PRELOAD_CACHE_ENTRY_CAP_MAX: usize = 64;
+const PRELOAD_CACHE_MAX_MB_MIN: usize = 32;
+const PRELOAD_CACHE_MAX_MB_MAX: usize = 2048;
 
 #[derive(Clone)]
 pub struct ThumbnailEntry {
@@ -88,6 +96,10 @@ pub struct AppState {
     slideshow_interval_secs: f32,
     thumbnail_sidebar_width: f32,
     thumbnail_grid_card_width: f32,
+    thumb_cache_entry_cap: usize,
+    thumb_cache_max_mb: usize,
+    preload_cache_entry_cap: usize,
+    preload_cache_max_mb: usize,
     window_position: Option<[f32; 2]>,
     window_inner_size: Option<[f32; 2]>,
     window_maximized: bool,
@@ -134,6 +146,18 @@ impl AppState {
             thumbnail_grid_card_width: settings
                 .thumbnail_grid_card_width
                 .clamp(THUMBNAIL_GRID_CARD_WIDTH_MIN, THUMBNAIL_GRID_CARD_WIDTH_MAX),
+            thumb_cache_entry_cap: settings
+                .thumb_cache_entry_cap
+                .clamp(THUMB_CACHE_ENTRY_CAP_MIN, THUMB_CACHE_ENTRY_CAP_MAX),
+            thumb_cache_max_mb: settings
+                .thumb_cache_max_mb
+                .clamp(THUMB_CACHE_MAX_MB_MIN, THUMB_CACHE_MAX_MB_MAX),
+            preload_cache_entry_cap: settings
+                .preload_cache_entry_cap
+                .clamp(PRELOAD_CACHE_ENTRY_CAP_MIN, PRELOAD_CACHE_ENTRY_CAP_MAX),
+            preload_cache_max_mb: settings
+                .preload_cache_max_mb
+                .clamp(PRELOAD_CACHE_MAX_MB_MIN, PRELOAD_CACHE_MAX_MB_MAX),
             window_position: settings.window_position,
             window_inner_size: settings.window_inner_size,
             window_maximized: settings.window_maximized,
@@ -154,6 +178,10 @@ impl AppState {
             slideshow_interval_secs: self.slideshow_interval_secs,
             thumbnail_sidebar_width: self.thumbnail_sidebar_width,
             thumbnail_grid_card_width: self.thumbnail_grid_card_width,
+            thumb_cache_entry_cap: self.thumb_cache_entry_cap,
+            thumb_cache_max_mb: self.thumb_cache_max_mb,
+            preload_cache_entry_cap: self.preload_cache_entry_cap,
+            preload_cache_max_mb: self.preload_cache_max_mb,
             window_position: self.window_position,
             window_inner_size: self.window_inner_size,
             window_maximized: self.window_maximized,
@@ -287,14 +315,6 @@ impl AppState {
         self.apply_zoom_step(ZOOM_STEP_OUT);
     }
 
-    pub fn zoom_from_wheel_delta(&mut self, delta_y: f32) {
-        if delta_y > 0.0 {
-            self.zoom_in();
-        } else if delta_y < 0.0 {
-            self.zoom_out();
-        }
-    }
-
     pub fn set_show_toolbar(&mut self, show: bool) {
         self.show_toolbar = show;
     }
@@ -375,6 +395,40 @@ impl AppState {
 
     pub fn recent_files(&self) -> &[PathBuf] {
         &self.recent_files
+    }
+
+    pub fn thumb_cache_entry_cap(&self) -> usize {
+        self.thumb_cache_entry_cap
+    }
+
+    pub fn thumb_cache_max_mb(&self) -> usize {
+        self.thumb_cache_max_mb
+    }
+
+    pub fn preload_cache_entry_cap(&self) -> usize {
+        self.preload_cache_entry_cap
+    }
+
+    pub fn preload_cache_max_mb(&self) -> usize {
+        self.preload_cache_max_mb
+    }
+
+    pub fn set_thumb_cache_entry_cap(&mut self, value: usize) {
+        self.thumb_cache_entry_cap =
+            value.clamp(THUMB_CACHE_ENTRY_CAP_MIN, THUMB_CACHE_ENTRY_CAP_MAX);
+    }
+
+    pub fn set_thumb_cache_max_mb(&mut self, value: usize) {
+        self.thumb_cache_max_mb = value.clamp(THUMB_CACHE_MAX_MB_MIN, THUMB_CACHE_MAX_MB_MAX);
+    }
+
+    pub fn set_preload_cache_entry_cap(&mut self, value: usize) {
+        self.preload_cache_entry_cap =
+            value.clamp(PRELOAD_CACHE_ENTRY_CAP_MIN, PRELOAD_CACHE_ENTRY_CAP_MAX);
+    }
+
+    pub fn set_preload_cache_max_mb(&mut self, value: usize) {
+        self.preload_cache_max_mb = value.clamp(PRELOAD_CACHE_MAX_MB_MIN, PRELOAD_CACHE_MAX_MB_MAX);
     }
 
     pub fn recent_directories(&self) -> &[PathBuf] {
