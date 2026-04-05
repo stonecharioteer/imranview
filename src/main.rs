@@ -27,7 +27,7 @@ use crate::plugin::{PluginContext, PluginEvent, PluginHost};
 use crate::settings::{PersistedSettings, load_settings, save_settings};
 use crate::shortcuts::{ShortcutAction, menu_item_label};
 use crate::worker::{
-    BatchConvertOptions, BatchOutputFormat, CanvasAnchor, ColorAdjustParams, EffectsParams,
+    AlphaBrushOp, BatchConvertOptions, BatchOutputFormat, CanvasAnchor, ColorAdjustParams, EffectsParams,
     FileOperation, LosslessJpegOp, PanoramaDirection, ResizeFilter, RotationInterpolation, SaveImageOptions,
     SaveMetadataPolicy, SaveOutputFormat, SelectionParams, SelectionWorkflow, ShapeKind,
     ShapeParams, TransformOp, WorkerCommand, WorkerRequestKind, WorkerResult,
@@ -547,9 +547,16 @@ impl Default for ReplaceColorDialogState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlphaToolMode {
+    Global,
+    Brush,
+}
+
 #[derive(Clone, Debug)]
 struct AlphaDialogState {
     open: bool,
+    mode: AlphaToolMode,
     alpha_percent: f32,
     alpha_from_luma: bool,
     invert_luma: bool,
@@ -558,12 +565,19 @@ struct AlphaDialogState {
     region_y: u32,
     region_width: u32,
     region_height: u32,
+    brush_center_x: u32,
+    brush_center_y: u32,
+    brush_radius: u32,
+    brush_strength_percent: f32,
+    brush_softness: f32,
+    brush_operation: AlphaBrushOp,
 }
 
 impl Default for AlphaDialogState {
     fn default() -> Self {
         Self {
             open: false,
+            mode: AlphaToolMode::Global,
             alpha_percent: 100.0,
             alpha_from_luma: false,
             invert_luma: false,
@@ -572,6 +586,12 @@ impl Default for AlphaDialogState {
             region_y: 0,
             region_width: 256,
             region_height: 256,
+            brush_center_x: 128,
+            brush_center_y: 128,
+            brush_radius: 40,
+            brush_strength_percent: 50.0,
+            brush_softness: 0.4,
+            brush_operation: AlphaBrushOp::Decrease,
         }
     }
 }
@@ -802,6 +822,8 @@ struct BatchScanDialogState {
     jpeg_quality: u8,
     page_count: u32,
     command_template: String,
+    dpi: u32,
+    grayscale: bool,
 }
 
 impl Default for BatchScanDialogState {
@@ -817,6 +839,8 @@ impl Default for BatchScanDialogState {
             jpeg_quality: 90,
             page_count: 1,
             command_template: default_scanner_command_template(),
+            dpi: 300,
+            grayscale: false,
         }
     }
 }
@@ -825,6 +849,7 @@ impl Default for BatchScanDialogState {
 enum BatchScanSource {
     FolderImport,
     ScannerCommand,
+    NativeBackend,
 }
 
 #[derive(Clone, Debug)]
@@ -1916,6 +1941,31 @@ impl ImranViewApp {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_scan_native(
+        &mut self,
+        output_dir: PathBuf,
+        output_format: BatchOutputFormat,
+        rename_prefix: String,
+        start_index: u32,
+        page_count: u32,
+        jpeg_quality: u8,
+        dpi: u32,
+        grayscale: bool,
+    ) {
+        self.queue_utility_command(|request_id| WorkerCommand::ScanNative {
+            request_id,
+            output_dir,
+            output_format,
+            rename_prefix,
+            start_index,
+            page_count,
+            jpeg_quality,
+            dpi,
+            grayscale,
+        });
+    }
+
     fn dispatch_open_tiff_page(&mut self, path: PathBuf, page_index: u32) {
         self.queue_utility_command(|request_id| WorkerCommand::OpenTiffPage {
             request_id,
@@ -2878,6 +2928,9 @@ impl ImranViewApp {
         if let Some((w, h)) = self.state.original_dimensions() {
             state.region_width = w;
             state.region_height = h;
+            state.brush_center_x = w / 2;
+            state.brush_center_y = h / 2;
+            state.brush_radius = (w.min(h) / 6).max(1);
         }
         state.open = true;
         self.alpha_dialog = state;
@@ -3000,6 +3053,66 @@ impl ImranViewApp {
             emboss_strength: self.effects_dialog.emboss_strength,
             edge_enhance_strength: self.effects_dialog.edge_enhance_strength,
             oil_paint_strength: self.effects_dialog.oil_paint_strength,
+        }
+    }
+
+    fn apply_effects_params_to_dialog(&mut self, params: EffectsParams) {
+        self.effects_dialog.preset = EffectsPreset::Custom;
+        self.effects_dialog.blur_sigma = params.blur_sigma;
+        self.effects_dialog.sharpen_sigma = params.sharpen_sigma;
+        self.effects_dialog.sharpen_threshold = params.sharpen_threshold;
+        self.effects_dialog.invert = params.invert;
+        self.effects_dialog.grayscale = params.grayscale;
+        self.effects_dialog.sepia_strength = params.sepia_strength;
+        self.effects_dialog.posterize_levels = params.posterize_levels;
+        self.effects_dialog.vignette_strength = params.vignette_strength;
+        self.effects_dialog.tilt_shift_strength = params.tilt_shift_strength;
+        self.effects_dialog.stained_glass_strength = params.stained_glass_strength;
+        self.effects_dialog.emboss_strength = params.emboss_strength;
+        self.effects_dialog.edge_enhance_strength = params.edge_enhance_strength;
+        self.effects_dialog.oil_paint_strength = params.oil_paint_strength;
+    }
+
+    fn save_effects_preset(&mut self, path: PathBuf) {
+        let params = self.effects_params_from_dialog();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && fs::create_dir_all(parent).is_err() {
+                self.state.set_error(format!(
+                    "failed to create preset directory {}",
+                    parent.display()
+                ));
+                return;
+            }
+        }
+        match serde_json::to_string_pretty(&params) {
+            Ok(json) => match fs::write(&path, json) {
+                Ok(_) => {
+                    self.info_message = Some(format!("Saved effects preset {}", path.display()));
+                }
+                Err(err) => self
+                    .state
+                    .set_error(format!("failed to write preset {}: {err}", path.display())),
+            },
+            Err(err) => self
+                .state
+                .set_error(format!("failed to serialize effects preset: {err}")),
+        }
+    }
+
+    fn load_effects_preset(&mut self, path: PathBuf) {
+        match fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str::<EffectsParams>(&json) {
+                Ok(params) => {
+                    self.apply_effects_params_to_dialog(params);
+                    self.info_message = Some(format!("Loaded effects preset {}", path.display()));
+                }
+                Err(err) => self
+                    .state
+                    .set_error(format!("invalid effects preset {}: {err}", path.display())),
+            },
+            Err(err) => self
+                .state
+                .set_error(format!("failed to read preset {}: {err}", path.display())),
         }
     }
 
@@ -5918,62 +6031,147 @@ impl ImranViewApp {
             ctx,
             "popup.alpha",
             "Alpha Tools",
-            egui::vec2(460.0, 230.0),
+            egui::vec2(560.0, 340.0),
             &mut open,
             |app, _ctx, ui, open_state| {
-                ui.add(
-                    egui::Slider::new(&mut app.alpha_dialog.alpha_percent, 0.0..=100.0)
-                        .text("Global alpha (%)")
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Mode");
+                    ui.selectable_value(&mut app.alpha_dialog.mode, AlphaToolMode::Global, "Global");
+                    ui.selectable_value(
+                        &mut app.alpha_dialog.mode,
+                        AlphaToolMode::Brush,
+                        "Brush dab",
+                    );
+                });
+                ui.separator();
+                if app.alpha_dialog.mode == AlphaToolMode::Global {
+                    ui.add(
+                        egui::Slider::new(&mut app.alpha_dialog.alpha_percent, 0.0..=100.0)
+                            .text("Global alpha (%)")
+                            .fixed_decimals(1),
+                    );
+                    ui.checkbox(
+                        &mut app.alpha_dialog.alpha_from_luma,
+                        "Derive alpha from luminance",
+                    );
+                    if app.alpha_dialog.alpha_from_luma {
+                        ui.checkbox(&mut app.alpha_dialog.invert_luma, "Invert luminance alpha");
+                    }
+                    ui.checkbox(
+                        &mut app.alpha_dialog.limit_to_region,
+                        "Apply only to rectangular region",
+                    );
+                    if app.alpha_dialog.limit_to_region {
+                        ui.horizontal(|ui| {
+                            ui.label("X");
+                            ui.add(
+                                egui::DragValue::new(&mut app.alpha_dialog.region_x)
+                                    .range(0..=1_000_000),
+                            );
+                            ui.label("Y");
+                            ui.add(
+                                egui::DragValue::new(&mut app.alpha_dialog.region_y)
+                                    .range(0..=1_000_000),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Width");
+                            ui.add(
+                                egui::DragValue::new(&mut app.alpha_dialog.region_width)
+                                    .range(1..=1_000_000),
+                            );
+                            ui.label("Height");
+                            ui.add(
+                                egui::DragValue::new(&mut app.alpha_dialog.region_height)
+                                    .range(1..=1_000_000),
+                            );
+                        });
+                    }
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Brush operation");
+                        ui.selectable_value(
+                            &mut app.alpha_dialog.brush_operation,
+                            AlphaBrushOp::Decrease,
+                            "Decrease alpha",
+                        );
+                        ui.selectable_value(
+                            &mut app.alpha_dialog.brush_operation,
+                            AlphaBrushOp::Increase,
+                            "Increase alpha",
+                        );
+                        ui.selectable_value(
+                            &mut app.alpha_dialog.brush_operation,
+                            AlphaBrushOp::SetTransparent,
+                            "Set transparent",
+                        );
+                        ui.selectable_value(
+                            &mut app.alpha_dialog.brush_operation,
+                            AlphaBrushOp::SetOpaque,
+                            "Set opaque",
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Center X");
+                        ui.add(
+                            egui::DragValue::new(&mut app.alpha_dialog.brush_center_x)
+                                .range(0..=1_000_000),
+                        );
+                        ui.label("Center Y");
+                        ui.add(
+                            egui::DragValue::new(&mut app.alpha_dialog.brush_center_y)
+                                .range(0..=1_000_000),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Radius");
+                        ui.add(
+                            egui::DragValue::new(&mut app.alpha_dialog.brush_radius)
+                                .range(1..=100_000),
+                        );
+                    });
+                    ui.add(
+                        egui::Slider::new(
+                            &mut app.alpha_dialog.brush_strength_percent,
+                            0.0..=100.0,
+                        )
+                        .text("Strength (%)")
                         .fixed_decimals(1),
-                );
-                ui.checkbox(
-                    &mut app.alpha_dialog.alpha_from_luma,
-                    "Derive alpha from luminance",
-                );
-                if app.alpha_dialog.alpha_from_luma {
-                    ui.checkbox(&mut app.alpha_dialog.invert_luma, "Invert luminance alpha");
-                }
-                ui.checkbox(
-                    &mut app.alpha_dialog.limit_to_region,
-                    "Apply only to rectangular region",
-                );
-                if app.alpha_dialog.limit_to_region {
-                    ui.horizontal(|ui| {
-                        ui.label("X");
-                        ui.add(egui::DragValue::new(&mut app.alpha_dialog.region_x).range(0..=1_000_000));
-                        ui.label("Y");
-                        ui.add(egui::DragValue::new(&mut app.alpha_dialog.region_y).range(0..=1_000_000));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Width");
-                        ui.add(
-                            egui::DragValue::new(&mut app.alpha_dialog.region_width)
-                                .range(1..=1_000_000),
-                        );
-                        ui.label("Height");
-                        ui.add(
-                            egui::DragValue::new(&mut app.alpha_dialog.region_height)
-                                .range(1..=1_000_000),
-                        );
-                    });
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut app.alpha_dialog.brush_softness, 0.0..=1.0)
+                            .text("Softness")
+                            .fixed_decimals(2),
+                    );
                 }
                 ui.separator();
                 if ui.button("Apply").clicked() {
-                    app.dispatch_transform(TransformOp::AlphaAdjust {
-                        alpha_percent: app.alpha_dialog.alpha_percent,
-                        alpha_from_luma: app.alpha_dialog.alpha_from_luma,
-                        invert_luma: app.alpha_dialog.invert_luma,
-                        region: if app.alpha_dialog.limit_to_region {
-                            Some((
-                                app.alpha_dialog.region_x,
-                                app.alpha_dialog.region_y,
-                                app.alpha_dialog.region_width.max(1),
-                                app.alpha_dialog.region_height.max(1),
-                            ))
-                        } else {
-                            None
-                        },
-                    });
+                    if app.alpha_dialog.mode == AlphaToolMode::Global {
+                        app.dispatch_transform(TransformOp::AlphaAdjust {
+                            alpha_percent: app.alpha_dialog.alpha_percent,
+                            alpha_from_luma: app.alpha_dialog.alpha_from_luma,
+                            invert_luma: app.alpha_dialog.invert_luma,
+                            region: if app.alpha_dialog.limit_to_region {
+                                Some((
+                                    app.alpha_dialog.region_x,
+                                    app.alpha_dialog.region_y,
+                                    app.alpha_dialog.region_width.max(1),
+                                    app.alpha_dialog.region_height.max(1),
+                                ))
+                            } else {
+                                None
+                            },
+                        });
+                    } else {
+                        app.dispatch_transform(TransformOp::AlphaBrush {
+                            center_x: app.alpha_dialog.brush_center_x,
+                            center_y: app.alpha_dialog.brush_center_y,
+                            radius: app.alpha_dialog.brush_radius.max(1),
+                            strength_percent: app.alpha_dialog.brush_strength_percent,
+                            softness: app.alpha_dialog.brush_softness,
+                            operation: app.alpha_dialog.brush_operation,
+                        });
+                    }
                     *open_state = false;
                 }
             },
@@ -6051,6 +6249,28 @@ impl ImranViewApp {
                         app.apply_effects_preset(EffectsPreset::Custom);
                         app.effects_dialog = EffectsDialogState::default();
                         app.effects_dialog.open = true;
+                    }
+                    if ui.button("Save preset...").clicked() {
+                        let mut dialog =
+                            rfd::FileDialog::new().set_title("Save effects preset (JSON)");
+                        if let Some(directory) = app.state.preferred_open_directory() {
+                            dialog = dialog.set_directory(directory);
+                        }
+                        dialog = dialog.set_file_name("effects-preset.json");
+                        if let Some(path) = dialog.save_file() {
+                            app.save_effects_preset(path);
+                        }
+                    }
+                    if ui.button("Load preset...").clicked() {
+                        let mut dialog =
+                            rfd::FileDialog::new().set_title("Load effects preset (JSON)");
+                        if let Some(directory) = app.state.preferred_open_directory() {
+                            dialog = dialog.set_directory(directory);
+                        }
+                        dialog = dialog.add_filter("JSON", &["json"]);
+                        if let Some(path) = dialog.pick_file() {
+                            app.load_effects_preset(path);
+                        }
                     }
                 });
                 ui.separator();
@@ -6847,6 +7067,11 @@ impl ImranViewApp {
                     );
                     ui.selectable_value(
                         &mut app.batch_scan_dialog.source,
+                        BatchScanSource::NativeBackend,
+                        "Native scanner",
+                    );
+                    ui.selectable_value(
+                        &mut app.batch_scan_dialog.source,
                         BatchScanSource::ScannerCommand,
                         "Scanner command",
                     );
@@ -6862,7 +7087,7 @@ impl ImranViewApp {
                             }
                         }
                     });
-                } else {
+                } else if app.batch_scan_dialog.source == BatchScanSource::ScannerCommand {
                     ui.label("Scanner command template");
                     ui.text_edit_singleline(&mut app.batch_scan_dialog.command_template);
                     ui.small(
@@ -6875,6 +7100,23 @@ impl ImranViewApp {
                                 .range(1..=1024),
                         );
                     });
+                } else {
+                    ui.label("Native scanner settings");
+                    ui.horizontal(|ui| {
+                        ui.label("Pages");
+                        ui.add(
+                            egui::DragValue::new(&mut app.batch_scan_dialog.page_count)
+                                .range(1..=1024),
+                        );
+                        ui.label("DPI");
+                        ui.add(
+                            egui::DragValue::new(&mut app.batch_scan_dialog.dpi).range(75..=1200),
+                        );
+                    });
+                    ui.checkbox(&mut app.batch_scan_dialog.grayscale, "Capture grayscale");
+                    ui.small(
+                        "Uses platform scanner backend (SANE on Linux/macOS, WIA on Windows).",
+                    );
                 }
                 ui.label("Output folder");
                 ui.horizontal(|ui| {
@@ -6927,6 +7169,8 @@ impl ImranViewApp {
                 }
                 let action_label = if app.batch_scan_dialog.source == BatchScanSource::FolderImport {
                     "Run import"
+                } else if app.batch_scan_dialog.source == BatchScanSource::NativeBackend {
+                    "Run native scan"
                 } else {
                     "Run scan capture"
                 };
@@ -6951,7 +7195,7 @@ impl ImranViewApp {
                             jpeg_quality: app.batch_scan_dialog.jpeg_quality,
                         });
                         *open_state = false;
-                    } else {
+                    } else if app.batch_scan_dialog.source == BatchScanSource::ScannerCommand {
                         let template = app.batch_scan_dialog.command_template.trim().to_owned();
                         if template.is_empty() || !template.contains("{output}") {
                             app.state.set_error(
@@ -6967,6 +7211,18 @@ impl ImranViewApp {
                             app.batch_scan_dialog.page_count,
                             app.batch_scan_dialog.jpeg_quality,
                             template,
+                        );
+                        *open_state = false;
+                    } else {
+                        app.dispatch_scan_native(
+                            output_dir,
+                            app.batch_scan_dialog.output_format,
+                            app.batch_scan_dialog.rename_prefix.clone(),
+                            app.batch_scan_dialog.start_index,
+                            app.batch_scan_dialog.page_count,
+                            app.batch_scan_dialog.jpeg_quality,
+                            app.batch_scan_dialog.dpi,
+                            app.batch_scan_dialog.grayscale,
                         );
                         *open_state = false;
                     }

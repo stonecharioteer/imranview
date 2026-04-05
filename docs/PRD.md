@@ -114,11 +114,11 @@ Implemented:
 - Text tool and shape drawing workflows.
 - Overlay/watermark workflow.
 - Advanced selection workflows (rect/circle/polygon crop and cut-outside) and replace-color workflow.
-- Alpha and effects workflows (expanded toolset + presets).
+- Alpha and effects workflows (expanded toolset + presets, including brush-based alpha dabs).
 - Screenshot capture utility workflow.
 - Multipage TIFF preview/extract and multipage PDF creation workflow.
 - OCR workflow (external `tesseract` backend).
-- Panorama stitch workflow (lightweight overlap blend).
+- Panorama stitch workflow (seam-aware overlap blend).
 - Perspective correction workflow and zoom magnifier tool.
 - Contact-sheet export and HTML gallery export workflows.
 - Advanced options/settings dialog surface.
@@ -126,7 +126,9 @@ Implemented:
 - Batch automation runtime for multi-job JSON scripts (`jobs[]`, `continue_on_error`).
 - Scanner-command capture mode in batch scan workflow (`{output}`/`{index}` placeholders).
 - Effects presets including natural/vintage/dramatic/noir/tilt-shift/stained-glass variants.
+- Effects preset import/export workflow (JSON).
 - Region-scoped alpha editing and richer effect controls (emboss, edge-enhance, oil-paint style).
+- Alpha brush-dab tooling (increase/decrease/opaque/transparent operations with radius/softness).
 - Render-side advanced option wiring (checkerboard background, smoothing, display gamma simulation, overwrite confirmation, configurable zoom step, configurable wrap navigation).
 - ICC profile conversion utility workflow (external `magick` backend).
 - Undo/redo non-destructive edit history stack.
@@ -143,11 +145,12 @@ Partial:
 - Metadata preservation is best-effort and currently strongest on JPEG output paths.
 - Linux native menu-bar integration depends on runtime backend support; app falls back to in-window menu when native install is unavailable.
 - OCR depends on external `tesseract` availability.
-- Panorama stitching is a fast linear blend implementation, not feature-aligned seam finding.
+- Panorama stitching is seam-aware, but does not yet include multi-band blending or bundle-adjusted alignment.
 - Color management supports display-gamma simulation plus external-tool ICC conversion utility; full in-engine ICC transforms remain pending.
 - Scanner workflow currently depends on external scanner CLI commands (not full native TWAIN/WIA/SANE integrations).
 - Batch automation supports multi-job JSON scripts and presets/macros, not a full DSL/scripting engine.
-- Effects/alpha/options surfaces cover broad controls + presets, but not full deep-editor parity.
+- Advanced options surface is broad, but some deep parity categories remain.
+- Native scan backend exists as a baseline (SANE/WIA paths), but scanner hardware/driver coverage still varies by platform.
 
 Missing:
 - Full ICC color-management pipeline (profile assignment/conversion and rendering intents).
@@ -224,15 +227,15 @@ Legend:
 | F-034 | Fine rotation (arbitrary angle) | P1 | Done | Angle + interpolation + background fill + expand-canvas controls |
 | F-035 | Advanced selection workflows | P1 | Done | Rect/circle/polygon crop + cut-outside workflows shipped |
 | F-036 | Replace color tool | P1 | Done | Source/target/tolerance workflow shipped |
-| F-037 | Alpha layer editing | P1 | Partial | Global alpha/luma alpha + rectangular region targeting shipped; brush/mask tooling still pending |
-| F-038 | Effects dialog and filter stack | P2 | Partial | Core effects + broader preset catalog (natural/vintage/dramatic/noir/tilt-shift/stained-glass) + emboss/edge/oil-paint controls shipped |
+| F-037 | Alpha layer editing | P1 | Done | Global alpha/luma + rectangular region targeting + brush-dab alpha operations shipped |
+| F-038 | Effects dialog and filter stack | P2 | Done | Broader effect stack + presets + preset import/export workflow shipped |
 | F-039 | Screenshot capture dialog | P2 | Done | Delay + optional region workflow shipped |
 | F-040 | Search files workflow | P2 | Done | Folder-scoped search by name with extension filters |
 | F-041 | Multipage TIFF preview | P2 | Done | Page navigation plus extraction workflow shipped |
 | F-042 | Multipage PDF creation | P2 | Done | Ordered image set to PDF workflow shipped |
-| F-043 | Batch scan workflow | P2 | Partial | Folder import + scanner-command capture mode shipped; native TWAIN/WIA/SANE backend still pending |
+| F-043 | Batch scan workflow | P2 | Partial | Folder import + scanner-command + native backend baseline (SANE/WIA paths) shipped; advanced device/driver parity still pending |
 | F-044 | OCR workflow | P2 | Partial | OCR workflow shipped with external `tesseract` runtime dependency |
-| F-045 | Panorama stitch workflow | P2 | Partial | Lightweight overlap-based stitch/export shipped; advanced seam finding pending |
+| F-045 | Panorama stitch workflow | P2 | Done | Seam-aware overlap stitch/export shipped with dynamic seam selection |
 | F-046 | Perspective correction tool | P2 | Done | Corner-point perspective transform workflow shipped |
 | F-047 | Zoom magnifier tool | P2 | Done | Lens-style magnifier controls shipped |
 | F-048 | Thumbnail contact sheet export | P2 | Done | Grid export with optional labels shipped |
@@ -460,13 +463,13 @@ Scope:
 
 Result:
 - 100% parity: No.
-- Done: 54/70
-- Partial: 13/70
+- Done: 57/70
+- Partial: 10/70
 - Missing: 3/70
-- Effective parity estimate: ~77% strict (Done only), ~86% weighted (Done + 0.5 * Partial).
+- Effective parity estimate: ~81% strict (Done only), ~89% weighted (Done + 0.5 * Partial).
 
 Largest remaining gaps:
 - Full in-engine ICC color-management pipeline (profile assignment/conversion + rendering intents) without external tool dependency.
 - Linux-native menu-bar integration can still require fallback on unsupported distro/runtime backends.
 - Native scanner backend integrations (TWAIN/WIA/SANE); current mode relies on external scanner CLI commands.
-- Advanced panorama seam-finding/blending parity (current implementation remains lightweight overlap blend).
+- Advanced panorama parity items still pending: robust alignment and multi-band seam blending.

@@ -144,7 +144,7 @@ pub struct SelectionParams {
     pub fill: [u8; 4],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct EffectsParams {
     pub blur_sigma: f32,
     pub sharpen_sigma: f32,
@@ -159,6 +159,14 @@ pub struct EffectsParams {
     pub emboss_strength: f32,
     pub edge_enhance_strength: f32,
     pub oil_paint_strength: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlphaBrushOp {
+    Increase,
+    Decrease,
+    SetOpaque,
+    SetTransparent,
 }
 
 impl ResizeFilter {
@@ -232,6 +240,14 @@ pub enum TransformOp {
         alpha_from_luma: bool,
         invert_luma: bool,
         region: Option<(u32, u32, u32, u32)>,
+    },
+    AlphaBrush {
+        center_x: u32,
+        center_y: u32,
+        radius: u32,
+        strength_percent: f32,
+        softness: f32,
+        operation: AlphaBrushOp,
     },
     Effects(EffectsParams),
     PerspectiveCorrect {
@@ -443,6 +459,17 @@ pub enum WorkerCommand {
         page_count: u32,
         jpeg_quality: u8,
         command_template: String,
+    },
+    ScanNative {
+        request_id: u64,
+        output_dir: PathBuf,
+        output_format: BatchOutputFormat,
+        rename_prefix: String,
+        start_index: u32,
+        page_count: u32,
+        jpeg_quality: u8,
+        dpi: u32,
+        grayscale: bool,
     },
     OpenTiffPage {
         request_id: u64,
@@ -803,6 +830,27 @@ fn run_worker(
                 page_count,
                 jpeg_quality,
                 command_template,
+            )),
+            WorkerCommand::ScanNative {
+                request_id,
+                output_dir,
+                output_format,
+                rename_prefix,
+                start_index,
+                page_count,
+                jpeg_quality,
+                dpi,
+                grayscale,
+            } => Some(run_scan_native(
+                request_id,
+                output_dir,
+                output_format,
+                rename_prefix,
+                start_index,
+                page_count,
+                jpeg_quality,
+                dpi,
+                grayscale,
             )),
             WorkerCommand::OpenTiffPage {
                 request_id,
@@ -1540,6 +1588,142 @@ fn run_scan_to_directory(
         kind: WorkerRequestKind::Utility,
         error: err.to_string(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scan_native(
+    request_id: u64,
+    output_dir: PathBuf,
+    output_format: BatchOutputFormat,
+    rename_prefix: String,
+    start_index: u32,
+    page_count: u32,
+    jpeg_quality: u8,
+    dpi: u32,
+    grayscale: bool,
+) -> WorkerResult {
+    let output = (|| -> Result<WorkerResult> {
+        let page_count = page_count.clamp(1, 10_000);
+        let dpi = dpi.clamp(75, 1200);
+        fs::create_dir_all(&output_dir)
+            .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+        let save_format = output_format.to_save_format(jpeg_quality.clamp(1, 100));
+        let extension = save_format.extension();
+        let mut first_path: Option<PathBuf> = None;
+
+        for page_offset in 0..page_count {
+            let index = start_index.saturating_add(page_offset);
+            let final_name = format!("{rename_prefix}{index:04}.{extension}");
+            let final_path = output_dir.join(final_name);
+            let temp_capture = output_dir.join(format!(".imranview-scan-{index:04}.png"));
+
+            scan_native_capture_to_png(&temp_capture, dpi, grayscale)
+                .with_context(|| format!("native scan capture failed for page {}", page_offset + 1))?;
+
+            let image = load_working_image(&temp_capture)
+                .with_context(|| format!("failed to decode scanned image {}", temp_capture.display()))?;
+            save_image_with_format(&final_path, &image, save_format)
+                .with_context(|| format!("failed to save {}", final_path.display()))?;
+            let _ = fs::remove_file(&temp_capture);
+
+            if first_path.is_none() {
+                first_path = Some(final_path.clone());
+            }
+        }
+
+        Ok(WorkerResult::UtilityCompleted {
+            request_id,
+            message: format!(
+                "Captured {} page(s) via native scanner backend to {}",
+                page_count,
+                output_dir.display()
+            ),
+            open_path: first_path,
+        })
+    })();
+
+    output.unwrap_or_else(|err| WorkerResult::Failed {
+        request_id: Some(request_id),
+        kind: WorkerRequestKind::Utility,
+        error: err.to_string(),
+    })
+}
+
+fn scan_native_capture_to_png(output_path: &Path, dpi: u32, grayscale: bool) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mode = if grayscale { "Gray" } else { "Color" };
+        let status = std::process::Command::new("scanimage")
+            .arg("--format=png")
+            .arg("--mode")
+            .arg(mode)
+            .arg("--resolution")
+            .arg(dpi.to_string())
+            .arg("--output-file")
+            .arg(output_path)
+            .status()
+            .with_context(|| "failed to execute `scanimage` (install SANE tools)")?;
+        if !status.success() {
+            return Err(anyhow!("scanimage failed with status {status}"));
+        }
+        if !output_path.is_file() {
+            return Err(anyhow!(
+                "scanimage completed but did not produce {}",
+                output_path.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let escaped = output_path.display().to_string().replace('\'', "''");
+        let wia_format = if grayscale {
+            "{B96B3CAA-0728-11D3-9D7B-0000F81EF32E}" // PNG
+        } else {
+            "{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}" // JPEG
+        };
+        let script = format!(
+            "$dialog=New-Object -ComObject WIA.CommonDialog; \
+             $device=$dialog.ShowSelectDevice(1,$true,$false); \
+             if($null -eq $device){{exit 2}}; \
+             $item=$device.Items.Item(1); \
+             $item.Properties.Item('6147').Value={dpi}; \
+             $item.Properties.Item('6148').Value={dpi}; \
+             $img=$dialog.ShowTransfer($item,'{wia_format}',$false); \
+             if($null -eq $img){{exit 3}}; \
+             $img.SaveFile('{escaped}');"
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status()
+            .with_context(|| "failed to execute Windows WIA scanner command")?;
+        if !status.success() {
+            return Err(anyhow!("Windows WIA scanner command failed with status {status}"));
+        }
+        if !output_path.is_file() {
+            return Err(anyhow!(
+                "WIA command completed but did not produce {}",
+                output_path.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (output_path, dpi, grayscale);
+        Err(anyhow!("native scanner backend is not supported on this platform"))
+    }
 }
 
 fn shell_escape_path(path: &Path) -> String {
@@ -2434,7 +2618,7 @@ fn stitch_images(
                 );
                 blit_rgba(&canvas, &mut next, 0, 0);
                 let x_start = canvas.width() - overlap;
-                blend_rgba(image, &mut next, x_start, 0, overlap, true);
+                blend_with_vertical_seam(&canvas, image, &mut next, x_start, 0, overlap);
                 canvas = next;
             }
             PanoramaDirection::Vertical => {
@@ -2448,7 +2632,7 @@ fn stitch_images(
                 );
                 blit_rgba(&canvas, &mut next, 0, 0);
                 let y_start = canvas.height() - overlap;
-                blend_rgba(image, &mut next, 0, y_start, overlap, false);
+                blend_with_horizontal_seam(&canvas, image, &mut next, 0, y_start, overlap);
                 canvas = next;
             }
         }
@@ -2456,48 +2640,265 @@ fn stitch_images(
     canvas
 }
 
-fn blend_rgba(
-    src: &RgbaImage,
-    dst: &mut RgbaImage,
+fn blend_with_vertical_seam(
+    existing: &RgbaImage,
+    incoming: &RgbaImage,
+    out: &mut RgbaImage,
     offset_x: u32,
     offset_y: u32,
     overlap: u32,
-    horizontal: bool,
 ) {
-    for y in 0..src.height() {
-        for x in 0..src.width() {
+    if overlap == 0 {
+        blit_rgba(incoming, out, offset_x, offset_y);
+        return;
+    }
+
+    let overlap_w = overlap
+        .min(incoming.width())
+        .min(existing.width().saturating_sub(offset_x))
+        .min(out.width().saturating_sub(offset_x));
+    let overlap_h = incoming
+        .height()
+        .min(existing.height().saturating_sub(offset_y))
+        .min(out.height().saturating_sub(offset_y));
+
+    if overlap_w == 0 || overlap_h == 0 {
+        blit_rgba(incoming, out, offset_x, offset_y);
+        return;
+    }
+
+    let mut cost = vec![vec![0u32; overlap_w as usize]; overlap_h as usize];
+    for y in 0..overlap_h {
+        for x in 0..overlap_w {
+            let existing_px = existing.get_pixel(offset_x + x, offset_y + y);
+            let incoming_px = incoming.get_pixel(x, y);
+            cost[y as usize][x as usize] = rgb_distance_sq(*existing_px, *incoming_px);
+        }
+    }
+    let seam = compute_vertical_seam(&cost);
+    let blend_band = ((overlap_w as i32) / 24).clamp(1, 6);
+
+    for y in 0..incoming.height() {
+        for x in 0..incoming.width() {
             let dx = offset_x + x;
             let dy = offset_y + y;
-            if dx >= dst.width() || dy >= dst.height() {
+            if dx >= out.width() || dy >= out.height() {
                 continue;
             }
-            let src_px = *src.get_pixel(x, y);
-            let should_blend = if overlap == 0 {
-                false
-            } else if horizontal {
-                x < overlap
-            } else {
-                y < overlap
-            };
-            if should_blend {
-                let blend_t = if overlap <= 1 {
-                    1.0
-                } else if horizontal {
-                    x as f32 / (overlap - 1) as f32
-                } else {
-                    y as f32 / (overlap - 1) as f32
-                };
-                let dst_px = *dst.get_pixel(dx, dy);
-                let mixed = mix_rgba(dst_px, src_px, blend_t.clamp(0.0, 1.0));
-                dst.put_pixel(dx, dy, mixed);
-            } else {
-                dst.put_pixel(dx, dy, src_px);
+
+            let src_px = *incoming.get_pixel(x, y);
+            if x >= overlap_w || y >= overlap_h {
+                out.put_pixel(dx, dy, src_px);
+                continue;
             }
+
+            let seam_x = seam[y as usize] as i32;
+            let x_i = x as i32;
+            if x_i < seam_x - blend_band {
+                continue;
+            }
+            if x_i > seam_x + blend_band {
+                out.put_pixel(dx, dy, src_px);
+                continue;
+            }
+
+            let blend_t = if blend_band <= 0 {
+                0.5
+            } else {
+                let left = seam_x - blend_band;
+                ((x_i - left) as f32 / (blend_band * 2) as f32).clamp(0.0, 1.0)
+            };
+            let dst_px = *out.get_pixel(dx, dy);
+            out.put_pixel(dx, dy, mix_rgba(dst_px, src_px, blend_t));
         }
     }
 }
 
+fn blend_with_horizontal_seam(
+    existing: &RgbaImage,
+    incoming: &RgbaImage,
+    out: &mut RgbaImage,
+    offset_x: u32,
+    offset_y: u32,
+    overlap: u32,
+) {
+    if overlap == 0 {
+        blit_rgba(incoming, out, offset_x, offset_y);
+        return;
+    }
+
+    let overlap_h = overlap
+        .min(incoming.height())
+        .min(existing.height().saturating_sub(offset_y))
+        .min(out.height().saturating_sub(offset_y));
+    let overlap_w = incoming
+        .width()
+        .min(existing.width().saturating_sub(offset_x))
+        .min(out.width().saturating_sub(offset_x));
+
+    if overlap_w == 0 || overlap_h == 0 {
+        blit_rgba(incoming, out, offset_x, offset_y);
+        return;
+    }
+
+    let mut cost = vec![vec![0u32; overlap_h as usize]; overlap_w as usize];
+    for x in 0..overlap_w {
+        for y in 0..overlap_h {
+            let existing_px = existing.get_pixel(offset_x + x, offset_y + y);
+            let incoming_px = incoming.get_pixel(x, y);
+            cost[x as usize][y as usize] = rgb_distance_sq(*existing_px, *incoming_px);
+        }
+    }
+    let seam = compute_horizontal_seam(&cost);
+    let blend_band = ((overlap_h as i32) / 24).clamp(1, 6);
+
+    for y in 0..incoming.height() {
+        for x in 0..incoming.width() {
+            let dx = offset_x + x;
+            let dy = offset_y + y;
+            if dx >= out.width() || dy >= out.height() {
+                continue;
+            }
+
+            let src_px = *incoming.get_pixel(x, y);
+            if y >= overlap_h || x >= overlap_w {
+                out.put_pixel(dx, dy, src_px);
+                continue;
+            }
+
+            let seam_y = seam[x as usize] as i32;
+            let y_i = y as i32;
+            if y_i < seam_y - blend_band {
+                continue;
+            }
+            if y_i > seam_y + blend_band {
+                out.put_pixel(dx, dy, src_px);
+                continue;
+            }
+
+            let blend_t = if blend_band <= 0 {
+                0.5
+            } else {
+                let top = seam_y - blend_band;
+                ((y_i - top) as f32 / (blend_band * 2) as f32).clamp(0.0, 1.0)
+            };
+            let dst_px = *out.get_pixel(dx, dy);
+            out.put_pixel(dx, dy, mix_rgba(dst_px, src_px, blend_t));
+        }
+    }
+}
+
+fn compute_vertical_seam(cost: &[Vec<u32>]) -> Vec<usize> {
+    let rows = cost.len();
+    let cols = cost.first().map(|row| row.len()).unwrap_or(0);
+    if rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+
+    let mut dp = vec![vec![0u64; cols]; rows];
+    let mut parent = vec![vec![0usize; cols]; rows];
+    for x in 0..cols {
+        dp[0][x] = cost[0][x] as u64;
+        parent[0][x] = x;
+    }
+
+    for y in 1..rows {
+        for x in 0..cols {
+            let mut best_prev = x;
+            let mut best_cost = dp[y - 1][x];
+            if x > 0 && dp[y - 1][x - 1] < best_cost {
+                best_cost = dp[y - 1][x - 1];
+                best_prev = x - 1;
+            }
+            if x + 1 < cols && dp[y - 1][x + 1] < best_cost {
+                best_cost = dp[y - 1][x + 1];
+                best_prev = x + 1;
+            }
+            dp[y][x] = best_cost + cost[y][x] as u64;
+            parent[y][x] = best_prev;
+        }
+    }
+
+    let mut end_x = 0usize;
+    let mut end_cost = dp[rows - 1][0];
+    for x in 1..cols {
+        if dp[rows - 1][x] < end_cost {
+            end_cost = dp[rows - 1][x];
+            end_x = x;
+        }
+    }
+
+    let mut seam = vec![0usize; rows];
+    let mut x = end_x;
+    for y in (0..rows).rev() {
+        seam[y] = x;
+        if y > 0 {
+            x = parent[y][x];
+        }
+    }
+    seam
+}
+
+fn compute_horizontal_seam(cost: &[Vec<u32>]) -> Vec<usize> {
+    let cols = cost.len();
+    let rows = cost.first().map(|column| column.len()).unwrap_or(0);
+    if cols == 0 || rows == 0 {
+        return Vec::new();
+    }
+
+    let mut dp = vec![vec![0u64; rows]; cols];
+    let mut parent = vec![vec![0usize; rows]; cols];
+    for y in 0..rows {
+        dp[0][y] = cost[0][y] as u64;
+        parent[0][y] = y;
+    }
+
+    for x in 1..cols {
+        for y in 0..rows {
+            let mut best_prev = y;
+            let mut best_cost = dp[x - 1][y];
+            if y > 0 && dp[x - 1][y - 1] < best_cost {
+                best_cost = dp[x - 1][y - 1];
+                best_prev = y - 1;
+            }
+            if y + 1 < rows && dp[x - 1][y + 1] < best_cost {
+                best_cost = dp[x - 1][y + 1];
+                best_prev = y + 1;
+            }
+            dp[x][y] = best_cost + cost[x][y] as u64;
+            parent[x][y] = best_prev;
+        }
+    }
+
+    let mut end_y = 0usize;
+    let mut end_cost = dp[cols - 1][0];
+    for y in 1..rows {
+        if dp[cols - 1][y] < end_cost {
+            end_cost = dp[cols - 1][y];
+            end_y = y;
+        }
+    }
+
+    let mut seam = vec![0usize; cols];
+    let mut y = end_y;
+    for x in (0..cols).rev() {
+        seam[x] = y;
+        if x > 0 {
+            y = parent[x][y];
+        }
+    }
+    seam
+}
+
+fn rgb_distance_sq(a: Rgba<u8>, b: Rgba<u8>) -> u32 {
+    let dr = a[0] as i32 - b[0] as i32;
+    let dg = a[1] as i32 - b[1] as i32;
+    let db = a[2] as i32 - b[2] as i32;
+    (dr * dr + dg * dg + db * db) as u32
+}
+
 fn mix_rgba(a: Rgba<u8>, b: Rgba<u8>, t: f32) -> Rgba<u8> {
+    let t = t.clamp(0.0, 1.0);
     let mix = |lhs: u8, rhs: u8| -> u8 {
         (lhs as f32 * (1.0 - t) + rhs as f32 * t)
             .round()
@@ -2656,6 +3057,22 @@ fn apply_transform(op: TransformOp, image: &DynamicImage) -> Result<DynamicImage
             alpha_from_luma,
             invert_luma,
             region,
+        )),
+        TransformOp::AlphaBrush {
+            center_x,
+            center_y,
+            radius,
+            strength_percent,
+            softness,
+            operation,
+        } => Ok(apply_alpha_brush(
+            image,
+            center_x,
+            center_y,
+            radius,
+            strength_percent,
+            softness,
+            operation,
         )),
         TransformOp::Effects(params) => Ok(apply_effects(image, params)),
         TransformOp::PerspectiveCorrect {
@@ -3096,6 +3513,71 @@ fn apply_alpha_adjust(
             px[3] = alpha.round().clamp(0.0, 255.0) as u8;
         }
     }
+    DynamicImage::ImageRgba8(output)
+}
+
+fn apply_alpha_brush(
+    image: &DynamicImage,
+    center_x: u32,
+    center_y: u32,
+    radius: u32,
+    strength_percent: f32,
+    softness: f32,
+    operation: AlphaBrushOp,
+) -> DynamicImage {
+    let mut output = image.to_rgba8();
+    let (w, h) = output.dimensions();
+    if w == 0 || h == 0 {
+        return DynamicImage::ImageRgba8(output);
+    }
+
+    let radius = radius.max(1);
+    let radius_f = radius as f32;
+    let strength = (strength_percent / 100.0).clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return DynamicImage::ImageRgba8(output);
+    }
+    let softness = softness.clamp(0.0, 1.0);
+    let inner_radius = radius_f * (1.0 - softness);
+
+    let min_x = center_x.saturating_sub(radius);
+    let min_y = center_y.saturating_sub(radius);
+    let max_x = center_x.saturating_add(radius).min(w.saturating_sub(1));
+    let max_y = center_y.saturating_add(radius).min(h.saturating_sub(1));
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 - center_x as f32;
+            let dy = y as f32 - center_y as f32;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance > radius_f {
+                continue;
+            }
+            let falloff = if distance <= inner_radius || inner_radius >= radius_f {
+                1.0
+            } else {
+                let t = ((distance - inner_radius) / (radius_f - inner_radius)).clamp(0.0, 1.0);
+                (1.0 - t).powf(1.4)
+            };
+            let weight = (strength * falloff).clamp(0.0, 1.0);
+            if weight <= 0.0 {
+                continue;
+            }
+
+            let px = output.get_pixel_mut(x, y);
+            let current_alpha = px[3] as f32;
+            let next_alpha = match operation {
+                AlphaBrushOp::Increase | AlphaBrushOp::SetOpaque => {
+                    current_alpha + (255.0 - current_alpha) * weight
+                }
+                AlphaBrushOp::Decrease | AlphaBrushOp::SetTransparent => {
+                    current_alpha * (1.0 - weight)
+                }
+            };
+            px[3] = next_alpha.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
     DynamicImage::ImageRgba8(output)
 }
 
@@ -4285,8 +4767,9 @@ mod tests {
     use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 
     use super::{
-        CanvasAnchor, ColorAdjustParams, EffectsParams, ResizeFilter, RotationInterpolation,
-        ShapeKind, ShapeParams, TransformOp, apply_transform,
+        AlphaBrushOp, CanvasAnchor, ColorAdjustParams, EffectsParams, PanoramaDirection,
+        ResizeFilter, RotationInterpolation, ShapeKind, ShapeParams, TransformOp, apply_transform,
+        stitch_images,
     };
 
     fn test_image(width: u32, height: u32) -> DynamicImage {
@@ -4453,5 +4936,32 @@ mod tests {
         )
         .expect("effects transform should succeed");
         assert_eq!(transformed.dimensions(), (20, 20));
+    }
+
+    #[test]
+    fn alpha_brush_transform_preserves_dimensions() {
+        let source = test_image(64, 48);
+        let transformed = apply_transform(
+            TransformOp::AlphaBrush {
+                center_x: 32,
+                center_y: 24,
+                radius: 14,
+                strength_percent: 60.0,
+                softness: 0.5,
+                operation: AlphaBrushOp::SetTransparent,
+            },
+            &source,
+        )
+        .expect("alpha brush transform should succeed");
+        assert_eq!(transformed.dimensions(), (64, 48));
+    }
+
+    #[test]
+    fn panorama_stitch_preserves_expected_canvas_size() {
+        let a = RgbaImage::from_pixel(80, 32, Rgba([10, 20, 30, 255]));
+        let b = RgbaImage::from_pixel(90, 32, Rgba([12, 22, 32, 255]));
+        let out = stitch_images(&[a, b], PanoramaDirection::Horizontal, 0.1);
+        assert_eq!(out.height(), 32);
+        assert_eq!(out.width(), 80 + 90 - 8);
     }
 }
