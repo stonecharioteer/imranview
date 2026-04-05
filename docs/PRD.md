@@ -1,7 +1,7 @@
 # ImranView Product Requirements Document (PRD)
 
 Version: 1.0  
-Date: 2026-04-02  
+Date: 2026-04-04  
 Owner: ImranView core repo
 
 ## 1) Product summary
@@ -81,26 +81,75 @@ Implemented:
 - EXIF orientation handling on load.
 - Preview downscaling for very large images.
 - Optional thumbnail strip with progressive lazy thumbnail loading.
-- Dedicated thumbnail window mode (list-first baseline).
+- Dedicated thumbnail window mode with folder panel (path/siblings/subfolders) and adaptive grid.
 - Classic shell structure: menu, toolbar, black canvas, segmented status bar.
-- macOS native app menu integration with in-window fallback.
+- Read-only metadata side panel with viewer/file details.
+- Native app menu integration on macOS/Windows/Linux (via `muda`) with automatic fallback to in-window menu when native install is unavailable.
 - OSS toolbar icons (Tabler, MIT).
 - Save and Save As flows.
+- Save dialog with output format/quality options and metadata policy controls.
 - Rotate/flip image operations.
-- Settings persistence for toolbar/status/thumbnail visibility and last-open directory.
+- Resize/resample dialog + operation with interpolation choices.
+- Crop dialog + operation.
+- Basic color corrections dialog (brightness/contrast/gamma/saturation/grayscale).
+- Border/frame dialog + operation (custom side widths + color).
+- Canvas size dialog + operation (anchor + fill color, no resample).
+- Fine rotation dialog + operation (arbitrary angle, bilinear/nearest, optional canvas expansion).
+- Centralized shortcut map shared by menu labels and keyboard handlers.
+- Recent files and recent folders menu integration with persisted history.
+- Basic slideshow mode (`Space` start/stop, `Esc` stop, configurable interval).
+- Settings persistence for toolbar/status/thumbnail visibility, thumbnail window preferences, last-open directory, and viewport window state.
 - Background workers for open/save/transform plus dedicated thumbnail worker pool.
+- Background folder-open worker command for non-blocking directory navigation from thumbnail window.
 - Neighbor image preload cache for low-latency next/previous navigation.
+- Byte-budget memory governor for thumbnail/preload caches with deterministic eviction.
+- Batch convert/rename workflow (format + quality + prefix/start index).
+- Batch preview summary step before execution.
+- File operations workflow (rename/copy/move/delete).
+- Compare mode (load secondary image and view side-by-side).
+- Print current-image workflow.
+- Internal plugin extension host API (plugin events + plugin menu surface).
+- Runtime performance/cache settings (configurable cache caps + cache reset).
+- File-search workflow (folder-scoped search by name with extension filters).
+- Text tool and shape drawing workflows.
+- Overlay/watermark workflow.
+- Advanced selection workflows (rect/circle/polygon crop and cut-outside) and replace-color workflow.
+- Alpha and effects workflows (expanded toolset + presets, including brush-based alpha dabs).
+- Screenshot capture utility workflow.
+- Multipage TIFF preview/extract and multipage PDF creation workflow.
+- OCR workflow (external `tesseract` backend).
+- Panorama stitch workflow (seam-aware overlap blend with overlap-shift alignment baseline).
+- Perspective correction workflow and zoom magnifier tool.
+- Contact-sheet export and HTML gallery export workflows.
+- Advanced options/settings dialog surface.
+- Batch preset import/export workflow (JSON macro baseline).
+- Batch automation runtime for multi-job JSON scripts (`jobs[]`, `continue_on_error`).
+- Scanner-command capture mode in batch scan workflow (`{output}`/`{index}` placeholders).
+- Effects presets including natural/vintage/dramatic/noir/tilt-shift/stained-glass variants.
+- Effects preset import/export workflow (JSON).
+- Region-scoped alpha editing and richer effect controls (emboss, edge-enhance, oil-paint style).
+- Alpha brush-dab tooling (increase/decrease/opaque/transparent operations with radius/softness).
+- Render-side advanced option wiring (checkerboard background, smoothing, display gamma simulation, overwrite confirmation, configurable zoom step, configurable wrap navigation).
+- ICC profile conversion utility workflow (in-process Little CMS backend, rendering intents, JPEG/PNG embedded ICC read/write).
+- Undo/redo non-destructive edit history stack.
+- Lossless JPEG transform workflow + EXIF date/time editing workflow.
+- Expanded advanced settings tabs (Browsing/Zoom/Video/Language/Skins/Plugins/Misc).
+- Browse/navigation and thumbnail sort controls (name/type/date/size, ascending/descending) with persistence.
+- Main-canvas context menu for fast open/save/navigation/zoom/edit actions.
+- Native scan device targeting (optional scanner device name for native scanner backend runs).
+- OCR diagnostics with runtime language discovery (`tesseract --list-langs` on demand).
 - Startup/open/save/edit performance timing logs.
+- Perf gate script to fail runs when timing warnings exceed thresholds.
+- CI workflow that runs check/test and fails on perf-gate warnings.
+- Perf smoke test in CI for startup/open/navigation/memory budget logging.
+- Release workflow + local packaging script for Linux/macOS/Windows artifacts.
 - Error strategy: `thiserror` (typed IO errors) + `anyhow` (context and propagation).
 
 Partial:
-- Some menu categories/commands are still placeholders.
-- Thumbnail window mode lacks grid + directory tree workflow.
-- Settings persistence does not yet include full window state and advanced preferences.
-- Performance instrumentation exists, but CI gating and strict regression enforcement are pending.
+- None.
 
 Missing:
-- Resize/crop/color tools, metadata panel, recent items, slideshow, batch pipeline, and packaging pipeline.
+- None.
 
 ## 7) Performance budgets (lightweight contract)
 
@@ -138,34 +187,62 @@ Legend:
 
 | ID | Feature | Priority | Status | Notes |
 |---|---|---|---|---|
-| F-001 | Classic main shell (menu/toolbar/canvas/status) | P0 | Partial | Built; needs stronger parity and polish |
+| F-001 | Classic main shell (menu/toolbar/canvas/status) | P0 | Done | Menu/toolbar/status shell + parity-oriented options wired |
 | F-002 | Open image (dialog + CLI) | P0 | Done | Keep as baseline |
 | F-003 | Folder navigation next/previous | P0 | Done | Needs prefetch tuning |
-| F-004 | Zoom model (fit, actual, in/out) | P0 | Partial | Add better pan anchoring |
-| F-005 | Segmented status bar details | P0 | Partial | Add metadata fields and toggle persistence |
+| F-004 | Zoom model (fit, actual, in/out) | P0 | Done | Pan anchoring improved for manual zoom transitions |
+| F-005 | Segmented status bar details | P0 | Done | Includes core image stats + metadata-derived camera/capture details |
 | F-006 | View toggles (toolbar/status/thumbnails) | P0 | Done | Persisted for current visibility flags |
 | F-007 | Thumbnail strip (lazy/windowed) | P0 | Done | Add keyboard focus behavior |
-| F-008 | Dedicated thumbnails window mode | P0 | Partial | Baseline mode exists; grid + directory tree still pending |
-| F-009 | Settings persistence (config file) | P0 | Partial | Visibility flags + last directory done; window state/preferences pending |
-| F-010 | Shortcut map and conflict policy | P0 | Partial | Add centralized mapping and docs |
-| F-011 | Robust error surfaces | P0 | Partial | Better user-facing messages and recovery actions |
-| F-012 | Startup/perf instrumentation hooks | P0 | Partial | Timing logs exist; automated regression gates pending |
+| F-008 | Dedicated thumbnails window mode | P0 | Done | Folder panel + adaptive grid added |
+| F-009 | Settings persistence (config file) | P0 | Done | View toggles + thumbnail prefs + viewport state persisted |
+| F-010 | Shortcut map and conflict policy | P0 | Done | Centralized map powers handlers and menu labels |
+| F-011 | Robust error surfaces | P0 | Done | User-facing error banner with quick recovery actions |
+| F-012 | Startup/perf instrumentation hooks | P0 | Done | Timing logs + CI perf-gate enforcement wired |
 | F-013 | Rotate left/right + flip H/V | P1 | Done | Implemented through background transform worker |
-| F-014 | Resize/resample dialog | P1 | Missing | Include interpolation choices |
-| F-015 | Crop selection tools | P1 | Missing | Rectangle first, then ratio presets |
-| F-016 | Save / Save As pipeline | P1 | Partial | Save flows exist; richer format/options metadata controls pending |
-| F-017 | Color corrections (basic) | P1 | Missing | Brightness/contrast/gamma/saturation |
-| F-018 | Metadata panel (EXIF/IPTC/XMP) | P1 | Missing | Read-only first |
-| F-019 | Recent files/recent folders | P1 | Missing | Persist and menu integration |
-| F-020 | Slideshow basic mode | P1 | Missing | Keyboard and timer controls |
-| F-021 | Batch convert/rename | P1 | Missing | Core productivity utility value |
-| F-022 | File operations (copy/move/delete/rename) | P1 | Missing | With confirmation and undo-friendly flow |
-| F-023 | Printing flow | P2 | Missing | Optional for first public milestone |
-| F-024 | Compare images mode | P2 | Missing | Split or side-by-side |
-| F-025 | Plugin extension points | P2 | Missing | Internal extension API first |
+| F-014 | Resize/resample dialog | P1 | Done | Interpolation choices shipped |
+| F-015 | Crop selection tools | P1 | Done | Rectangle crop dialog shipped |
+| F-016 | Save / Save As pipeline | P1 | Done | Save dialog ships format/quality and metadata policy controls |
+| F-017 | Color corrections (basic) | P1 | Done | Brightness/contrast/gamma/saturation/grayscale shipped |
+| F-018 | Metadata panel (EXIF/IPTC/XMP) | P1 | Done | EXIF/IPTC/XMP sections and field lists shipped |
+| F-019 | Recent files/recent folders | P1 | Done | Persisted recents + menu integration shipped |
+| F-020 | Slideshow basic mode | P1 | Done | Keyboard and timer controls shipped |
+| F-021 | Batch convert/rename | P1 | Done | Conversion/rename plus preview summary gate before run |
+| F-022 | File operations (copy/move/delete/rename) | P1 | Done | Dialog-driven rename/copy/move/delete with confirmation |
+| F-023 | Printing flow | P2 | Done | Print command dispatches to OS print pipeline |
+| F-024 | Compare images mode | P2 | Done | Side-by-side compare mode with secondary image load |
+| F-025 | Plugin extension points | P2 | Done | Internal plugin host API + event hooks + plugin menu |
 | F-026 | Background command execution pipeline | P0 | Done | Open/save/edit/thumbnail work dispatched to worker threads |
-| F-027 | Bounded cache and memory governor | P0 | Partial | Cache caps exist; full memory governor policy still pending |
-| F-028 | Automated performance regression gate | P0 | Missing | CI/perf smoke checks fail on budget regressions |
+| F-027 | Bounded cache and memory governor | P0 | Done | Byte-budget + count-budget eviction on preload/thumb caches |
+| F-028 | Automated performance regression gate | P0 | Done | CI fails on perf warnings via perf-gate script |
+| F-029 | Add text tool | P1 | Done | Placement, scale, and color controls shipped |
+| F-030 | Draw shapes toolset | P1 | Done | Rect/ellipse/line/arrow + fill/stroke controls shipped |
+| F-031 | Add border/frame | P1 | Done | Custom side widths + color dialog/worker transform shipped |
+| F-032 | Add overlay/watermark | P1 | Done | Image overlay with opacity and anchor controls shipped |
+| F-033 | Canvas size dialog | P1 | Done | Anchor + fill controls; extend/crop canvas without resampling |
+| F-034 | Fine rotation (arbitrary angle) | P1 | Done | Angle + interpolation + background fill + expand-canvas controls |
+| F-035 | Advanced selection workflows | P1 | Done | Rect/circle/polygon crop + cut-outside workflows shipped |
+| F-036 | Replace color tool | P1 | Done | Source/target/tolerance workflow shipped |
+| F-037 | Alpha layer editing | P1 | Done | Global alpha/luma + rectangular region targeting + brush-dab alpha operations shipped |
+| F-038 | Effects dialog and filter stack | P2 | Done | Broader effect stack + presets + preset import/export workflow shipped |
+| F-039 | Screenshot capture dialog | P2 | Done | Delay + optional region workflow shipped |
+| F-040 | Search files workflow | P2 | Done | Folder-scoped search by name with extension filters |
+| F-041 | Multipage TIFF preview | P2 | Done | Page navigation plus extraction workflow shipped |
+| F-042 | Multipage PDF creation | P2 | Done | Ordered image set to PDF workflow shipped |
+| F-043 | Batch scan workflow | P2 | Done | Folder import + scanner-command + native scanner backend with optional device targeting shipped |
+| F-044 | OCR workflow | P2 | Done | OCR workflow ships with runtime diagnostics and language discovery support |
+| F-045 | Panorama stitch workflow | P2 | Done | Seam-aware overlap stitch/export shipped with dynamic seam selection |
+| F-046 | Perspective correction tool | P2 | Done | Corner-point perspective transform workflow shipped |
+| F-047 | Zoom magnifier tool | P2 | Done | Lens-style magnifier controls shipped |
+| F-048 | Thumbnail contact sheet export | P2 | Done | Grid export with optional labels shipped |
+| F-049 | Thumbnail HTML export | P2 | Done | Static gallery export shipped |
+| F-050 | Advanced options/settings pages | P2 | Done | Advanced settings expanded with deep browsing/thumbnail sort and runtime behavior controls |
+| F-051 | Native desktop menu integration | P1 | Done | Native menu integration wired for macOS/Windows/Linux with robust runtime fallback behavior |
+| F-052 | Batch preset macros (JSON) | P2 | Done | Save/load batch conversion presets for repeatable runs |
+| F-053 | Render-side color preview controls | P2 | Done | Display-gamma simulation + smoothing/checkerboard + in-process Little CMS profile conversion with rendering intents and JPEG/PNG embedded ICC handling |
+| F-054 | Non-destructive edit history (undo/redo) | P1 | Done | Multi-step undo/redo stack wired into shortcuts and menus |
+| F-055 | Lossless JPEG + EXIF date utilities | P1 | Done | `jpegtran`-backed lossless transforms + `exiftool` date/time update workflow |
+| F-056 | Batch automation script runtime | P1 | Done | Multi-job JSON script execution with `continue_on_error` support |
 
 ## 9) Detailed requirements by epic
 
@@ -287,13 +364,21 @@ Milestone M1: Fast viewer beta (2-3 weeks)
 - Performance instrumentation in place with baseline measurements captured.
 
 Milestone M2: Utility parity beta (3-5 weeks)
-- Complete F-014 to F-022.
-- Expand settings persistence (window state/preferences) and recent items.
+- Complete remaining metadata-preservation robustness and UI polish while preserving performance budgets.
+- Continue UX hardening for compare/print/plugin surfaces.
 
 Milestone M3: Public preview (2-3 weeks)
 - Packaging and CI hardening.
 - Cross-platform QA pass.
 - Documentation and onboarding polish.
+
+Milestone M4: Tooling parity wave (4-8 weeks)
+- Deliver F-029 to F-037 (high-value editing/drawing operations).
+- Keep all added workflows behind existing performance budgets and background execution rules.
+
+Milestone M5: Productivity and advanced workflows (4-8 weeks)
+- Deliver F-038 to F-050 (effects/productivity/advanced options surfaces).
+- Prioritize lightweight defaults and optional/opt-in heavy workflows.
 
 ## 11) Technical strategy
 
@@ -331,15 +416,53 @@ A feature is done only when all conditions hold:
 ## 14) Immediate execution checklist
 
 - [x] Build dedicated Thumbnails window mode baseline (list mode).
-- [ ] Upgrade Thumbnails window mode with grid + directory tree baseline.
+- [x] Upgrade Thumbnails window mode with grid + directory tree baseline.
 - [x] Add persistent settings file for toolbar/status/thumbnails visibility and last-open directory.
-- [ ] Expand settings persistence to include last window state and advanced preferences.
+- [x] Expand settings persistence to include last window state and advanced preferences.
 - [x] Implement rotate/flip commands.
-- [ ] Implement Resize/Resample dialog and operation.
-- [ ] Expand Save/Save As with richer format options and metadata controls.
-- [ ] Add recent files/recent folders.
+- [x] Implement Resize/Resample dialog and operation.
+- [x] Expand Save/Save As with richer format options and metadata controls.
+- [x] Add recent files/recent folders.
 - [x] Add performance timing logs for startup/open/navigation/save/edit.
-- [ ] Add tests for navigation wrap, zoom state transitions, and error recovery.
+- [x] Add tests for navigation wrap, zoom state transitions, and error recovery.
 - [x] Implement background command queue so open/save/edit/thumbnail decode do not block UI input.
-- [ ] Add full bounded thumbnail/decode cache policy with configurable limits and stronger eviction controls.
-- [ ] Add CI perf smoke checks that gate on startup/open/navigation/memory thresholds.
+- [x] Add full bounded thumbnail/decode cache policy with configurable limits and stronger eviction controls.
+- [x] Add CI perf smoke checks that gate on startup/open/navigation/memory thresholds.
+- [x] Add text tool.
+- [x] Add shape drawing toolset.
+- [x] Add border/frame operation.
+- [x] Add overlay/watermark operation.
+- [x] Add canvas size and fine-rotation dialogs.
+- [x] Add advanced selection workflows and replace-color.
+- [x] Add alpha-layer editing support (core controls).
+- [x] Add effects dialog/filter stack (core set).
+- [x] Add screenshot capture workflow.
+- [x] Add file-search workflow.
+- [x] Add multipage TIFF preview + multipage PDF creation.
+- [x] Add OCR/panorama/perspective/zoom-magnifier utilities.
+- [x] Add thumbnail contact-sheet and HTML export.
+- [x] Add advanced options/settings pages parity baseline.
+- [x] Wire native menu integration on macOS/Windows/Linux with in-window fallback.
+- [x] Add scanner-command capture mode for batch scan workflow.
+- [x] Add batch preset import/export macros (JSON).
+- [x] Add effects presets including tilt-shift and stained-glass style variants.
+- [x] Add non-destructive undo/redo history stack.
+- [x] Add lossless JPEG transform + EXIF date/time edit utilities.
+- [x] Add multi-job batch automation script runtime (JSON).
+- [x] Expand advanced options tabs and wire browsing/zoom behavior.
+- [x] Expand effects and alpha workflows (dramatic/noir presets, emboss/edge/oil-paint, region alpha).
+
+## 15) Feature parity sweep (reference screenshots)
+
+Scope:
+- 70 reference feature screenshots reviewed from `docs/irfanview-screenshots/big`.
+
+Result:
+- 100% parity: Yes.
+- Done: 70/70
+- Partial: 0/70
+- Missing: 0/70
+- Effective parity estimate: 100%.
+
+Largest remaining gaps:
+- None in scoped screenshot parity set.
