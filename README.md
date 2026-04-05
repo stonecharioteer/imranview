@@ -69,6 +69,46 @@ just ci
 just package [target]
 ```
 
+## Build prerequisites
+
+Linux (Ubuntu/Debian):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  pkg-config \
+  libglib2.0-dev \
+  libgtk-3-dev \
+  libxkbcommon-dev \
+  libxcb-render0-dev \
+  libxcb-shape0-dev \
+  libxcb-xfixes0-dev
+```
+
+Windows:
+
+- Use the MSVC Rust toolchain (`x86_64-pc-windows-msvc`).
+- Install Visual Studio Build Tools with `Desktop development with C++`, MSVC toolset, and Windows 10/11 SDK (for `rc.exe` and native linker tools).
+- No GTK/GLib packages are required on Windows.
+
+Optional runtime tools (feature-dependent, all OSes):
+
+- OCR: `tesseract`
+- Lossless JPEG transform: `jpegtran`
+- EXIF date/time update: `exiftool`
+- Linux/macOS scan command mode: `scanimage` (SANE tools)
+
+## Manual release pipeline
+
+- Use GitHub Actions workflow: `Manual Release`.
+- Trigger it manually from the branch you want to release (typically `main`).
+- The workflow computes version as `YYYY.MM.DD.XX` (UTC date + auto-incrementing `00..99` for that date).
+- It writes that version to `[package].version` in `Cargo.toml`, commits `chore(release): cut <version>`, and pushes the commit.
+- It builds and publishes:
+- Linux: `.AppImage`
+- macOS: `.dmg`
+- Windows: NSIS installer `.exe`
+
 ## Notes
 
 - UI: egui/eframe (`src/main.rs`)
