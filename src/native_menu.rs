@@ -67,6 +67,7 @@ const ID_VIEW_SHOW_STATUS_BAR: &str = "menu.view.show_status_bar";
 const ID_VIEW_SHOW_METADATA_PANEL: &str = "menu.view.show_metadata_panel";
 const ID_VIEW_SHOW_THUMBNAIL_STRIP: &str = "menu.view.show_thumbnail_strip";
 const ID_VIEW_SHOW_THUMBNAIL_WINDOW: &str = "menu.view.show_thumbnail_window";
+const ID_VIEW_COMMAND_PALETTE: &str = "menu.view.command_palette";
 const ID_VIEW_MAGNIFIER: &str = "menu.view.magnifier";
 const ID_OPTIONS_PERFORMANCE: &str = "menu.options.performance";
 const ID_OPTIONS_CLEAR_CACHES: &str = "menu.options.clear_caches";
@@ -120,6 +121,7 @@ pub enum NativeMenuAction {
     Effects,
     PerspectiveCorrection,
     PanoramaStitch,
+    CommandPalette,
     ToggleShowToolbar,
     ToggleShowStatusBar,
     ToggleShowMetadataPanel,
@@ -180,6 +182,7 @@ pub struct NativeMenu {
     view_show_metadata_panel: CheckMenuItem,
     view_show_thumbnail_strip: CheckMenuItem,
     view_show_thumbnail_window: CheckMenuItem,
+    view_command_palette: MenuItem,
     view_magnifier: MenuItem,
     options_performance: MenuItem,
     options_clear_caches: MenuItem,
@@ -443,9 +446,17 @@ impl NativeMenu {
             false,
             None,
         );
+        let view_command_palette = MenuItem::with_id(
+            ID_VIEW_COMMAND_PALETTE,
+            "Command Palette...",
+            true,
+            Some(Accelerator::new(Some(primary_menu_modifier()), Code::KeyK)),
+        );
         let view_magnifier = MenuItem::with_id(ID_VIEW_MAGNIFIER, "Zoom Magnifier...", true, None);
         view_menu
             .append_items(&[
+                &view_command_palette,
+                &PredefinedMenuItem::separator(),
                 &view_show_toolbar,
                 &view_show_status_bar,
                 &view_show_metadata_panel,
@@ -550,6 +561,7 @@ impl NativeMenu {
             view_show_metadata_panel,
             view_show_thumbnail_strip,
             view_show_thumbnail_window,
+            view_command_palette,
             view_magnifier,
             options_performance,
             options_clear_caches,
@@ -616,6 +628,7 @@ impl NativeMenu {
             .set_checked(state.show_thumbnail_strip());
         self.view_show_thumbnail_window
             .set_checked(state.thumbnails_window_mode());
+        self.view_command_palette.set_enabled(true);
     }
 
     pub fn drain_actions(&self) -> Vec<NativeMenuAction> {
@@ -673,6 +686,7 @@ impl NativeMenu {
                 ID_VIEW_SHOW_METADATA_PANEL => Some(NativeMenuAction::ToggleShowMetadataPanel),
                 ID_VIEW_SHOW_THUMBNAIL_STRIP => Some(NativeMenuAction::ToggleThumbnailStrip),
                 ID_VIEW_SHOW_THUMBNAIL_WINDOW => Some(NativeMenuAction::ToggleThumbnailWindow),
+                ID_VIEW_COMMAND_PALETTE => Some(NativeMenuAction::CommandPalette),
                 ID_VIEW_MAGNIFIER => Some(NativeMenuAction::Magnifier),
                 ID_OPTIONS_PERFORMANCE => Some(NativeMenuAction::PerformanceSettings),
                 ID_OPTIONS_CLEAR_CACHES => Some(NativeMenuAction::ClearRuntimeCaches),

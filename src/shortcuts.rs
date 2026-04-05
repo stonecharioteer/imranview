@@ -5,6 +5,7 @@ pub enum ShortcutAction {
     Open,
     Save,
     SaveAs,
+    CommandPalette,
     Undo,
     Redo,
     PreviousImage,
@@ -15,51 +16,8 @@ pub enum ShortcutAction {
     ActualSize,
 }
 
-pub fn trigger(ctx: &egui::Context, action: ShortcutAction) -> bool {
+fn shortcut_for(action: ShortcutAction) -> Option<egui::KeyboardShortcut> {
     match action {
-        ShortcutAction::Open => ctx.input_mut(|i| {
-            i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND,
-                egui::Key::O,
-            ))
-        }),
-        ShortcutAction::Save => ctx.input_mut(|i| {
-            i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND,
-                egui::Key::S,
-            ))
-        }),
-        ShortcutAction::SaveAs => ctx.input_mut(|i| {
-            i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                egui::Key::S,
-            ))
-        }),
-        ShortcutAction::Undo => ctx.input_mut(|i| {
-            i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND,
-                egui::Key::Z,
-            ))
-        }),
-        ShortcutAction::Redo => ctx.input_mut(|i| {
-            i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                egui::Key::Z,
-            ))
-        }),
-        ShortcutAction::PreviousImage => ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)),
-        ShortcutAction::NextImage => ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)),
-        ShortcutAction::ZoomIn => {
-            ctx.input(|i| i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals))
-        }
-        ShortcutAction::ZoomOut => ctx.input(|i| i.key_pressed(egui::Key::Minus)),
-        ShortcutAction::Fit => ctx.input(|i| i.key_pressed(egui::Key::Num0)),
-        ShortcutAction::ActualSize => ctx.input(|i| i.key_pressed(egui::Key::Num1)),
-    }
-}
-
-pub fn menu_item_label(ctx: &egui::Context, action: ShortcutAction, title: &str) -> String {
-    let shortcut = match action {
         ShortcutAction::Open => Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND,
             egui::Key::O,
@@ -71,6 +29,10 @@ pub fn menu_item_label(ctx: &egui::Context, action: ShortcutAction, title: &str)
         ShortcutAction::SaveAs => Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
             egui::Key::S,
+        )),
+        ShortcutAction::CommandPalette => Some(egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND,
+            egui::Key::K,
         )),
         ShortcutAction::Undo => Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND,
@@ -104,10 +66,33 @@ pub fn menu_item_label(ctx: &egui::Context, action: ShortcutAction, title: &str)
             egui::Modifiers::NONE,
             egui::Key::Num1,
         )),
-    };
+    }
+}
 
-    if let Some(shortcut) = shortcut {
-        format!("{title}\t{}", ctx.format_shortcut(&shortcut))
+pub fn trigger(ctx: &egui::Context, action: ShortcutAction) -> bool {
+    if action == ShortcutAction::ZoomIn {
+        if let Some(shortcut) = shortcut_for(action) {
+            if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                return true;
+            }
+        }
+        return ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Equals));
+    }
+
+    if let Some(shortcut) = shortcut_for(action) {
+        return ctx.input_mut(|i| i.consume_shortcut(&shortcut));
+    }
+
+    false
+}
+
+pub fn shortcut_text(ctx: &egui::Context, action: ShortcutAction) -> Option<String> {
+    shortcut_for(action).map(|shortcut| ctx.format_shortcut(&shortcut))
+}
+
+pub fn menu_item_label(ctx: &egui::Context, action: ShortcutAction, title: &str) -> String {
+    if let Some(shortcut) = shortcut_text(ctx, action) {
+        format!("{title}\t{shortcut}")
     } else {
         title.to_owned()
     }

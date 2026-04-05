@@ -25,12 +25,13 @@ use crate::image_io::{collect_images_in_directory, is_supported_image_path};
 use crate::native_menu::{NativeMenu, NativeMenuAction};
 use crate::plugin::{PluginContext, PluginEvent, PluginHost};
 use crate::settings::{PersistedSettings, load_settings, save_settings};
-use crate::shortcuts::{ShortcutAction, menu_item_label};
+use crate::shortcuts::{ShortcutAction, menu_item_label, shortcut_text};
 use crate::worker::{
-    AlphaBrushOp, BatchConvertOptions, BatchOutputFormat, CanvasAnchor, ColorAdjustParams, EffectsParams,
-    FileOperation, LosslessJpegOp, PanoramaDirection, ResizeFilter, RotationInterpolation, SaveImageOptions,
-    SaveMetadataPolicy, SaveOutputFormat, SelectionParams, SelectionWorkflow, ShapeKind,
-    ShapeParams, TransformOp, WorkerCommand, WorkerRequestKind, WorkerResult,
+    AlphaBrushOp, BatchConvertOptions, BatchOutputFormat, CanvasAnchor, ColorAdjustParams,
+    EffectsParams, FileOperation, LosslessJpegOp, PanoramaDirection, ResizeFilter,
+    RotationInterpolation, SaveImageOptions, SaveMetadataPolicy, SaveOutputFormat, SelectionParams,
+    SelectionWorkflow, ShapeKind, ShapeParams, TransformOp, WorkerCommand, WorkerRequestKind,
+    WorkerResult,
 };
 
 const THUMB_TEXTURE_CACHE_CAP: usize = 320;
@@ -43,6 +44,9 @@ const STATUS_PANEL_HEIGHT: f32 = 26.0;
 const APP_FAVICON_PNG: &[u8] = include_bytes!("../assets/branding/favicon.png");
 const FOLDER_PANEL_LIST_LIMIT: usize = 256;
 const RECENT_MENU_LIMIT: usize = 12;
+const COMMAND_PALETTE_PANEL_WIDTH: f32 = 700.0;
+const COMMAND_PALETTE_PANEL_MAX_HEIGHT: f32 = 560.0;
+const COMMAND_PALETTE_MAX_VISIBLE: usize = 320;
 
 const fn platform_window_corner_radius() -> u8 {
     #[cfg(target_os = "macos")]
@@ -149,6 +153,94 @@ fn centered_dialog_window(title: &'static str) -> egui::Window<'static> {
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+}
+
+#[derive(Clone, Debug)]
+enum MenuCommand {
+    FileOpen,
+    FileSave,
+    FileSaveAs,
+    FileSaveWithOptions,
+    FileLosslessJpegTransform,
+    FileChangeExifDateTime,
+    FileConvertColorProfile,
+    FileRenameCurrent,
+    FileCopyCurrentToFolder,
+    FileMoveCurrentToFolder,
+    FileDeleteCurrent,
+    FileBatchConvertRename,
+    FileRunAutomationScript,
+    FileBatchScanImport,
+    FileScreenshotCapture,
+    FileOcr,
+    FilePrintCurrent,
+    FileOpenRecent(PathBuf),
+    FileOpenRecentFolder(PathBuf),
+    FileSearchFiles,
+    FileMultipageTiff,
+    FileCreateMultipagePdf,
+    FileExportContactSheet,
+    FileExportHtmlGallery,
+    FileExit,
+    EditUndo,
+    EditRedo,
+    EditRotateLeft,
+    EditRotateRight,
+    EditFlipHorizontal,
+    EditFlipVertical,
+    EditResizeResample,
+    EditCrop,
+    EditColorCorrections,
+    EditBorderFrame,
+    EditCanvasSize,
+    EditFineRotation,
+    EditTextTool,
+    EditShapeTool,
+    EditOverlayWatermark,
+    EditSelectionWorkflows,
+    EditReplaceColor,
+    EditAlphaTools,
+    EditEffects,
+    EditPerspectiveCorrection,
+    ImagePrevious,
+    ImageNext,
+    ImageZoomIn,
+    ImageZoomOut,
+    ImageFitToWindow,
+    ImageActualSize,
+    ImageToggleSlideshow,
+    ImageLoadCompare,
+    ImageToggleCompareMode,
+    ImagePanoramaStitch,
+    ViewCommandPalette,
+    ViewToggleStatusBar,
+    ViewToggleToolbar,
+    ViewToggleMetadataPanel,
+    ViewToggleThumbnailStrip,
+    ViewToggleThumbnailWindow,
+    ViewZoomMagnifier,
+    OptionsPerformanceCache,
+    OptionsClearRuntimeCaches,
+    OptionsAdvancedSettings,
+    HelpAbout,
+}
+
+#[derive(Clone, Debug)]
+struct CommandPaletteEntry {
+    group: &'static str,
+    title: String,
+    shortcut: Option<String>,
+    search_blob: String,
+    enabled: bool,
+    command: MenuCommand,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommandPaletteState {
+    open: bool,
+    query: String,
+    selected_index: usize,
+    request_focus: bool,
 }
 
 fn default_scanner_command_template() -> String {
@@ -1276,6 +1368,7 @@ struct ImranViewApp {
     slideshow_running: bool,
     slideshow_last_tick: Instant,
     show_about_window: bool,
+    command_palette: CommandPaletteState,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     native_menu: Option<NativeMenu>,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -1374,6 +1467,7 @@ impl ImranViewApp {
             slideshow_running: false,
             slideshow_last_tick: Instant::now(),
             show_about_window: false,
+            command_palette: CommandPaletteState::default(),
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             native_menu: None,
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -2679,7 +2773,1043 @@ impl ImranViewApp {
         output
     }
 
+    fn open_batch_script_picker_and_dispatch(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("Run batch automation script");
+        if let Some(directory) = self.state.preferred_open_directory() {
+            dialog = dialog.set_directory(directory);
+        }
+        dialog = dialog.add_filter("JSON", &["json"]);
+        if let Some(path) = dialog.pick_file() {
+            self.dispatch_batch_script(path);
+        }
+    }
+
+    fn open_command_palette(&mut self) {
+        self.command_palette.open = true;
+        self.command_palette.query.clear();
+        self.command_palette.selected_index = 0;
+        self.command_palette.request_focus = true;
+    }
+
+    fn toggle_command_palette(&mut self) {
+        if self.command_palette.open {
+            self.command_palette.open = false;
+            self.command_palette.query.clear();
+            self.command_palette.selected_index = 0;
+            self.command_palette.request_focus = false;
+        } else {
+            self.open_command_palette();
+        }
+    }
+
+    fn is_menu_command_enabled(&self, command: &MenuCommand) -> bool {
+        match command {
+            MenuCommand::FileOpen
+            | MenuCommand::FileBatchConvertRename
+            | MenuCommand::FileRunAutomationScript
+            | MenuCommand::FileBatchScanImport
+            | MenuCommand::FileScreenshotCapture
+            | MenuCommand::FileExit
+            | MenuCommand::ViewCommandPalette
+            | MenuCommand::ViewToggleStatusBar
+            | MenuCommand::ViewToggleToolbar
+            | MenuCommand::ViewToggleMetadataPanel
+            | MenuCommand::ViewToggleThumbnailStrip
+            | MenuCommand::ViewToggleThumbnailWindow
+            | MenuCommand::OptionsPerformanceCache
+            | MenuCommand::OptionsClearRuntimeCaches
+            | MenuCommand::OptionsAdvancedSettings
+            | MenuCommand::HelpAbout => true,
+            MenuCommand::FileOpenRecent(path) => path.is_file(),
+            MenuCommand::FileOpenRecentFolder(path) => path.is_dir(),
+            MenuCommand::FileSearchFiles => !self.state.images_in_directory().is_empty(),
+            MenuCommand::FileSave
+            | MenuCommand::FileSaveAs
+            | MenuCommand::FileSaveWithOptions
+            | MenuCommand::FileLosslessJpegTransform
+            | MenuCommand::FileChangeExifDateTime
+            | MenuCommand::FileConvertColorProfile
+            | MenuCommand::FileRenameCurrent
+            | MenuCommand::FileCopyCurrentToFolder
+            | MenuCommand::FileMoveCurrentToFolder
+            | MenuCommand::FileDeleteCurrent
+            | MenuCommand::FileOcr
+            | MenuCommand::FilePrintCurrent
+            | MenuCommand::FileMultipageTiff
+            | MenuCommand::FileCreateMultipagePdf
+            | MenuCommand::FileExportContactSheet
+            | MenuCommand::FileExportHtmlGallery
+            | MenuCommand::EditRotateLeft
+            | MenuCommand::EditRotateRight
+            | MenuCommand::EditFlipHorizontal
+            | MenuCommand::EditFlipVertical
+            | MenuCommand::EditResizeResample
+            | MenuCommand::EditCrop
+            | MenuCommand::EditColorCorrections
+            | MenuCommand::EditBorderFrame
+            | MenuCommand::EditCanvasSize
+            | MenuCommand::EditFineRotation
+            | MenuCommand::EditTextTool
+            | MenuCommand::EditShapeTool
+            | MenuCommand::EditOverlayWatermark
+            | MenuCommand::EditSelectionWorkflows
+            | MenuCommand::EditReplaceColor
+            | MenuCommand::EditAlphaTools
+            | MenuCommand::EditEffects
+            | MenuCommand::EditPerspectiveCorrection
+            | MenuCommand::ImagePrevious
+            | MenuCommand::ImageNext
+            | MenuCommand::ImageZoomIn
+            | MenuCommand::ImageZoomOut
+            | MenuCommand::ImageFitToWindow
+            | MenuCommand::ImageActualSize
+            | MenuCommand::ImageLoadCompare
+            | MenuCommand::ImagePanoramaStitch
+            | MenuCommand::ViewZoomMagnifier => self.state.has_image(),
+            MenuCommand::ImageToggleCompareMode => self.compare_image.is_some(),
+            MenuCommand::ImageToggleSlideshow => self.slideshow_running || self.state.has_image(),
+            MenuCommand::EditUndo => self.state.can_undo(),
+            MenuCommand::EditRedo => self.state.can_redo(),
+        }
+    }
+
+    fn run_menu_command(&mut self, ctx: &egui::Context, command: MenuCommand) {
+        match command {
+            MenuCommand::FileOpen => self.open_path_dialog(),
+            MenuCommand::FileSave => self.dispatch_save(None, false, self.default_save_options()),
+            MenuCommand::FileSaveAs | MenuCommand::FileSaveWithOptions => {
+                self.open_save_as_dialog();
+            }
+            MenuCommand::FileLosslessJpegTransform => self.open_lossless_jpeg_dialog(),
+            MenuCommand::FileChangeExifDateTime => self.open_exif_date_dialog(),
+            MenuCommand::FileConvertColorProfile => self.open_color_profile_dialog(),
+            MenuCommand::FileRenameCurrent => self.open_rename_dialog(),
+            MenuCommand::FileCopyCurrentToFolder => self.copy_current_to_dialog(),
+            MenuCommand::FileMoveCurrentToFolder => self.move_current_to_dialog(),
+            MenuCommand::FileDeleteCurrent => {
+                if self.advanced_options_dialog.confirm_delete {
+                    self.confirm_delete_current = true;
+                } else {
+                    self.delete_current_file();
+                }
+            }
+            MenuCommand::FileBatchConvertRename => self.open_batch_dialog(),
+            MenuCommand::FileRunAutomationScript => self.open_batch_script_picker_and_dispatch(),
+            MenuCommand::FileBatchScanImport => self.open_batch_scan_dialog(),
+            MenuCommand::FileScreenshotCapture => self.open_screenshot_dialog(),
+            MenuCommand::FileOcr => self.open_ocr_dialog(),
+            MenuCommand::FilePrintCurrent => self.dispatch_print_current(),
+            MenuCommand::FileOpenRecent(path) => self.dispatch_open(path, false),
+            MenuCommand::FileOpenRecentFolder(path) => self.dispatch_open_directory(path),
+            MenuCommand::FileSearchFiles => self.open_search_dialog(),
+            MenuCommand::FileMultipageTiff => self.open_tiff_dialog(),
+            MenuCommand::FileCreateMultipagePdf => self.open_pdf_dialog(),
+            MenuCommand::FileExportContactSheet => self.open_contact_sheet_dialog(),
+            MenuCommand::FileExportHtmlGallery => self.open_html_export_dialog(),
+            MenuCommand::FileExit => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            MenuCommand::EditUndo => self.undo_edit(ctx),
+            MenuCommand::EditRedo => self.redo_edit(ctx),
+            MenuCommand::EditRotateLeft => self.dispatch_transform(TransformOp::RotateLeft),
+            MenuCommand::EditRotateRight => self.dispatch_transform(TransformOp::RotateRight),
+            MenuCommand::EditFlipHorizontal => self.dispatch_transform(TransformOp::FlipHorizontal),
+            MenuCommand::EditFlipVertical => self.dispatch_transform(TransformOp::FlipVertical),
+            MenuCommand::EditResizeResample => self.open_resize_dialog(),
+            MenuCommand::EditCrop => self.open_crop_dialog(),
+            MenuCommand::EditColorCorrections => self.open_color_dialog(),
+            MenuCommand::EditBorderFrame => self.open_border_dialog(),
+            MenuCommand::EditCanvasSize => self.open_canvas_dialog(),
+            MenuCommand::EditFineRotation => self.open_fine_rotate_dialog(),
+            MenuCommand::EditTextTool => self.open_text_tool_dialog(),
+            MenuCommand::EditShapeTool => self.open_shape_tool_dialog(),
+            MenuCommand::EditOverlayWatermark => self.open_overlay_dialog(),
+            MenuCommand::EditSelectionWorkflows => self.open_selection_workflow_dialog(),
+            MenuCommand::EditReplaceColor => self.open_replace_color_dialog(),
+            MenuCommand::EditAlphaTools => self.open_alpha_dialog(),
+            MenuCommand::EditEffects => self.open_effects_dialog(),
+            MenuCommand::EditPerspectiveCorrection => self.open_perspective_dialog(),
+            MenuCommand::ImagePrevious => self.open_previous(),
+            MenuCommand::ImageNext => self.open_next(),
+            MenuCommand::ImageZoomIn => self.zoom_in(),
+            MenuCommand::ImageZoomOut => self.zoom_out(),
+            MenuCommand::ImageFitToWindow => self.zoom_fit(),
+            MenuCommand::ImageActualSize => self.zoom_actual(),
+            MenuCommand::ImageToggleSlideshow => {
+                if self.slideshow_running {
+                    self.stop_slideshow();
+                } else {
+                    self.start_slideshow();
+                }
+            }
+            MenuCommand::ImageLoadCompare => self.open_compare_path_dialog(),
+            MenuCommand::ImageToggleCompareMode => {
+                self.compare_mode = !self.compare_mode;
+            }
+            MenuCommand::ImagePanoramaStitch => self.open_panorama_dialog(),
+            MenuCommand::ViewCommandPalette => self.open_command_palette(),
+            MenuCommand::ViewToggleStatusBar => {
+                self.state
+                    .set_show_status_bar(!self.state.show_status_bar());
+                self.persist_settings();
+            }
+            MenuCommand::ViewToggleToolbar => {
+                self.state.set_show_toolbar(!self.state.show_toolbar());
+                self.persist_settings();
+            }
+            MenuCommand::ViewToggleMetadataPanel => {
+                self.state
+                    .set_show_metadata_panel(!self.state.show_metadata_panel());
+                self.persist_settings();
+            }
+            MenuCommand::ViewToggleThumbnailStrip => {
+                self.state
+                    .set_show_thumbnail_strip(!self.state.show_thumbnail_strip());
+                self.persist_settings();
+            }
+            MenuCommand::ViewToggleThumbnailWindow => {
+                self.state
+                    .set_thumbnails_window_mode(!self.state.thumbnails_window_mode());
+                self.persist_settings();
+            }
+            MenuCommand::ViewZoomMagnifier => self.open_magnifier_dialog(),
+            MenuCommand::OptionsPerformanceCache => self.open_performance_dialog(),
+            MenuCommand::OptionsClearRuntimeCaches => self.clear_runtime_caches(),
+            MenuCommand::OptionsAdvancedSettings => self.open_advanced_options_dialog(),
+            MenuCommand::HelpAbout => self.open_about_window(),
+        }
+    }
+
+    fn command_palette_group_order(group: &str) -> usize {
+        match group {
+            "File" => 0,
+            "Edit" => 1,
+            "Image" => 2,
+            "View" => 3,
+            "Options" => 4,
+            "Help" => 5,
+            _ => usize::MAX,
+        }
+    }
+
+    fn fuzzy_match_score(query: &str, haystack: &str) -> Option<i32> {
+        let query_chars: Vec<char> = query
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect();
+        if query_chars.is_empty() {
+            return Some(0);
+        }
+
+        let haystack_chars: Vec<char> =
+            haystack.chars().map(|ch| ch.to_ascii_lowercase()).collect();
+        let mut query_index = 0usize;
+        let mut score = 0i32;
+        let mut previous_match: Option<usize> = None;
+
+        for (index, hay_char) in haystack_chars.iter().enumerate() {
+            if query_index >= query_chars.len() {
+                break;
+            }
+            if *hay_char == query_chars[query_index] {
+                score += 10;
+                if let Some(previous) = previous_match {
+                    if index == previous + 1 {
+                        score += 14;
+                    } else if index <= previous + 3 {
+                        score += 4;
+                    }
+                }
+                if index == 0 || !haystack_chars[index - 1].is_ascii_alphanumeric() {
+                    score += 8;
+                }
+                previous_match = Some(index);
+                query_index += 1;
+            }
+        }
+
+        if query_index != query_chars.len() {
+            return None;
+        }
+
+        let density_penalty =
+            (haystack_chars.len().saturating_sub(query_chars.len()) as i32).min(40);
+        Some(score - density_penalty)
+    }
+
+    fn collect_command_palette_entries(&self, ctx: &egui::Context) -> Vec<CommandPaletteEntry> {
+        // Keep this list in sync with all menu-bar commands so new items automatically show up in
+        // the command palette.
+        let mut entries = Vec::with_capacity(96);
+        let mut push = |group: &'static str,
+                        title: &str,
+                        shortcut: Option<ShortcutAction>,
+                        command: MenuCommand,
+                        aliases: &[&str]| {
+            let mut search_blob = format!(
+                "{} {}",
+                group.to_ascii_lowercase(),
+                title.to_ascii_lowercase()
+            );
+            for alias in aliases {
+                search_blob.push(' ');
+                search_blob.push_str(alias);
+            }
+            let enabled = self.is_menu_command_enabled(&command);
+            entries.push(CommandPaletteEntry {
+                group,
+                title: title.to_owned(),
+                shortcut: shortcut.and_then(|action| shortcut_text(ctx, action)),
+                search_blob,
+                enabled,
+                command,
+            });
+        };
+
+        push(
+            "File",
+            "Open...",
+            Some(ShortcutAction::Open),
+            MenuCommand::FileOpen,
+            &["load", "file", "browse"],
+        );
+        push(
+            "File",
+            "Save",
+            Some(ShortcutAction::Save),
+            MenuCommand::FileSave,
+            &["write", "export"],
+        );
+        push(
+            "File",
+            "Save As...",
+            Some(ShortcutAction::SaveAs),
+            MenuCommand::FileSaveAs,
+            &["duplicate", "export"],
+        );
+        push(
+            "File",
+            "Save with options...",
+            None,
+            MenuCommand::FileSaveWithOptions,
+            &["save", "format", "metadata"],
+        );
+        push(
+            "File",
+            "Lossless JPEG transform...",
+            None,
+            MenuCommand::FileLosslessJpegTransform,
+            &["jpegtran", "rotate", "flip"],
+        );
+        push(
+            "File",
+            "Change EXIF date/time...",
+            None,
+            MenuCommand::FileChangeExifDateTime,
+            &["metadata", "timestamp", "capture"],
+        );
+        push(
+            "File",
+            "Convert color profile...",
+            None,
+            MenuCommand::FileConvertColorProfile,
+            &["icc", "icm", "color"],
+        );
+        push(
+            "File",
+            "Rename current...",
+            None,
+            MenuCommand::FileRenameCurrent,
+            &["rename", "file"],
+        );
+        push(
+            "File",
+            "Copy current to folder...",
+            None,
+            MenuCommand::FileCopyCurrentToFolder,
+            &["copy", "file"],
+        );
+        push(
+            "File",
+            "Move current to folder...",
+            None,
+            MenuCommand::FileMoveCurrentToFolder,
+            &["move", "file"],
+        );
+        push(
+            "File",
+            "Delete current...",
+            None,
+            MenuCommand::FileDeleteCurrent,
+            &["delete", "remove"],
+        );
+        push(
+            "File",
+            "Batch convert / rename...",
+            None,
+            MenuCommand::FileBatchConvertRename,
+            &["batch", "convert", "rename"],
+        );
+        push(
+            "File",
+            "Run automation script...",
+            None,
+            MenuCommand::FileRunAutomationScript,
+            &["batch", "script", "json"],
+        );
+        push(
+            "File",
+            "Batch scan/import...",
+            None,
+            MenuCommand::FileBatchScanImport,
+            &["scan", "import"],
+        );
+        push(
+            "File",
+            "Screenshot capture...",
+            None,
+            MenuCommand::FileScreenshotCapture,
+            &["capture", "screen"],
+        );
+        push(
+            "File",
+            "OCR...",
+            None,
+            MenuCommand::FileOcr,
+            &["text", "recognition"],
+        );
+        push(
+            "File",
+            "Print current...",
+            None,
+            MenuCommand::FilePrintCurrent,
+            &["print", "paper"],
+        );
+        push(
+            "File",
+            "Search files...",
+            None,
+            MenuCommand::FileSearchFiles,
+            &["search", "find", "folder"],
+        );
+        push(
+            "File",
+            "Multipage TIFF...",
+            None,
+            MenuCommand::FileMultipageTiff,
+            &["tiff", "pages"],
+        );
+        push(
+            "File",
+            "Create multipage PDF...",
+            None,
+            MenuCommand::FileCreateMultipagePdf,
+            &["pdf", "pages", "export"],
+        );
+        push(
+            "File",
+            "Export contact sheet...",
+            None,
+            MenuCommand::FileExportContactSheet,
+            &["sheet", "thumbnails", "export"],
+        );
+        push(
+            "File",
+            "Export HTML gallery...",
+            None,
+            MenuCommand::FileExportHtmlGallery,
+            &["html", "gallery", "export"],
+        );
+        push(
+            "File",
+            "Exit",
+            None,
+            MenuCommand::FileExit,
+            &["quit", "close"],
+        );
+
+        push(
+            "Edit",
+            "Undo",
+            Some(ShortcutAction::Undo),
+            MenuCommand::EditUndo,
+            &["history", "revert"],
+        );
+        push(
+            "Edit",
+            "Redo",
+            Some(ShortcutAction::Redo),
+            MenuCommand::EditRedo,
+            &["history", "repeat"],
+        );
+        push(
+            "Edit",
+            "Rotate left",
+            None,
+            MenuCommand::EditRotateLeft,
+            &["rotate"],
+        );
+        push(
+            "Edit",
+            "Rotate right",
+            None,
+            MenuCommand::EditRotateRight,
+            &["rotate"],
+        );
+        push(
+            "Edit",
+            "Flip horizontal",
+            None,
+            MenuCommand::EditFlipHorizontal,
+            &["mirror"],
+        );
+        push(
+            "Edit",
+            "Flip vertical",
+            None,
+            MenuCommand::EditFlipVertical,
+            &["mirror"],
+        );
+        push(
+            "Edit",
+            "Resize / resample...",
+            None,
+            MenuCommand::EditResizeResample,
+            &["scale", "dimensions"],
+        );
+        push(
+            "Edit",
+            "Crop...",
+            None,
+            MenuCommand::EditCrop,
+            &["crop", "selection"],
+        );
+        push(
+            "Edit",
+            "Color corrections...",
+            None,
+            MenuCommand::EditColorCorrections,
+            &["color", "brightness", "contrast"],
+        );
+        push(
+            "Edit",
+            "Add border / frame...",
+            None,
+            MenuCommand::EditBorderFrame,
+            &["border", "frame", "canvas"],
+        );
+        push(
+            "Edit",
+            "Canvas size...",
+            None,
+            MenuCommand::EditCanvasSize,
+            &["canvas", "resize"],
+        );
+        push(
+            "Edit",
+            "Fine rotation...",
+            None,
+            MenuCommand::EditFineRotation,
+            &["rotation", "angle"],
+        );
+        push(
+            "Edit",
+            "Text tool...",
+            None,
+            MenuCommand::EditTextTool,
+            &["text", "annotate"],
+        );
+        push(
+            "Edit",
+            "Shape tool...",
+            None,
+            MenuCommand::EditShapeTool,
+            &["shape", "annotate"],
+        );
+        push(
+            "Edit",
+            "Overlay / watermark...",
+            None,
+            MenuCommand::EditOverlayWatermark,
+            &["overlay", "watermark"],
+        );
+        push(
+            "Edit",
+            "Selection workflows...",
+            None,
+            MenuCommand::EditSelectionWorkflows,
+            &["selection", "mask", "workflow"],
+        );
+        push(
+            "Edit",
+            "Replace color...",
+            None,
+            MenuCommand::EditReplaceColor,
+            &["replace", "color"],
+        );
+        push(
+            "Edit",
+            "Alpha tools...",
+            None,
+            MenuCommand::EditAlphaTools,
+            &["alpha", "transparency"],
+        );
+        push(
+            "Edit",
+            "Effects...",
+            None,
+            MenuCommand::EditEffects,
+            &["filters", "effects"],
+        );
+        push(
+            "Edit",
+            "Perspective correction...",
+            None,
+            MenuCommand::EditPerspectiveCorrection,
+            &["perspective", "keystone"],
+        );
+
+        push(
+            "Image",
+            "Previous image",
+            Some(ShortcutAction::PreviousImage),
+            MenuCommand::ImagePrevious,
+            &["prev", "back"],
+        );
+        push(
+            "Image",
+            "Next image",
+            Some(ShortcutAction::NextImage),
+            MenuCommand::ImageNext,
+            &["next", "forward"],
+        );
+        push(
+            "Image",
+            "Zoom in",
+            Some(ShortcutAction::ZoomIn),
+            MenuCommand::ImageZoomIn,
+            &["scale", "magnify"],
+        );
+        push(
+            "Image",
+            "Zoom out",
+            Some(ShortcutAction::ZoomOut),
+            MenuCommand::ImageZoomOut,
+            &["scale", "shrink"],
+        );
+        push(
+            "Image",
+            "Fit to window",
+            Some(ShortcutAction::Fit),
+            MenuCommand::ImageFitToWindow,
+            &["fit", "autosize"],
+        );
+        push(
+            "Image",
+            "Actual size",
+            Some(ShortcutAction::ActualSize),
+            MenuCommand::ImageActualSize,
+            &["100%", "native"],
+        );
+        let slideshow_label = if self.slideshow_running {
+            "Stop slideshow"
+        } else {
+            "Start slideshow"
+        };
+        push(
+            "Image",
+            slideshow_label,
+            None,
+            MenuCommand::ImageToggleSlideshow,
+            &["slideshow", "space", "playback"],
+        );
+        push(
+            "Image",
+            "Load compare image...",
+            None,
+            MenuCommand::ImageLoadCompare,
+            &["compare", "diff"],
+        );
+        push(
+            "Image",
+            "Toggle compare mode",
+            None,
+            MenuCommand::ImageToggleCompareMode,
+            &["compare", "toggle"],
+        );
+        push(
+            "Image",
+            "Panorama stitch...",
+            None,
+            MenuCommand::ImagePanoramaStitch,
+            &["panorama", "stitch"],
+        );
+
+        let status_bar_label = if self.state.show_status_bar() {
+            "Show status bar (on)"
+        } else {
+            "Show status bar (off)"
+        };
+        let toolbar_label = if self.state.show_toolbar() {
+            "Show toolbar (on)"
+        } else {
+            "Show toolbar (off)"
+        };
+        let metadata_label = if self.state.show_metadata_panel() {
+            "Metadata panel (on)"
+        } else {
+            "Metadata panel (off)"
+        };
+        let strip_label = if self.state.show_thumbnail_strip() {
+            "Thumbnail strip (on)"
+        } else {
+            "Thumbnail strip (off)"
+        };
+        let thumbnail_window_label = if self.state.thumbnails_window_mode() {
+            "Thumbnail window (on)"
+        } else {
+            "Thumbnail window (off)"
+        };
+        push(
+            "View",
+            "Command palette...",
+            Some(ShortcutAction::CommandPalette),
+            MenuCommand::ViewCommandPalette,
+            &["commands", "actions", "search"],
+        );
+        push(
+            "View",
+            status_bar_label,
+            None,
+            MenuCommand::ViewToggleStatusBar,
+            &["toggle", "status", "bar"],
+        );
+        push(
+            "View",
+            toolbar_label,
+            None,
+            MenuCommand::ViewToggleToolbar,
+            &["toggle", "toolbar"],
+        );
+        push(
+            "View",
+            metadata_label,
+            None,
+            MenuCommand::ViewToggleMetadataPanel,
+            &["toggle", "metadata"],
+        );
+        push(
+            "View",
+            strip_label,
+            None,
+            MenuCommand::ViewToggleThumbnailStrip,
+            &["toggle", "thumbnails", "strip"],
+        );
+        push(
+            "View",
+            thumbnail_window_label,
+            None,
+            MenuCommand::ViewToggleThumbnailWindow,
+            &["toggle", "thumbnails", "window"],
+        );
+        push(
+            "View",
+            "Zoom magnifier...",
+            None,
+            MenuCommand::ViewZoomMagnifier,
+            &["magnifier", "loupe", "zoom"],
+        );
+
+        push(
+            "Options",
+            "Performance / cache...",
+            None,
+            MenuCommand::OptionsPerformanceCache,
+            &["performance", "cache", "memory"],
+        );
+        push(
+            "Options",
+            "Clear runtime caches",
+            None,
+            MenuCommand::OptionsClearRuntimeCaches,
+            &["clear", "cache", "memory"],
+        );
+        push(
+            "Options",
+            "Advanced settings...",
+            None,
+            MenuCommand::OptionsAdvancedSettings,
+            &["advanced", "settings", "preferences"],
+        );
+
+        push(
+            "Help",
+            "About ImranView",
+            None,
+            MenuCommand::HelpAbout,
+            &["about", "version", "credits"],
+        );
+
+        drop(push);
+
+        for path in self.state.recent_files().iter().take(RECENT_MENU_LIMIT) {
+            let label = format!("Recent file: {}", format_recent_file_label(path));
+            let mut search_blob = format!("file recent {}", label.to_ascii_lowercase());
+            search_blob.push(' ');
+            search_blob.push_str(&path.display().to_string().to_ascii_lowercase());
+            let command = MenuCommand::FileOpenRecent(path.clone());
+            let enabled = self.is_menu_command_enabled(&command);
+            entries.push(CommandPaletteEntry {
+                group: "File",
+                title: label,
+                shortcut: None,
+                search_blob,
+                enabled,
+                command,
+            });
+        }
+        for path in self
+            .state
+            .recent_directories()
+            .iter()
+            .take(RECENT_MENU_LIMIT)
+        {
+            let label = format!("Recent folder: {}", format_recent_folder_label(path));
+            let mut search_blob = format!("file recent folder {}", label.to_ascii_lowercase());
+            search_blob.push(' ');
+            search_blob.push_str(&path.display().to_string().to_ascii_lowercase());
+            let command = MenuCommand::FileOpenRecentFolder(path.clone());
+            let enabled = self.is_menu_command_enabled(&command);
+            entries.push(CommandPaletteEntry {
+                group: "File",
+                title: label,
+                shortcut: None,
+                search_blob,
+                enabled,
+                command,
+            });
+        }
+
+        entries
+    }
+
+    fn draw_command_palette(&mut self, ctx: &egui::Context) {
+        if !self.command_palette.open {
+            return;
+        }
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.command_palette.open = false;
+            self.command_palette.query.clear();
+            self.command_palette.selected_index = 0;
+            return;
+        }
+
+        let entries = self.collect_command_palette_entries(ctx);
+        let query = self.command_palette.query.trim().to_ascii_lowercase();
+        let mut visible = Vec::with_capacity(entries.len());
+        if query.is_empty() {
+            for index in 0..entries.len() {
+                visible.push((index, 0i32));
+            }
+        } else {
+            for (index, entry) in entries.iter().enumerate() {
+                if let Some(score) = Self::fuzzy_match_score(&query, &entry.search_blob) {
+                    visible.push((index, score));
+                }
+            }
+        }
+        visible.sort_by(|left, right| {
+            let left_entry = &entries[left.0];
+            let right_entry = &entries[right.0];
+            Self::command_palette_group_order(left_entry.group)
+                .cmp(&Self::command_palette_group_order(right_entry.group))
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        if visible.len() > COMMAND_PALETTE_MAX_VISIBLE {
+            visible.truncate(COMMAND_PALETTE_MAX_VISIBLE);
+        }
+        if visible.is_empty() {
+            self.command_palette.selected_index = 0;
+        } else if self.command_palette.selected_index >= visible.len() {
+            self.command_palette.selected_index = visible.len().saturating_sub(1);
+        }
+
+        if !visible.is_empty()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+        {
+            self.command_palette.selected_index =
+                (self.command_palette.selected_index + 1).min(visible.len().saturating_sub(1));
+        }
+        if !visible.is_empty()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+        {
+            self.command_palette.selected_index =
+                self.command_palette.selected_index.saturating_sub(1);
+        }
+        if !visible.is_empty()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown))
+        {
+            self.command_palette.selected_index =
+                (self.command_palette.selected_index + 10).min(visible.len().saturating_sub(1));
+        }
+        if !visible.is_empty()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp))
+        {
+            self.command_palette.selected_index =
+                self.command_palette.selected_index.saturating_sub(10);
+        }
+
+        let mut execute_command = if !visible.is_empty()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        {
+            let entry_index = visible[self.command_palette.selected_index].0;
+            let entry = &entries[entry_index];
+            if entry.enabled {
+                Some(entry.command.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let viewport_rect = ctx
+            .input(|i| i.viewport().inner_rect)
+            .unwrap_or_else(|| ctx.input(|i| i.screen_rect()));
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("command-palette-backdrop"),
+        ));
+        painter.rect_filled(viewport_rect, 0.0, egui::Color32::from_black_alpha(72));
+
+        let panel_width = COMMAND_PALETTE_PANEL_WIDTH
+            .min((viewport_rect.width() - 28.0).max(420.0))
+            .max(420.0);
+        egui::Area::new(egui::Id::new("command-palette-panel"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 28.0))
+            .show(ctx, |ui| {
+                let frame = egui::Frame::new()
+                    .fill(ui.visuals().window_fill)
+                    .stroke(ui.visuals().window_stroke)
+                    .corner_radius(egui::CornerRadius::same(platform_window_corner_radius()))
+                    .shadow(ui.visuals().window_shadow)
+                    .inner_margin(egui::Margin::symmetric(12, 10));
+                frame.show(ui, |ui| {
+                    ui.set_min_width(panel_width);
+                    ui.set_max_width(panel_width);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Command Palette").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(shortcut) =
+                                shortcut_text(ctx, ShortcutAction::CommandPalette)
+                            {
+                                ui.label(egui::RichText::new(shortcut).small().weak());
+                            }
+                        });
+                    });
+                    let query_response = ui.add(
+                        egui::TextEdit::singleline(&mut self.command_palette.query)
+                            .hint_text("Type a command...")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if self.command_palette.request_focus {
+                        query_response.request_focus();
+                        self.command_palette.request_focus = false;
+                    }
+                    if query_response.changed() {
+                        self.command_palette.selected_index = 0;
+                    }
+                    ui.separator();
+
+                    let list_height = COMMAND_PALETTE_PANEL_MAX_HEIGHT
+                        .min((viewport_rect.height() - 120.0).max(180.0));
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .max_height(list_height)
+                        .show(ui, |ui| {
+                            if visible.is_empty() {
+                                ui.label("No matching commands");
+                                return;
+                            }
+
+                            let mut last_group: Option<&str> = None;
+                            for (visible_index, (entry_index, _score)) in visible.iter().enumerate()
+                            {
+                                let entry = &entries[*entry_index];
+                                if last_group != Some(entry.group) {
+                                    if last_group.is_some() {
+                                        ui.add_space(6.0);
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(entry.group)
+                                            .small()
+                                            .strong()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                    last_group = Some(entry.group);
+                                }
+
+                                let selected = visible_index == self.command_palette.selected_index;
+                                let mut title = entry.title.clone();
+                                if !entry.enabled {
+                                    title.push_str(" (Unavailable)");
+                                }
+                                let response = ui
+                                    .horizontal(|ui| {
+                                        let response = ui.selectable_label(selected, title);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if let Some(shortcut) = &entry.shortcut {
+                                                    ui.label(
+                                                        egui::RichText::new(shortcut)
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                        response
+                                    })
+                                    .inner;
+
+                                if response.hovered() {
+                                    self.command_palette.selected_index = visible_index;
+                                }
+                                if response.clicked() && entry.enabled {
+                                    execute_command = Some(entry.command.clone());
+                                }
+                                if selected {
+                                    ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
+                                }
+                            }
+                        });
+                });
+            });
+
+        if let Some(command) = execute_command {
+            self.run_menu_command(ctx, command.clone());
+            if self.command_palette.open && !matches!(command, MenuCommand::ViewCommandPalette) {
+                self.command_palette.open = false;
+                self.command_palette.query.clear();
+                self.command_palette.selected_index = 0;
+                self.command_palette.request_focus = false;
+            }
+        }
+    }
+
     fn run_shortcuts(&mut self, ctx: &egui::Context) {
+        if shortcuts::trigger(ctx, ShortcutAction::CommandPalette) {
+            self.toggle_command_palette();
+        }
+        if self.command_palette.open {
+            return;
+        }
+
         if shortcuts::trigger(ctx, ShortcutAction::SaveAs) {
             self.open_save_as_dialog();
         } else if shortcuts::trigger(ctx, ShortcutAction::Save) {
@@ -2740,7 +3870,8 @@ impl ImranViewApp {
 
     fn undo_edit(&mut self, ctx: &egui::Context) {
         if self.pending.edit_inflight {
-            self.state.set_error("wait for current edit to finish before undo");
+            self.state
+                .set_error("wait for current edit to finish before undo");
             return;
         }
         if let Err(err) = self.state.undo_edit() {
@@ -2752,7 +3883,8 @@ impl ImranViewApp {
 
     fn redo_edit(&mut self, ctx: &egui::Context) {
         if self.pending.edit_inflight {
-            self.state.set_error("wait for current edit to finish before redo");
+            self.state
+                .set_error("wait for current edit to finish before redo");
             return;
         }
         if let Err(err) = self.state.redo_edit() {
@@ -2915,7 +4047,11 @@ impl ImranViewApp {
             }
             points.push([x, y]);
         }
-        if points.len() >= 3 { Some(points) } else { None }
+        if points.len() >= 3 {
+            Some(points)
+        } else {
+            None
+        }
     }
 
     fn open_replace_color_dialog(&mut self) {
@@ -3624,15 +4760,7 @@ impl ImranViewApp {
                 }
                 NativeMenuAction::BatchConvert => self.open_batch_dialog(),
                 NativeMenuAction::RunAutomationScript => {
-                    let mut dialog =
-                        rfd::FileDialog::new().set_title("Run batch automation script");
-                    if let Some(directory) = self.state.preferred_open_directory() {
-                        dialog = dialog.set_directory(directory);
-                    }
-                    dialog = dialog.add_filter("JSON", &["json"]);
-                    if let Some(path) = dialog.pick_file() {
-                        self.dispatch_batch_script(path);
-                    }
+                    self.open_batch_script_picker_and_dispatch()
                 }
                 NativeMenuAction::BatchScan => self.open_batch_scan_dialog(),
                 NativeMenuAction::ScreenshotCapture => self.open_screenshot_dialog(),
@@ -3675,6 +4803,7 @@ impl ImranViewApp {
                 NativeMenuAction::Effects => self.open_effects_dialog(),
                 NativeMenuAction::PerspectiveCorrection => self.open_perspective_dialog(),
                 NativeMenuAction::PanoramaStitch => self.open_panorama_dialog(),
+                NativeMenuAction::CommandPalette => self.open_command_palette(),
                 NativeMenuAction::ToggleShowToolbar => {
                     self.state.set_show_toolbar(!self.state.show_toolbar());
                     self.persist_settings();
@@ -3935,15 +5064,7 @@ impl ImranViewApp {
                             ui.close_menu();
                         }
                         if ui.button("Run automation script...").clicked() {
-                            let mut dialog =
-                                rfd::FileDialog::new().set_title("Run batch automation script");
-                            if let Some(directory) = self.state.preferred_open_directory() {
-                                dialog = dialog.set_directory(directory);
-                            }
-                            dialog = dialog.add_filter("JSON", &["json"]);
-                            if let Some(path) = dialog.pick_file() {
-                                self.dispatch_batch_script(path);
-                            }
+                            self.open_batch_script_picker_and_dispatch();
                             ui.close_menu();
                         }
                         if ui.button("Batch scan/import...").clicked() {
@@ -4411,6 +5532,18 @@ impl ImranViewApp {
                     });
 
                     ui.menu_button("View", |ui| {
+                        if ui
+                            .button(menu_item_label(
+                                ctx,
+                                ShortcutAction::CommandPalette,
+                                "Command palette...",
+                            ))
+                            .clicked()
+                        {
+                            self.open_command_palette();
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         let mut show_status_bar = self.state.show_status_bar();
                         if ui
                             .checkbox(&mut show_status_bar, "Show status bar")
@@ -5949,13 +7082,13 @@ impl ImranViewApp {
                         app.selection_workflow_dialog.workflow,
                         SelectionWorkflow::CropPolygon | SelectionWorkflow::CutOutsidePolygon
                     ) {
-                        match Self::parse_polygon_points(&app.selection_workflow_dialog.polygon_points)
-                        {
+                        match Self::parse_polygon_points(
+                            &app.selection_workflow_dialog.polygon_points,
+                        ) {
                             Some(points) => points,
                             None => {
-                                app.state.set_error(
-                                    "invalid polygon points (expected: x,y; x,y; x,y)",
-                                );
+                                app.state
+                                    .set_error("invalid polygon points (expected: x,y; x,y; x,y)");
                                 return;
                             }
                         }
@@ -6036,7 +7169,11 @@ impl ImranViewApp {
             |app, _ctx, ui, open_state| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Mode");
-                    ui.selectable_value(&mut app.alpha_dialog.mode, AlphaToolMode::Global, "Global");
+                    ui.selectable_value(
+                        &mut app.alpha_dialog.mode,
+                        AlphaToolMode::Global,
+                        "Global",
+                    );
                     ui.selectable_value(
                         &mut app.alpha_dialog.mode,
                         AlphaToolMode::Brush,
@@ -7364,7 +8501,8 @@ impl ImranViewApp {
                     } else {
                         let path = PathBuf::from(app.lossless_jpeg_dialog.output_path.trim());
                         if path.as_os_str().is_empty() {
-                            app.state.set_error("output path is required when not in-place");
+                            app.state
+                                .set_error("output path is required when not in-place");
                             return;
                         }
                         Some(path)
@@ -7493,7 +8631,8 @@ impl ImranViewApp {
                         ui.label("Output");
                         ui.text_edit_singleline(&mut app.color_profile_dialog.output_path);
                         if ui.button("Pick...").clicked() {
-                            let mut dialog = rfd::FileDialog::new().set_title("Color profile output");
+                            let mut dialog =
+                                rfd::FileDialog::new().set_title("Color profile output");
                             if let Some(directory) = app.state.preferred_open_directory() {
                                 dialog = dialog.set_directory(directory);
                             }
@@ -7520,7 +8659,8 @@ impl ImranViewApp {
                     } else {
                         let output = PathBuf::from(app.color_profile_dialog.output_path.trim());
                         if output.as_os_str().is_empty() {
-                            app.state.set_error("output path is required when not in-place");
+                            app.state
+                                .set_error("output path is required when not in-place");
                             return;
                         }
                         output
@@ -8429,6 +9569,7 @@ impl eframe::App for ImranViewApp {
         self.draw_advanced_options_dialog(ctx);
         self.draw_delete_confirmation(ctx);
         self.draw_about_window(ctx);
+        self.draw_command_palette(ctx);
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.state.window_title()));
 
