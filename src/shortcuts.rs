@@ -5,6 +5,8 @@ pub enum ShortcutAction {
     Open,
     Save,
     SaveAs,
+    Undo,
+    Redo,
     PreviousImage,
     NextImage,
     ZoomIn,
@@ -33,6 +35,18 @@ pub fn trigger(ctx: &egui::Context, action: ShortcutAction) -> bool {
                 egui::Key::S,
             ))
         }),
+        ShortcutAction::Undo => ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::Z,
+            ))
+        }),
+        ShortcutAction::Redo => ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            ))
+        }),
         ShortcutAction::PreviousImage => ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)),
         ShortcutAction::NextImage => ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)),
         ShortcutAction::ZoomIn => {
@@ -57,6 +71,14 @@ pub fn menu_item_label(ctx: &egui::Context, action: ShortcutAction, title: &str)
         ShortcutAction::SaveAs => Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
             egui::Key::S,
+        )),
+        ShortcutAction::Undo => Some(egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND,
+            egui::Key::Z,
+        )),
+        ShortcutAction::Redo => Some(egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::Z,
         )),
         ShortcutAction::PreviousImage => Some(egui::KeyboardShortcut::new(
             egui::Modifiers::NONE,

@@ -84,7 +84,7 @@ Implemented:
 - Dedicated thumbnail window mode with folder panel (path/siblings/subfolders) and adaptive grid.
 - Classic shell structure: menu, toolbar, black canvas, segmented status bar.
 - Read-only metadata side panel with viewer/file details.
-- macOS native app menu integration with in-window fallback.
+- Native app menu integration on macOS/Windows/Linux (via `muda`) with automatic fallback to in-window menu when native install is unavailable.
 - OSS toolbar icons (Tabler, MIT).
 - Save and Save As flows.
 - Save dialog with output format/quality options and metadata policy controls.
@@ -92,6 +92,9 @@ Implemented:
 - Resize/resample dialog + operation with interpolation choices.
 - Crop dialog + operation.
 - Basic color corrections dialog (brightness/contrast/gamma/saturation/grayscale).
+- Border/frame dialog + operation (custom side widths + color).
+- Canvas size dialog + operation (anchor + fill color, no resample).
+- Fine rotation dialog + operation (arbitrary angle, bilinear/nearest, optional canvas expansion).
 - Centralized shortcut map shared by menu labels and keyboard handlers.
 - Recent files and recent folders menu integration with persisted history.
 - Basic slideshow mode (`Space` start/stop, `Esc` stop, configurable interval).
@@ -107,6 +110,28 @@ Implemented:
 - Print current-image workflow.
 - Internal plugin extension host API (plugin events + plugin menu surface).
 - Runtime performance/cache settings (configurable cache caps + cache reset).
+- File-search workflow (folder-scoped search by name with extension filters).
+- Text tool and shape drawing workflows.
+- Overlay/watermark workflow.
+- Advanced selection workflows (rect/circle/polygon crop and cut-outside) and replace-color workflow.
+- Alpha and effects workflows (expanded toolset + presets).
+- Screenshot capture utility workflow.
+- Multipage TIFF preview/extract and multipage PDF creation workflow.
+- OCR workflow (external `tesseract` backend).
+- Panorama stitch workflow (lightweight overlap blend).
+- Perspective correction workflow and zoom magnifier tool.
+- Contact-sheet export and HTML gallery export workflows.
+- Advanced options/settings dialog surface.
+- Batch preset import/export workflow (JSON macro baseline).
+- Batch automation runtime for multi-job JSON scripts (`jobs[]`, `continue_on_error`).
+- Scanner-command capture mode in batch scan workflow (`{output}`/`{index}` placeholders).
+- Effects presets including natural/vintage/dramatic/noir/tilt-shift/stained-glass variants.
+- Region-scoped alpha editing and richer effect controls (emboss, edge-enhance, oil-paint style).
+- Render-side advanced option wiring (checkerboard background, smoothing, display gamma simulation, overwrite confirmation, configurable zoom step, configurable wrap navigation).
+- ICC profile conversion utility workflow (external `magick` backend).
+- Undo/redo non-destructive edit history stack.
+- Lossless JPEG transform workflow + EXIF date/time editing workflow.
+- Expanded advanced settings tabs (Browsing/Zoom/Video/Language/Skins/Plugins/Misc).
 - Startup/open/save/edit performance timing logs.
 - Perf gate script to fail runs when timing warnings exceed thresholds.
 - CI workflow that runs check/test and fails on perf-gate warnings.
@@ -116,14 +141,16 @@ Implemented:
 
 Partial:
 - Metadata preservation is best-effort and currently strongest on JPEG output paths.
+- Linux native menu-bar integration depends on runtime backend support; app falls back to in-window menu when native install is unavailable.
+- OCR depends on external `tesseract` availability.
+- Panorama stitching is a fast linear blend implementation, not feature-aligned seam finding.
+- Color management supports display-gamma simulation plus external-tool ICC conversion utility; full in-engine ICC transforms remain pending.
+- Scanner workflow currently depends on external scanner CLI commands (not full native TWAIN/WIA/SANE integrations).
+- Batch automation supports multi-job JSON scripts and presets/macros, not a full DSL/scripting engine.
+- Effects/alpha/options surfaces cover broad controls + presets, but not full deep-editor parity.
 
 Missing:
-- Advanced drawing/edit overlays: text, shapes, border/frame, overlay/watermark, canvas size.
-- Advanced pixel/selection operations: fine rotation, round/custom selection workflows, replace color, alpha-layer editing.
-- Effects and stylization stack: effect presets and stronger filter catalog.
-- Productivity tooling parity: screenshot capture, file search, multipage workflows, contact sheet/HTML export.
-- Advanced utility workflows: OCR, panorama stitching, perspective correction, zoom magnifier.
-- Settings-surface parity: richer options pages (color management, file handling, viewing/editing/fullscreen profiles).
+- Full ICC color-management pipeline (profile assignment/conversion and rendering intents).
 
 ## 7) Performance budgets (lightweight contract)
 
@@ -189,28 +216,34 @@ Legend:
 | F-026 | Background command execution pipeline | P0 | Done | Open/save/edit/thumbnail work dispatched to worker threads |
 | F-027 | Bounded cache and memory governor | P0 | Done | Byte-budget + count-budget eviction on preload/thumb caches |
 | F-028 | Automated performance regression gate | P0 | Done | CI fails on perf warnings via perf-gate script |
-| F-029 | Add text tool | P1 | Missing | Font, color, stroke, and placement controls |
-| F-030 | Draw shapes toolset | P1 | Missing | Rect/ellipse/arrow/line + fill/stroke/shadow controls |
-| F-031 | Add border/frame | P1 | Missing | Inner/outer border and frame presets |
-| F-032 | Add overlay/watermark | P1 | Missing | Image/text overlays with opacity and anchor controls |
-| F-033 | Canvas size dialog | P1 | Missing | Extend/crop canvas without resampling image content |
-| F-034 | Fine rotation (arbitrary angle) | P1 | Missing | Angle + interpolation/background fill options |
-| F-035 | Advanced selection workflows | P1 | Missing | Round/custom selection, cut-outside, selection crop |
-| F-036 | Replace color tool | P1 | Missing | Source/target color + tolerance previews |
-| F-037 | Alpha layer editing | P1 | Missing | Alpha inspection and edit operations |
-| F-038 | Effects dialog and filter stack | P2 | Missing | Broader effect catalog with preview |
-| F-039 | Screenshot capture dialog | P2 | Missing | Delay/region/window capture flow |
-| F-040 | Search files workflow | P2 | Missing | Folder-scoped file search with filters |
-| F-041 | Multipage TIFF preview | P2 | Missing | Page navigation and extract/export actions |
-| F-042 | Multipage PDF creation | P2 | Missing | Compose ordered image set to PDF |
-| F-043 | Batch scan workflow | P2 | Missing | Scanner-to-batch pipeline integration |
-| F-044 | OCR workflow | P2 | Missing | Text extraction to clipboard/file |
-| F-045 | Panorama stitch workflow | P2 | Missing | Multi-image alignment + export |
-| F-046 | Perspective correction tool | P2 | Missing | Corner handles and transform preview |
-| F-047 | Zoom magnifier tool | P2 | Missing | Lens zoom and sampling controls |
-| F-048 | Thumbnail contact sheet export | P2 | Missing | Grid export with labels and sizing |
-| F-049 | Thumbnail HTML export | P2 | Missing | Static gallery export with links |
-| F-050 | Advanced options/settings pages | P2 | Missing | Viewing/editing/fullscreen/color-management/file-handling panels |
+| F-029 | Add text tool | P1 | Done | Placement, scale, and color controls shipped |
+| F-030 | Draw shapes toolset | P1 | Done | Rect/ellipse/line/arrow + fill/stroke controls shipped |
+| F-031 | Add border/frame | P1 | Done | Custom side widths + color dialog/worker transform shipped |
+| F-032 | Add overlay/watermark | P1 | Done | Image overlay with opacity and anchor controls shipped |
+| F-033 | Canvas size dialog | P1 | Done | Anchor + fill controls; extend/crop canvas without resampling |
+| F-034 | Fine rotation (arbitrary angle) | P1 | Done | Angle + interpolation + background fill + expand-canvas controls |
+| F-035 | Advanced selection workflows | P1 | Done | Rect/circle/polygon crop + cut-outside workflows shipped |
+| F-036 | Replace color tool | P1 | Done | Source/target/tolerance workflow shipped |
+| F-037 | Alpha layer editing | P1 | Partial | Global alpha/luma alpha + rectangular region targeting shipped; brush/mask tooling still pending |
+| F-038 | Effects dialog and filter stack | P2 | Partial | Core effects + broader preset catalog (natural/vintage/dramatic/noir/tilt-shift/stained-glass) + emboss/edge/oil-paint controls shipped |
+| F-039 | Screenshot capture dialog | P2 | Done | Delay + optional region workflow shipped |
+| F-040 | Search files workflow | P2 | Done | Folder-scoped search by name with extension filters |
+| F-041 | Multipage TIFF preview | P2 | Done | Page navigation plus extraction workflow shipped |
+| F-042 | Multipage PDF creation | P2 | Done | Ordered image set to PDF workflow shipped |
+| F-043 | Batch scan workflow | P2 | Partial | Folder import + scanner-command capture mode shipped; native TWAIN/WIA/SANE backend still pending |
+| F-044 | OCR workflow | P2 | Partial | OCR workflow shipped with external `tesseract` runtime dependency |
+| F-045 | Panorama stitch workflow | P2 | Partial | Lightweight overlap-based stitch/export shipped; advanced seam finding pending |
+| F-046 | Perspective correction tool | P2 | Done | Corner-point perspective transform workflow shipped |
+| F-047 | Zoom magnifier tool | P2 | Done | Lens-style magnifier controls shipped |
+| F-048 | Thumbnail contact sheet export | P2 | Done | Grid export with optional labels shipped |
+| F-049 | Thumbnail HTML export | P2 | Done | Static gallery export shipped |
+| F-050 | Advanced options/settings pages | P2 | Partial | Advanced settings dialog shipped; deep category parity still pending |
+| F-051 | Native desktop menu integration | P1 | Partial | Native menu integration wired for macOS/Windows/Linux via `muda` with runtime fallback when native install is unavailable |
+| F-052 | Batch preset macros (JSON) | P2 | Done | Save/load batch conversion presets for repeatable runs |
+| F-053 | Render-side color preview controls | P2 | Partial | Display-gamma simulation + smoothing/checkerboard + external-tool ICC conversion workflow wired; full in-engine ICC management pending |
+| F-054 | Non-destructive edit history (undo/redo) | P1 | Done | Multi-step undo/redo stack wired into shortcuts and menus |
+| F-055 | Lossless JPEG + EXIF date utilities | P1 | Done | `jpegtran`-backed lossless transforms + `exiftool` date/time update workflow |
+| F-056 | Batch automation script runtime | P1 | Done | Multi-job JSON script execution with `continue_on_error` support |
 
 ## 9) Detailed requirements by epic
 
@@ -396,15 +429,44 @@ A feature is done only when all conditions hold:
 - [x] Implement background command queue so open/save/edit/thumbnail decode do not block UI input.
 - [x] Add full bounded thumbnail/decode cache policy with configurable limits and stronger eviction controls.
 - [x] Add CI perf smoke checks that gate on startup/open/navigation/memory thresholds.
-- [ ] Add text tool.
-- [ ] Add shape drawing toolset.
-- [ ] Add border/frame and overlay/watermark operations.
-- [ ] Add canvas size and fine-rotation dialogs.
-- [ ] Add advanced selection workflows and replace-color.
-- [ ] Add alpha-layer editing support.
-- [ ] Add effects dialog/filter stack.
-- [ ] Add screenshot capture and file-search workflows.
-- [ ] Add multipage TIFF preview + multipage PDF creation.
-- [ ] Add OCR/panorama/perspective/zoom-magnifier utilities.
-- [ ] Add thumbnail contact-sheet and HTML export.
-- [ ] Add advanced options/settings pages parity.
+- [x] Add text tool.
+- [x] Add shape drawing toolset.
+- [x] Add border/frame operation.
+- [x] Add overlay/watermark operation.
+- [x] Add canvas size and fine-rotation dialogs.
+- [x] Add advanced selection workflows and replace-color.
+- [x] Add alpha-layer editing support (core controls).
+- [x] Add effects dialog/filter stack (core set).
+- [x] Add screenshot capture workflow.
+- [x] Add file-search workflow.
+- [x] Add multipage TIFF preview + multipage PDF creation.
+- [x] Add OCR/panorama/perspective/zoom-magnifier utilities.
+- [x] Add thumbnail contact-sheet and HTML export.
+- [x] Add advanced options/settings pages parity baseline.
+- [x] Wire native menu integration on macOS/Windows/Linux with in-window fallback.
+- [x] Add scanner-command capture mode for batch scan workflow.
+- [x] Add batch preset import/export macros (JSON).
+- [x] Add effects presets including tilt-shift and stained-glass style variants.
+- [x] Add non-destructive undo/redo history stack.
+- [x] Add lossless JPEG transform + EXIF date/time edit utilities.
+- [x] Add multi-job batch automation script runtime (JSON).
+- [x] Expand advanced options tabs and wire browsing/zoom behavior.
+- [x] Expand effects and alpha workflows (dramatic/noir presets, emboss/edge/oil-paint, region alpha).
+
+## 15) Feature parity sweep (reference screenshots)
+
+Scope:
+- 70 reference feature screenshots reviewed from `docs/irfanview-screenshots/big`.
+
+Result:
+- 100% parity: No.
+- Done: 54/70
+- Partial: 13/70
+- Missing: 3/70
+- Effective parity estimate: ~77% strict (Done only), ~86% weighted (Done + 0.5 * Partial).
+
+Largest remaining gaps:
+- Full in-engine ICC color-management pipeline (profile assignment/conversion + rendering intents) without external tool dependency.
+- Linux-native menu-bar integration can still require fallback on unsupported distro/runtime backends.
+- Native scanner backend integrations (TWAIN/WIA/SANE); current mode relies on external scanner CLI commands.
+- Advanced panorama seam-finding/blending parity (current implementation remains lightweight overlap blend).

@@ -9,6 +9,7 @@ eframe = "0.31"
 egui = "0.31"
 env_logger = "0.11"
 exif = { version = "0.6", package = "kamadak-exif" }
+font8x8 = "0.3"
 image = { version = "0.25", default-features = false, features = [
     "avif",
     "bmp",
@@ -28,8 +29,16 @@ rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
+tiff = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.17"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+muda = "0.17"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 muda = "0.17"
 
 [build-dependencies]

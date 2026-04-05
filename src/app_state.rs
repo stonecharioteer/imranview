@@ -20,8 +20,6 @@ use crate::settings::{PersistedSettings, is_existing_dir};
 
 const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 16.0;
-const ZOOM_STEP_IN: f32 = 1.2;
-const ZOOM_STEP_OUT: f32 = 1.0 / ZOOM_STEP_IN;
 const THUMBNAIL_WINDOW_RADIUS_STRIP: usize = 90;
 const THUMBNAIL_DECODE_RADIUS_STRIP: usize = 12;
 const THUMBNAIL_DECODE_RADIUS_WINDOW_MODE: usize = 36;
@@ -40,6 +38,7 @@ const PRELOAD_CACHE_ENTRY_CAP_MIN: usize = 1;
 const PRELOAD_CACHE_ENTRY_CAP_MAX: usize = 64;
 const PRELOAD_CACHE_MAX_MB_MIN: usize = 32;
 const PRELOAD_CACHE_MAX_MB_MAX: usize = 2048;
+const EDIT_HISTORY_CAP: usize = 48;
 
 #[derive(Clone)]
 pub struct ThumbnailEntry {
@@ -85,6 +84,8 @@ pub struct AppState {
     images_in_directory: Vec<PathBuf>,
     current_index: Option<usize>,
     current_image: Option<LoadedImageState>,
+    undo_stack: Vec<LoadedImageState>,
+    redo_stack: Vec<LoadedImageState>,
     zoom_mode: ZoomMode,
     show_toolbar: bool,
     show_status_bar: bool,
@@ -129,6 +130,8 @@ impl AppState {
             images_in_directory: Vec::new(),
             current_index: None,
             current_image: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             zoom_mode: ZoomMode::Fit,
             show_toolbar: settings.show_toolbar,
             show_status_bar: settings.show_status_bar,
@@ -191,6 +194,23 @@ impl AppState {
                 .as_ref()
                 .filter(|path| is_existing_dir(path))
                 .cloned(),
+            checkerboard_background: false,
+            smooth_main_scaling: true,
+            default_jpeg_quality: 92,
+            auto_reopen_after_save: true,
+            hide_toolbar_in_fullscreen: false,
+            enable_color_management: false,
+            simulate_srgb_output: true,
+            display_gamma: 2.2,
+            browsing_wrap_navigation: true,
+            zoom_step_percent: 20.0,
+            video_frame_step_ms: 40,
+            ui_language: "System".to_owned(),
+            skin_name: "Classic".to_owned(),
+            plugin_search_path: String::new(),
+            keep_single_instance: true,
+            confirm_delete: true,
+            confirm_overwrite: true,
         }
     }
 
@@ -232,6 +252,8 @@ impl AppState {
         self.images_in_directory = files;
         self.current_index = current_index;
         self.current_image = Some(LoadedImageState::from_payload(payload));
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         if let Some(current_path) = self.current_file.clone() {
             push_recent_path(&mut self.recent_files, current_path);
         }
@@ -246,10 +268,54 @@ impl AppState {
     }
 
     pub fn apply_transform_payload(&mut self, payload: LoadedImagePayload) -> Result<()> {
-        if self.current_image.is_none() {
+        let Some(current) = self.current_image.clone() else {
             anyhow::bail!("no image loaded")
+        };
+        self.undo_stack.push(current);
+        if self.undo_stack.len() > EDIT_HISTORY_CAP {
+            let drop_count = self.undo_stack.len() - EDIT_HISTORY_CAP;
+            self.undo_stack.drain(0..drop_count);
         }
         self.current_image = Some(LoadedImageState::from_payload(payload));
+        self.redo_stack.clear();
+        self.last_error = None;
+        Ok(())
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn undo_edit(&mut self) -> Result<()> {
+        let Some(previous) = self.undo_stack.pop() else {
+            anyhow::bail!("nothing to undo")
+        };
+        let Some(current) = self.current_image.clone() else {
+            anyhow::bail!("no image loaded")
+        };
+        self.redo_stack.push(current);
+        self.current_image = Some(previous);
+        self.last_error = None;
+        Ok(())
+    }
+
+    pub fn redo_edit(&mut self) -> Result<()> {
+        let Some(next) = self.redo_stack.pop() else {
+            anyhow::bail!("nothing to redo")
+        };
+        let Some(current) = self.current_image.clone() else {
+            anyhow::bail!("no image loaded")
+        };
+        self.undo_stack.push(current);
+        if self.undo_stack.len() > EDIT_HISTORY_CAP {
+            let drop_count = self.undo_stack.len() - EDIT_HISTORY_CAP;
+            self.undo_stack.drain(0..drop_count);
+        }
+        self.current_image = Some(next);
         self.last_error = None;
         Ok(())
     }
@@ -264,12 +330,12 @@ impl AppState {
         self.open_adjacent("navigate_previous", -1)
     }
 
-    pub fn resolve_next_path(&self) -> Result<PathBuf> {
-        self.resolve_adjacent_path(1)
+    pub fn resolve_next_path_with_wrap(&self, wrap_navigation: bool) -> Result<PathBuf> {
+        self.resolve_adjacent_path(1, wrap_navigation)
     }
 
-    pub fn resolve_previous_path(&self) -> Result<PathBuf> {
-        self.resolve_adjacent_path(-1)
+    pub fn resolve_previous_path_with_wrap(&self, wrap_navigation: bool) -> Result<PathBuf> {
+        self.resolve_adjacent_path(-1, wrap_navigation)
     }
 
     #[cfg(test)]
@@ -307,12 +373,14 @@ impl AppState {
         }
     }
 
-    pub fn zoom_in(&mut self) {
-        self.apply_zoom_step(ZOOM_STEP_IN);
+    pub fn zoom_in_by_percent(&mut self, percent: f32) {
+        let step = zoom_step_factor(percent);
+        self.apply_zoom_step(1.0 + step);
     }
 
-    pub fn zoom_out(&mut self) {
-        self.apply_zoom_step(ZOOM_STEP_OUT);
+    pub fn zoom_out_by_percent(&mut self, percent: f32) {
+        let step = zoom_step_factor(percent);
+        self.apply_zoom_step(1.0 / (1.0 + step));
     }
 
     pub fn set_show_toolbar(&mut self, show: bool) {
@@ -460,6 +528,10 @@ impl AppState {
 
     pub fn current_directory_path(&self) -> Option<PathBuf> {
         self.current_directory.clone()
+    }
+
+    pub fn images_in_directory(&self) -> &[PathBuf] {
+        &self.images_in_directory
     }
 
     pub fn suggested_save_name(&self) -> Option<String> {
@@ -666,7 +738,7 @@ impl AppState {
 
     #[cfg(test)]
     fn open_adjacent(&mut self, perf_label: &str, step: isize) -> Result<()> {
-        let next_path = self.resolve_adjacent_path(step)?;
+        let next_path = self.resolve_adjacent_path(step, true)?;
 
         let started = Instant::now();
         self.open_image(next_path)?;
@@ -766,13 +838,29 @@ impl AppState {
         }
     }
 
-    fn resolve_adjacent_path(&self, step: isize) -> Result<PathBuf> {
+    fn resolve_adjacent_path(&self, step: isize, wrap_navigation: bool) -> Result<PathBuf> {
         let Some(current_index) = self.current_index else {
             anyhow::bail!("no image loaded");
         };
         let total = self.images_in_directory.len();
         if total == 0 {
             anyhow::bail!("no image loaded");
+        }
+
+        if !wrap_navigation {
+            let candidate = current_index as isize + step;
+            if candidate < 0 {
+                anyhow::bail!("already at first image");
+            }
+            if candidate >= total as isize {
+                anyhow::bail!("already at last image");
+            }
+            let next_index = candidate as usize;
+            return self
+                .images_in_directory
+                .get(next_index)
+                .cloned()
+                .context("failed to resolve adjacent image path");
         }
 
         let next_index = wrapped_index(current_index, total, step);
@@ -822,6 +910,10 @@ fn wrapped_index(current: usize, len: usize, step: isize) -> usize {
     let len = len as isize;
     let next = (current as isize + step).rem_euclid(len);
     next as usize
+}
+
+fn zoom_step_factor(percent: f32) -> f32 {
+    (percent.clamp(1.0, 200.0) / 100.0).max(0.01)
 }
 
 fn resolve_current_index(files: &[PathBuf], path: &Path) -> Option<usize> {
@@ -932,6 +1024,25 @@ mod tests {
     }
 
     #[test]
+    fn navigation_without_wrap_stops_at_boundaries() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let image_a = dir.path().join("a.png");
+        let image_b = dir.path().join("b.png");
+        write_test_png(&image_a, 16, 12, [255, 0, 0, 255]);
+        write_test_png(&image_b, 16, 12, [0, 255, 0, 255]);
+
+        let mut state = AppState::new();
+        state.open_image(&image_a).expect("failed to open image_a");
+
+        let previous = state.resolve_previous_path_with_wrap(false);
+        assert!(previous.is_err());
+
+        state.open_image(&image_b).expect("failed to open image_b");
+        let next = state.resolve_next_path_with_wrap(false);
+        assert!(next.is_err());
+    }
+
+    #[test]
     fn zoom_transitions_are_consistent() {
         let dir = tempdir().expect("failed to create temp dir");
         let image_a = dir.path().join("a.png");
@@ -943,7 +1054,7 @@ mod tests {
         assert!(state.zoom_is_fit());
         assert_eq!(state.zoom_label(), "Fit");
 
-        state.zoom_in();
+        state.zoom_in_by_percent(20.0);
         assert!(!state.zoom_is_fit());
         assert_ne!(state.zoom_label(), "Fit");
 
