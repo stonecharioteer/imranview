@@ -1,6 +1,6 @@
 [package]
 name = "imranview"
-version = "0.1.0"
+version = "2026.04.05.00"
 edition = "2024"
 
 [dependencies]
