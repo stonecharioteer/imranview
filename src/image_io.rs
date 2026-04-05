@@ -1,10 +1,13 @@
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use exif::{In, Tag};
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
@@ -240,6 +243,29 @@ pub fn preserve_metadata_best_effort(
         SaveFormat::Jpeg { .. } => copy_jpeg_metadata_segments(source, destination),
         _ => Err(anyhow!(
             "metadata preservation currently supports JPEG output only"
+        )),
+    }
+}
+
+pub fn extract_embedded_icc_profile(path: &Path) -> Result<Option<Vec<u8>>> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "jpg" | "jpeg" => extract_jpeg_icc_profile(path),
+        "png" => extract_png_icc_profile(path),
+        _ => Ok(None),
+    }
+}
+
+pub fn embed_icc_profile_best_effort(path: &Path, format: SaveFormat, icc: &[u8]) -> Result<()> {
+    match format {
+        SaveFormat::Jpeg { .. } => embed_jpeg_icc_profile(path, icc),
+        SaveFormat::Png => embed_png_icc_profile(path, icc),
+        _ => Err(anyhow!(
+            "ICC embedding currently supports JPEG and PNG output only"
         )),
     }
 }
@@ -527,6 +553,313 @@ fn is_jpeg_metadata_segment(marker: u8) -> bool {
     marker == 0xe1 || marker == 0xed
 }
 
+#[derive(Clone)]
+struct PngChunk {
+    kind: [u8; 4],
+    data: Vec<u8>,
+}
+
+fn extract_png_icc_profile(path: &Path) -> Result<Option<Vec<u8>>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read PNG for ICC extraction {}", path.display()))?;
+    let chunks = parse_png_chunks(&bytes)?;
+    for chunk in chunks {
+        if &chunk.kind != b"iCCP" {
+            continue;
+        }
+        let Some(name_end) = chunk.data.iter().position(|&byte| byte == 0) else {
+            continue;
+        };
+        let method_index = name_end + 1;
+        if method_index >= chunk.data.len() {
+            continue;
+        }
+        let method = chunk.data[method_index];
+        if method != 0 {
+            return Err(anyhow!(
+                "unsupported PNG iCCP compression method {} in {}",
+                method,
+                path.display()
+            ));
+        }
+        let compressed = &chunk.data[method_index + 1..];
+        let mut decoder = ZlibDecoder::new(compressed);
+        let mut icc = Vec::new();
+        decoder
+            .read_to_end(&mut icc)
+            .with_context(|| format!("failed to decompress PNG iCCP in {}", path.display()))?;
+        return Ok(Some(icc));
+    }
+    Ok(None)
+}
+
+fn embed_png_icc_profile(path: &Path, icc: &[u8]) -> Result<()> {
+    if icc.is_empty() {
+        return Err(anyhow!("cannot embed empty ICC profile"));
+    }
+
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read PNG for ICC embedding {}", path.display()))?;
+    let chunks = parse_png_chunks(&bytes)?;
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(icc)
+        .with_context(|| "failed to compress ICC profile for PNG iCCP")?;
+    let compressed = encoder
+        .finish()
+        .with_context(|| "failed to finalize PNG iCCP compression")?;
+
+    let mut iccp_data = Vec::with_capacity(16 + compressed.len());
+    iccp_data.extend_from_slice(b"ImranViewICC");
+    iccp_data.push(0);
+    iccp_data.push(0);
+    iccp_data.extend_from_slice(&compressed);
+
+    let mut rebuilt = Vec::with_capacity(bytes.len().saturating_add(iccp_data.len() + 32));
+    rebuilt.extend_from_slice(PNG_SIGNATURE);
+    let mut inserted = false;
+    for chunk in chunks {
+        if &chunk.kind == b"iCCP" {
+            continue;
+        }
+        if !inserted && &chunk.kind == b"IDAT" {
+            rebuilt.extend_from_slice(&encode_png_chunk(*b"iCCP", &iccp_data));
+            inserted = true;
+        }
+        rebuilt.extend_from_slice(&encode_png_chunk(chunk.kind, &chunk.data));
+    }
+    if !inserted {
+        return Err(anyhow!(
+            "cannot embed ICC profile because PNG is missing IDAT chunk"
+        ));
+    }
+
+    fs::write(path, rebuilt)
+        .with_context(|| format!("failed to write ICC-embedded PNG {}", path.display()))?;
+    Ok(())
+}
+
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+fn parse_png_chunks(bytes: &[u8]) -> Result<Vec<PngChunk>> {
+    if bytes.len() < PNG_SIGNATURE.len() || &bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
+        return Err(anyhow!("not a valid PNG stream"));
+    }
+
+    let mut chunks = Vec::new();
+    let mut index = PNG_SIGNATURE.len();
+    while index + 12 <= bytes.len() {
+        let length = u32::from_be_bytes([
+            bytes[index],
+            bytes[index + 1],
+            bytes[index + 2],
+            bytes[index + 3],
+        ]) as usize;
+        let kind_start = index + 4;
+        let data_start = kind_start + 4;
+        let data_end = data_start.saturating_add(length);
+        let crc_end = data_end.saturating_add(4);
+        if crc_end > bytes.len() {
+            return Err(anyhow!("truncated PNG chunk stream"));
+        }
+
+        let mut kind = [0u8; 4];
+        kind.copy_from_slice(&bytes[kind_start..kind_start + 4]);
+        let data = bytes[data_start..data_end].to_vec();
+        chunks.push(PngChunk { kind, data });
+        index = crc_end;
+        if &kind == b"IEND" {
+            return Ok(chunks);
+        }
+    }
+
+    Err(anyhow!("PNG IEND chunk not found"))
+}
+
+fn encode_png_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(data.len() + 12);
+    bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&kind);
+    bytes.extend_from_slice(data);
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&kind);
+    hasher.update(data);
+    bytes.extend_from_slice(&hasher.finalize().to_be_bytes());
+    bytes
+}
+
+fn extract_jpeg_icc_profile(path: &Path) -> Result<Option<Vec<u8>>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read JPEG for ICC extraction {}", path.display()))?;
+    let (segments, _) = split_jpeg_header_and_scan(&bytes)?;
+
+    let mut declared_total: Option<usize> = None;
+    let mut parts: Vec<Option<Vec<u8>>> = Vec::new();
+    for segment in segments {
+        let Some((sequence, total, payload)) = parse_jpeg_icc_app2_segment(&segment.bytes) else {
+            continue;
+        };
+        let total = total as usize;
+        let sequence = sequence as usize;
+        if sequence == 0 {
+            continue;
+        }
+
+        match declared_total {
+            Some(existing) if existing != total => {
+                return Err(anyhow!(
+                    "inconsistent ICC segment count in {}",
+                    path.display()
+                ));
+            }
+            None => {
+                declared_total = Some(total);
+                parts = vec![None; total];
+            }
+            _ => {}
+        }
+
+        if sequence > parts.len() {
+            return Err(anyhow!(
+                "invalid ICC segment sequence in {}",
+                path.display()
+            ));
+        }
+        parts[sequence - 1] = Some(payload.to_vec());
+    }
+
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    if parts.iter().any(|part| part.is_none()) {
+        return Err(anyhow!(
+            "incomplete ICC profile segments in {}",
+            path.display()
+        ));
+    }
+
+    let total_size = parts
+        .iter()
+        .map(|part| part.as_ref().map_or(0usize, Vec::len))
+        .sum();
+    let mut icc = Vec::with_capacity(total_size);
+    for part in parts.into_iter().flatten() {
+        icc.extend_from_slice(&part);
+    }
+    Ok(Some(icc))
+}
+
+fn embed_jpeg_icc_profile(path: &Path, icc: &[u8]) -> Result<()> {
+    if icc.is_empty() {
+        return Err(anyhow!("cannot embed empty ICC profile"));
+    }
+
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read JPEG for ICC embedding {}", path.display()))?;
+    let (segments, scan_data) = split_jpeg_header_and_scan(&bytes)?;
+    let icc_segments = build_jpeg_icc_app2_segments(icc)?;
+
+    let mut app_prefix_end = 0usize;
+    for segment in &segments {
+        if (0xe0..=0xef).contains(&segment.marker) || segment.marker == 0xfe {
+            app_prefix_end += 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut rebuilt = Vec::with_capacity(
+        bytes
+            .len()
+            .saturating_add(icc_segments.iter().map(Vec::len).sum::<usize>())
+            .saturating_add(1024),
+    );
+    rebuilt.extend_from_slice(&[0xff, 0xd8]);
+
+    for segment in segments.iter().take(app_prefix_end) {
+        if parse_jpeg_icc_app2_segment(&segment.bytes).is_none() {
+            rebuilt.extend_from_slice(&segment.bytes);
+        }
+    }
+    for icc_segment in &icc_segments {
+        rebuilt.extend_from_slice(icc_segment);
+    }
+    for segment in segments.into_iter().skip(app_prefix_end) {
+        if parse_jpeg_icc_app2_segment(&segment.bytes).is_none() {
+            rebuilt.extend_from_slice(&segment.bytes);
+        }
+    }
+    rebuilt.extend_from_slice(&scan_data);
+
+    fs::write(path, rebuilt)
+        .with_context(|| format!("failed to write ICC-embedded JPEG {}", path.display()))?;
+    Ok(())
+}
+
+fn build_jpeg_icc_app2_segments(icc: &[u8]) -> Result<Vec<Vec<u8>>> {
+    const ICC_HEADER: &[u8] = b"ICC_PROFILE\0";
+    const MAX_CHUNK_SIZE: usize = 65_519;
+
+    let total_segments = icc.len().div_ceil(MAX_CHUNK_SIZE);
+    if total_segments == 0 || total_segments > u8::MAX as usize {
+        return Err(anyhow!(
+            "ICC profile requires unsupported segment count: {}",
+            total_segments
+        ));
+    }
+
+    let mut segments = Vec::with_capacity(total_segments);
+    for (index, chunk) in icc.chunks(MAX_CHUNK_SIZE).enumerate() {
+        let sequence = (index + 1) as u8;
+        let total = total_segments as u8;
+        let length = 2usize
+            .saturating_add(ICC_HEADER.len())
+            .saturating_add(2)
+            .saturating_add(chunk.len());
+        if length > u16::MAX as usize {
+            return Err(anyhow!("ICC segment too large"));
+        }
+
+        let mut bytes = Vec::with_capacity(2 + length);
+        bytes.extend_from_slice(&[0xff, 0xe2]);
+        bytes.extend_from_slice(&(length as u16).to_be_bytes());
+        bytes.extend_from_slice(ICC_HEADER);
+        bytes.push(sequence);
+        bytes.push(total);
+        bytes.extend_from_slice(chunk);
+        segments.push(bytes);
+    }
+
+    Ok(segments)
+}
+
+fn parse_jpeg_icc_app2_segment(bytes: &[u8]) -> Option<(u8, u8, &[u8])> {
+    const ICC_HEADER: &[u8] = b"ICC_PROFILE\0";
+
+    if bytes.len() < 4 + ICC_HEADER.len() + 2 {
+        return None;
+    }
+    if bytes[0] != 0xff || bytes[1] != 0xe2 {
+        return None;
+    }
+    let declared_length = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+    if declared_length + 2 != bytes.len() {
+        return None;
+    }
+    let payload = &bytes[4..];
+    if !payload.starts_with(ICC_HEADER) {
+        return None;
+    }
+    let sequence = payload[ICC_HEADER.len()];
+    let total = payload[ICC_HEADER.len() + 1];
+    if sequence == 0 || total == 0 {
+        return None;
+    }
+    let profile_payload = &payload[ICC_HEADER.len() + 2..];
+    Some((sequence, total, profile_payload))
+}
+
 fn split_jpeg_header_and_scan(bytes: &[u8]) -> Result<(Vec<JpegSegment>, Vec<u8>)> {
     if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
         return Err(anyhow!("not a valid jpeg stream"));
@@ -571,4 +904,61 @@ fn split_jpeg_header_and_scan(bytes: &[u8]) -> Result<(Vec<JpegSegment>, Vec<u8>
         index = end;
     }
     Err(anyhow!("jpeg scan data marker not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SaveFormat, build_jpeg_icc_app2_segments, embed_jpeg_icc_profile, embed_png_icc_profile,
+        extract_jpeg_icc_profile, extract_png_icc_profile, parse_jpeg_icc_app2_segment,
+        save_image_with_format,
+    };
+    use image::{DynamicImage, Rgba, RgbaImage};
+    use tempfile::tempdir;
+
+    #[test]
+    fn jpeg_icc_segments_roundtrip_payload() {
+        let payload: Vec<u8> = (0..140_000).map(|index| (index % 251) as u8).collect();
+        let segments = build_jpeg_icc_app2_segments(&payload).expect("segments should build");
+        assert!(segments.len() >= 3);
+
+        let mut assembled = Vec::new();
+        for segment in segments {
+            let parsed = parse_jpeg_icc_app2_segment(&segment).expect("must parse ICC segment");
+            assembled.extend_from_slice(parsed.2);
+        }
+        assert_eq!(assembled, payload);
+    }
+
+    #[test]
+    fn jpeg_embed_and_extract_icc_profile_roundtrip() {
+        let temp = tempdir().expect("tempdir should create");
+        let path = temp.path().join("icc-roundtrip.jpg");
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(24, 18, Rgba([3, 4, 5, 255])));
+        save_image_with_format(&path, &source, SaveFormat::Jpeg { quality: 90 })
+            .expect("jpeg should save");
+
+        let icc_payload: Vec<u8> = (0..88_000).map(|index| (index % 233) as u8).collect();
+        embed_jpeg_icc_profile(&path, &icc_payload).expect("embedding should succeed");
+        let extracted = extract_jpeg_icc_profile(&path)
+            .expect("extraction should succeed")
+            .expect("profile should exist");
+        assert_eq!(extracted, icc_payload);
+    }
+
+    #[test]
+    fn png_embed_and_extract_icc_profile_roundtrip() {
+        let temp = tempdir().expect("tempdir should create");
+        let path = temp.path().join("icc-roundtrip.png");
+        let source =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(28, 20, Rgba([21, 22, 23, 255])));
+        save_image_with_format(&path, &source, SaveFormat::Png).expect("png should save");
+
+        let icc_payload: Vec<u8> = (0..24_000).map(|index| (index % 239) as u8).collect();
+        embed_png_icc_profile(&path, &icc_payload).expect("PNG ICC embedding should succeed");
+        let extracted = extract_png_icc_profile(&path)
+            .expect("PNG ICC extraction should succeed")
+            .expect("PNG profile should exist");
+        assert_eq!(extracted, icc_payload);
+    }
 }

@@ -11,13 +11,14 @@ use anyhow::{Context, Result, anyhow};
 use font8x8::UnicodeFonts;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+use lcms2::{Intent, PixelFormat, Profile, Transform};
 use serde::{Deserialize, Serialize};
 
 use crate::image_io::{
     LoadedImagePayload, MetadataSummary, SaveFormat, ThumbnailPayload, collect_images_in_directory,
-    extract_metadata_summary, infer_save_format, load_image_payload, load_thumbnail_payload,
-    load_working_image, payload_from_working_image, preserve_metadata_best_effort,
-    save_image_with_format,
+    embed_icc_profile_best_effort, extract_embedded_icc_profile, extract_metadata_summary,
+    infer_save_format, load_image_payload, load_thumbnail_payload, load_working_image,
+    payload_from_working_image, preserve_metadata_best_effort, save_image_with_format,
 };
 use crate::perf::{EDIT_IMAGE_BUDGET, OPEN_IMAGE_BUDGET, SAVE_IMAGE_BUDGET, log_timing};
 
@@ -470,6 +471,7 @@ pub enum WorkerCommand {
         jpeg_quality: u8,
         dpi: u32,
         grayscale: bool,
+        device_name: Option<String>,
     },
     OpenTiffPage {
         request_id: u64,
@@ -841,6 +843,7 @@ fn run_worker(
                 jpeg_quality,
                 dpi,
                 grayscale,
+                device_name,
             } => Some(run_scan_native(
                 request_id,
                 output_dir,
@@ -851,6 +854,7 @@ fn run_worker(
                 jpeg_quality,
                 dpi,
                 grayscale,
+                device_name,
             )),
             WorkerCommand::OpenTiffPage {
                 request_id,
@@ -1385,7 +1389,10 @@ fn run_lossless_jpeg(
 
         Ok(WorkerResult::UtilityCompleted {
             request_id,
-            message: format!("Lossless JPEG transform complete: {}", final_output.display()),
+            message: format!(
+                "Lossless JPEG transform complete: {}",
+                final_output.display()
+            ),
             open_path: Some(final_output),
         })
     })();
@@ -1446,11 +1453,17 @@ fn run_convert_color_profile(
             return Err(anyhow!("missing input image {}", path.display()));
         }
         if !target_profile.is_file() {
-            return Err(anyhow!("missing target profile {}", target_profile.display()));
+            return Err(anyhow!(
+                "missing target profile {}",
+                target_profile.display()
+            ));
         }
         if let Some(source_profile) = source_profile.as_ref() {
             if !source_profile.is_file() {
-                return Err(anyhow!("missing source profile {}", source_profile.display()));
+                return Err(anyhow!(
+                    "missing source profile {}",
+                    source_profile.display()
+                ));
             }
         }
         if let Some(parent) = output_path.parent() {
@@ -1458,37 +1471,86 @@ fn run_convert_color_profile(
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
+        let mut image = load_working_image(&path)
+            .map_err(|err| anyhow!("failed to decode input image {}: {err}", path.display()))?
+            .to_rgba8();
+
+        let source_profile = if let Some(profile_path) = source_profile.as_ref() {
+            Profile::new_file(profile_path).with_context(|| {
+                format!(
+                    "failed to load source ICC profile {}",
+                    profile_path.display()
+                )
+            })?
+        } else if let Some(embedded) = extract_embedded_icc_profile(&path).with_context(|| {
+            format!(
+                "failed to inspect embedded ICC profile in {}",
+                path.display()
+            )
+        })? {
+            Profile::new_icc(&embedded).with_context(|| {
+                format!(
+                    "failed to parse embedded ICC profile from {}",
+                    path.display()
+                )
+            })?
+        } else {
+            Profile::new_srgb()
+        };
+        let target_profile = Profile::new_file(&target_profile).with_context(|| {
+            format!(
+                "failed to load target ICC profile {}",
+                target_profile.display()
+            )
+        })?;
+
+        let intent = match rendering_intent.trim().to_ascii_lowercase().as_str() {
+            "perceptual" => Intent::Perceptual,
+            "saturation" => Intent::Saturation,
+            "absolute" | "absolutecolorimetric" | "absolute-colorimetric" => {
+                Intent::AbsoluteColorimetric
+            }
+            _ => Intent::RelativeColorimetric,
+        };
+
+        let transform = Transform::new(
+            &source_profile,
+            PixelFormat::RGBA_8,
+            &target_profile,
+            PixelFormat::RGBA_8,
+            intent,
+        )
+        .context("failed to build ICC transform")?;
+        transform.transform_in_place(image.as_mut());
+
         let final_output = output_path;
         let temp_output = if final_output == path {
             temporary_icc_output_path(&path)
         } else {
             final_output.clone()
         };
-
-        let intent = match rendering_intent.trim().to_ascii_lowercase().as_str() {
-            "perceptual" => "perceptual",
-            "saturation" => "saturation",
-            "absolute" | "absolutecolorimetric" | "absolute-colorimetric" => {
-                "absolute"
+        let save_format = infer_save_format(&temp_output, 92).map_err(|err| {
+            anyhow!(
+                "unsupported output extension for color-profile conversion {}: {err}",
+                temp_output.display()
+            )
+        })?;
+        let output_image = DynamicImage::ImageRgba8(image);
+        save_image_with_format(&temp_output, &output_image, save_format).map_err(|err| {
+            anyhow!(
+                "failed to save color-profile output {}: {err}",
+                temp_output.display()
+            )
+        })?;
+        if let Ok(target_icc) = target_profile.icc() {
+            if let Err(err) = embed_icc_profile_best_effort(&temp_output, save_format, &target_icc)
+            {
+                log::warn!(
+                    target: "imranview::worker",
+                    "failed to embed target ICC profile into {}: {err:#}",
+                    temp_output.display()
+                );
             }
-            _ => "relative",
-        };
-
-        let mut command = std::process::Command::new("magick");
-        command.arg(&path).arg("-intent").arg(intent);
-        if let Some(source_profile) = source_profile.as_ref() {
-            command.arg("-profile").arg(source_profile);
-        }
-        command
-            .arg("-profile")
-            .arg(&target_profile)
-            .arg(&temp_output);
-
-        let status = command
-            .status()
-            .with_context(|| "failed to execute `magick` (install ImageMagick with ICC support)")?;
-        if !status.success() {
-            return Err(anyhow!("magick color profile conversion failed with status {status}"));
         }
 
         if final_output == path {
@@ -1498,7 +1560,10 @@ fn run_convert_color_profile(
 
         Ok(WorkerResult::UtilityCompleted {
             request_id,
-            message: format!("Color profile conversion complete: {}", final_output.display()),
+            message: format!(
+                "Color profile conversion complete: {}",
+                final_output.display()
+            ),
             open_path: Some(final_output),
         })
     })();
@@ -1601,6 +1666,7 @@ fn run_scan_native(
     jpeg_quality: u8,
     dpi: u32,
     grayscale: bool,
+    device_name: Option<String>,
 ) -> WorkerResult {
     let output = (|| -> Result<WorkerResult> {
         let page_count = page_count.clamp(1, 10_000);
@@ -1618,11 +1684,14 @@ fn run_scan_native(
             let final_path = output_dir.join(final_name);
             let temp_capture = output_dir.join(format!(".imranview-scan-{index:04}.png"));
 
-            scan_native_capture_to_png(&temp_capture, dpi, grayscale)
-                .with_context(|| format!("native scan capture failed for page {}", page_offset + 1))?;
+            scan_native_capture_to_png(&temp_capture, dpi, grayscale, device_name.as_deref())
+                .with_context(|| {
+                    format!("native scan capture failed for page {}", page_offset + 1)
+                })?;
 
-            let image = load_working_image(&temp_capture)
-                .with_context(|| format!("failed to decode scanned image {}", temp_capture.display()))?;
+            let image = load_working_image(&temp_capture).with_context(|| {
+                format!("failed to decode scanned image {}", temp_capture.display())
+            })?;
             save_image_with_format(&final_path, &image, save_format)
                 .with_context(|| format!("failed to save {}", final_path.display()))?;
             let _ = fs::remove_file(&temp_capture);
@@ -1650,7 +1719,12 @@ fn run_scan_native(
     })
 }
 
-fn scan_native_capture_to_png(output_path: &Path, dpi: u32, grayscale: bool) -> Result<()> {
+fn scan_native_capture_to_png(
+    output_path: &Path,
+    dpi: u32,
+    grayscale: bool,
+    device_name: Option<&str>,
+) -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if let Some(parent) = output_path.parent() {
@@ -1658,18 +1732,30 @@ fn scan_native_capture_to_png(output_path: &Path, dpi: u32, grayscale: bool) -> 
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let mode = if grayscale { "Gray" } else { "Color" };
-        let status = std::process::Command::new("scanimage")
+        let mut command = std::process::Command::new("scanimage");
+        command
             .arg("--format=png")
             .arg("--mode")
             .arg(mode)
             .arg("--resolution")
             .arg(dpi.to_string())
             .arg("--output-file")
-            .arg(output_path)
+            .arg(output_path);
+        if let Some(device_name) = device_name.filter(|value| !value.trim().is_empty()) {
+            command.arg("--device-name").arg(device_name.trim());
+        }
+        let status = command
             .status()
             .with_context(|| "failed to execute `scanimage` (install SANE tools)")?;
         if !status.success() {
-            return Err(anyhow!("scanimage failed with status {status}"));
+            let mut message = format!("scanimage failed with status {status}");
+            if let Ok(devices) = scanimage_list_devices() {
+                if !devices.trim().is_empty() {
+                    message.push_str("\nDetected scanner devices:\n");
+                    message.push_str(devices.trim());
+                }
+            }
+            return Err(anyhow!(message));
         }
         if !output_path.is_file() {
             return Err(anyhow!(
@@ -1686,6 +1772,7 @@ fn scan_native_capture_to_png(output_path: &Path, dpi: u32, grayscale: bool) -> 
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
+        let _ = device_name;
         let escaped = output_path.display().to_string().replace('\'', "''");
         let wia_format = if grayscale {
             "{B96B3CAA-0728-11D3-9D7B-0000F81EF32E}" // PNG
@@ -1708,7 +1795,9 @@ fn scan_native_capture_to_png(output_path: &Path, dpi: u32, grayscale: bool) -> 
             .status()
             .with_context(|| "failed to execute Windows WIA scanner command")?;
         if !status.success() {
-            return Err(anyhow!("Windows WIA scanner command failed with status {status}"));
+            return Err(anyhow!(
+                "Windows WIA scanner command failed with status {status}"
+            ));
         }
         if !output_path.is_file() {
             return Err(anyhow!(
@@ -1721,9 +1810,23 @@ fn scan_native_capture_to_png(output_path: &Path, dpi: u32, grayscale: bool) -> 
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = (output_path, dpi, grayscale);
-        Err(anyhow!("native scanner backend is not supported on this platform"))
+        let _ = (output_path, dpi, grayscale, device_name);
+        Err(anyhow!(
+            "native scanner backend is not supported on this platform"
+        ))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn scanimage_list_devices() -> Result<String> {
+    let output = std::process::Command::new("scanimage")
+        .arg("-L")
+        .output()
+        .with_context(|| "failed to execute `scanimage -L` for device listing")?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
 fn shell_escape_path(path: &Path) -> String {
@@ -1861,13 +1964,30 @@ fn run_ocr(
             .arg("stdout")
             .arg("-l")
             .arg(&language)
-            .output()
-            .with_context(
-                || "failed to execute `tesseract` (install it and ensure it is on PATH)",
-            )?;
+            .output();
+        let command = match command {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow!(
+                    "`tesseract` is not installed or not on PATH. Install it, then retry OCR."
+                ));
+            }
+            Err(error) => {
+                return Err(error).with_context(
+                    || "failed to execute `tesseract` (install it and ensure it is on PATH)",
+                );
+            }
+        };
         if !command.status.success() {
             let stderr = String::from_utf8_lossy(&command.stderr);
-            return Err(anyhow!("tesseract failed: {}", stderr.trim()));
+            let mut message = format!("tesseract failed: {}", stderr.trim());
+            if let Ok(languages) = tesseract_list_languages() {
+                if !languages.is_empty() {
+                    message.push_str("\nDetected tesseract languages: ");
+                    message.push_str(&languages.join(", "));
+                }
+            }
+            return Err(anyhow!(message));
         }
         let text = String::from_utf8(command.stdout).context("OCR output is not valid UTF-8")?;
         if let Some(path) = output_path.as_ref() {
@@ -1890,6 +2010,31 @@ fn run_ocr(
         kind: WorkerRequestKind::Ocr,
         error: err.to_string(),
     })
+}
+
+fn tesseract_list_languages() -> Result<Vec<String>> {
+    let output = std::process::Command::new("tesseract")
+        .arg("--list-langs")
+        .output()
+        .with_context(|| "failed to execute `tesseract --list-langs`")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut languages = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.ends_with(':') {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("list of available languages") {
+            continue;
+        }
+        languages.push(trimmed.to_owned());
+    }
+    languages.sort();
+    languages.dedup();
+    Ok(languages)
 }
 
 fn run_stitch_panorama(
@@ -2611,28 +2756,48 @@ fn stitch_images(
                 let overlap =
                     ((canvas.width().min(image.width()) as f32) * overlap_percent).round() as u32;
                 let overlap = overlap.min(canvas.width().min(image.width()).saturating_sub(1));
+                let shift_y = estimate_vertical_overlap_shift(&canvas, image, overlap);
+                let existing_origin_y = if shift_y < 0 { (-shift_y) as u32 } else { 0 };
+                let incoming_origin_y = if shift_y > 0 { shift_y as u32 } else { 0 };
+                let incoming_origin_x = canvas.width() - overlap;
                 let mut next = RgbaImage::from_pixel(
                     canvas.width() + image.width() - overlap,
-                    canvas.height().max(image.height()),
+                    (existing_origin_y + canvas.height()).max(incoming_origin_y + image.height()),
                     Rgba([0, 0, 0, 255]),
                 );
-                blit_rgba(&canvas, &mut next, 0, 0);
-                let x_start = canvas.width() - overlap;
-                blend_with_vertical_seam(&canvas, image, &mut next, x_start, 0, overlap);
+                blit_rgba(&canvas, &mut next, 0, existing_origin_y);
+                blend_with_vertical_seam(
+                    &canvas,
+                    (0, existing_origin_y),
+                    image,
+                    (incoming_origin_x, incoming_origin_y),
+                    &mut next,
+                    overlap,
+                );
                 canvas = next;
             }
             PanoramaDirection::Vertical => {
                 let overlap =
                     ((canvas.height().min(image.height()) as f32) * overlap_percent).round() as u32;
                 let overlap = overlap.min(canvas.height().min(image.height()).saturating_sub(1));
+                let shift_x = estimate_horizontal_overlap_shift(&canvas, image, overlap);
+                let existing_origin_x = if shift_x < 0 { (-shift_x) as u32 } else { 0 };
+                let incoming_origin_x = if shift_x > 0 { shift_x as u32 } else { 0 };
+                let incoming_origin_y = canvas.height() - overlap;
                 let mut next = RgbaImage::from_pixel(
-                    canvas.width().max(image.width()),
+                    (existing_origin_x + canvas.width()).max(incoming_origin_x + image.width()),
                     canvas.height() + image.height() - overlap,
                     Rgba([0, 0, 0, 255]),
                 );
-                blit_rgba(&canvas, &mut next, 0, 0);
-                let y_start = canvas.height() - overlap;
-                blend_with_horizontal_seam(&canvas, image, &mut next, 0, y_start, overlap);
+                blit_rgba(&canvas, &mut next, existing_origin_x, 0);
+                blend_with_horizontal_seam(
+                    &canvas,
+                    (existing_origin_x, 0),
+                    image,
+                    (incoming_origin_x, incoming_origin_y),
+                    &mut next,
+                    overlap,
+                );
                 canvas = next;
             }
         }
@@ -2642,36 +2807,54 @@ fn stitch_images(
 
 fn blend_with_vertical_seam(
     existing: &RgbaImage,
+    existing_origin: (u32, u32),
     incoming: &RgbaImage,
+    incoming_origin: (u32, u32),
     out: &mut RgbaImage,
-    offset_x: u32,
-    offset_y: u32,
     overlap: u32,
 ) {
     if overlap == 0 {
-        blit_rgba(incoming, out, offset_x, offset_y);
+        blit_rgba(incoming, out, incoming_origin.0, incoming_origin.1);
         return;
     }
 
-    let overlap_w = overlap
-        .min(incoming.width())
-        .min(existing.width().saturating_sub(offset_x))
-        .min(out.width().saturating_sub(offset_x));
-    let overlap_h = incoming
-        .height()
-        .min(existing.height().saturating_sub(offset_y))
-        .min(out.height().saturating_sub(offset_y));
+    let overlap_left = incoming_origin.0;
+    let overlap_right = incoming_origin.0.saturating_add(overlap);
+    let left = overlap_left
+        .max(existing_origin.0)
+        .max(incoming_origin.0)
+        .min(out.width());
+    let right = overlap_right
+        .min(existing_origin.0.saturating_add(existing.width()))
+        .min(incoming_origin.0.saturating_add(incoming.width()))
+        .min(out.width());
+    let top = existing_origin.1.max(incoming_origin.1).min(out.height());
+    let bottom = existing_origin
+        .1
+        .saturating_add(existing.height())
+        .min(incoming_origin.1.saturating_add(incoming.height()))
+        .min(out.height());
 
+    let overlap_w = right.saturating_sub(left);
+    let overlap_h = bottom.saturating_sub(top);
     if overlap_w == 0 || overlap_h == 0 {
-        blit_rgba(incoming, out, offset_x, offset_y);
+        blit_rgba(incoming, out, incoming_origin.0, incoming_origin.1);
         return;
     }
 
     let mut cost = vec![vec![0u32; overlap_w as usize]; overlap_h as usize];
     for y in 0..overlap_h {
         for x in 0..overlap_w {
-            let existing_px = existing.get_pixel(offset_x + x, offset_y + y);
-            let incoming_px = incoming.get_pixel(x, y);
+            let out_x = left + x;
+            let out_y = top + y;
+            let existing_px = existing.get_pixel(
+                out_x.saturating_sub(existing_origin.0),
+                out_y.saturating_sub(existing_origin.1),
+            );
+            let incoming_px = incoming.get_pixel(
+                out_x.saturating_sub(incoming_origin.0),
+                out_y.saturating_sub(incoming_origin.1),
+            );
             cost[y as usize][x as usize] = rgb_distance_sq(*existing_px, *incoming_px);
         }
     }
@@ -2680,24 +2863,25 @@ fn blend_with_vertical_seam(
 
     for y in 0..incoming.height() {
         for x in 0..incoming.width() {
-            let dx = offset_x + x;
-            let dy = offset_y + y;
+            let dx = incoming_origin.0 + x;
+            let dy = incoming_origin.1 + y;
             if dx >= out.width() || dy >= out.height() {
                 continue;
             }
 
             let src_px = *incoming.get_pixel(x, y);
-            if x >= overlap_w || y >= overlap_h {
+            if dx < left || dx >= right || dy < top || dy >= bottom {
                 out.put_pixel(dx, dy, src_px);
                 continue;
             }
 
-            let seam_x = seam[y as usize] as i32;
-            let x_i = x as i32;
-            if x_i < seam_x - blend_band {
+            let local_x = dx.saturating_sub(left) as i32;
+            let local_y = dy.saturating_sub(top) as usize;
+            let seam_x = seam[local_y] as i32;
+            if local_x < seam_x - blend_band {
                 continue;
             }
-            if x_i > seam_x + blend_band {
+            if local_x > seam_x + blend_band {
                 out.put_pixel(dx, dy, src_px);
                 continue;
             }
@@ -2706,7 +2890,7 @@ fn blend_with_vertical_seam(
                 0.5
             } else {
                 let left = seam_x - blend_band;
-                ((x_i - left) as f32 / (blend_band * 2) as f32).clamp(0.0, 1.0)
+                ((local_x - left) as f32 / (blend_band * 2) as f32).clamp(0.0, 1.0)
             };
             let dst_px = *out.get_pixel(dx, dy);
             out.put_pixel(dx, dy, mix_rgba(dst_px, src_px, blend_t));
@@ -2716,36 +2900,54 @@ fn blend_with_vertical_seam(
 
 fn blend_with_horizontal_seam(
     existing: &RgbaImage,
+    existing_origin: (u32, u32),
     incoming: &RgbaImage,
+    incoming_origin: (u32, u32),
     out: &mut RgbaImage,
-    offset_x: u32,
-    offset_y: u32,
     overlap: u32,
 ) {
     if overlap == 0 {
-        blit_rgba(incoming, out, offset_x, offset_y);
+        blit_rgba(incoming, out, incoming_origin.0, incoming_origin.1);
         return;
     }
 
-    let overlap_h = overlap
-        .min(incoming.height())
-        .min(existing.height().saturating_sub(offset_y))
-        .min(out.height().saturating_sub(offset_y));
-    let overlap_w = incoming
-        .width()
-        .min(existing.width().saturating_sub(offset_x))
-        .min(out.width().saturating_sub(offset_x));
+    let overlap_top = incoming_origin.1;
+    let overlap_bottom = incoming_origin.1.saturating_add(overlap);
+    let left = existing_origin.0.max(incoming_origin.0).min(out.width());
+    let right = existing_origin
+        .0
+        .saturating_add(existing.width())
+        .min(incoming_origin.0.saturating_add(incoming.width()))
+        .min(out.width());
+    let top = overlap_top
+        .max(existing_origin.1)
+        .max(incoming_origin.1)
+        .min(out.height());
+    let bottom = overlap_bottom
+        .min(existing_origin.1.saturating_add(existing.height()))
+        .min(incoming_origin.1.saturating_add(incoming.height()))
+        .min(out.height());
 
+    let overlap_h = bottom.saturating_sub(top);
+    let overlap_w = right.saturating_sub(left);
     if overlap_w == 0 || overlap_h == 0 {
-        blit_rgba(incoming, out, offset_x, offset_y);
+        blit_rgba(incoming, out, incoming_origin.0, incoming_origin.1);
         return;
     }
 
     let mut cost = vec![vec![0u32; overlap_h as usize]; overlap_w as usize];
     for x in 0..overlap_w {
         for y in 0..overlap_h {
-            let existing_px = existing.get_pixel(offset_x + x, offset_y + y);
-            let incoming_px = incoming.get_pixel(x, y);
+            let out_x = left + x;
+            let out_y = top + y;
+            let existing_px = existing.get_pixel(
+                out_x.saturating_sub(existing_origin.0),
+                out_y.saturating_sub(existing_origin.1),
+            );
+            let incoming_px = incoming.get_pixel(
+                out_x.saturating_sub(incoming_origin.0),
+                out_y.saturating_sub(incoming_origin.1),
+            );
             cost[x as usize][y as usize] = rgb_distance_sq(*existing_px, *incoming_px);
         }
     }
@@ -2754,24 +2956,25 @@ fn blend_with_horizontal_seam(
 
     for y in 0..incoming.height() {
         for x in 0..incoming.width() {
-            let dx = offset_x + x;
-            let dy = offset_y + y;
+            let dx = incoming_origin.0 + x;
+            let dy = incoming_origin.1 + y;
             if dx >= out.width() || dy >= out.height() {
                 continue;
             }
 
             let src_px = *incoming.get_pixel(x, y);
-            if y >= overlap_h || x >= overlap_w {
+            if dx < left || dx >= right || dy < top || dy >= bottom {
                 out.put_pixel(dx, dy, src_px);
                 continue;
             }
 
-            let seam_y = seam[x as usize] as i32;
-            let y_i = y as i32;
-            if y_i < seam_y - blend_band {
+            let local_x = dx.saturating_sub(left) as usize;
+            let local_y = dy.saturating_sub(top) as i32;
+            let seam_y = seam[local_x] as i32;
+            if local_y < seam_y - blend_band {
                 continue;
             }
-            if y_i > seam_y + blend_band {
+            if local_y > seam_y + blend_band {
                 out.put_pixel(dx, dy, src_px);
                 continue;
             }
@@ -2780,12 +2983,123 @@ fn blend_with_horizontal_seam(
                 0.5
             } else {
                 let top = seam_y - blend_band;
-                ((y_i - top) as f32 / (blend_band * 2) as f32).clamp(0.0, 1.0)
+                ((local_y - top) as f32 / (blend_band * 2) as f32).clamp(0.0, 1.0)
             };
             let dst_px = *out.get_pixel(dx, dy);
             out.put_pixel(dx, dy, mix_rgba(dst_px, src_px, blend_t));
         }
     }
+}
+
+fn estimate_vertical_overlap_shift(
+    existing: &RgbaImage,
+    incoming: &RgbaImage,
+    overlap: u32,
+) -> i32 {
+    let overlap_w = overlap.min(existing.width()).min(incoming.width());
+    if overlap_w == 0 {
+        return 0;
+    }
+    let max_shift = ((existing.height().min(incoming.height()) as f32) * 0.2)
+        .round()
+        .clamp(0.0, 96.0) as i32;
+    if max_shift == 0 {
+        return 0;
+    }
+
+    let x_step = (overlap_w / 40).max(1);
+    let y_step = (existing.height().min(incoming.height()) / 40).max(1);
+    let existing_x_start = existing.width().saturating_sub(overlap_w);
+
+    let mut best_shift = 0;
+    let mut best_score = u128::MAX;
+    for shift in -max_shift..=max_shift {
+        let mut score = 0u128;
+        let mut samples = 0u32;
+        let mut y = 0u32;
+        while y < incoming.height() {
+            let existing_y = y as i32 + shift;
+            if existing_y >= 0 && existing_y < existing.height() as i32 {
+                let existing_y = existing_y as u32;
+                let mut x = 0u32;
+                while x < overlap_w {
+                    let existing_px = existing.get_pixel(existing_x_start + x, existing_y);
+                    let incoming_px = incoming.get_pixel(x, y);
+                    score =
+                        score.saturating_add(rgb_distance_sq(*existing_px, *incoming_px) as u128);
+                    samples = samples.saturating_add(1);
+                    x = x.saturating_add(x_step);
+                }
+            }
+            y = y.saturating_add(y_step);
+        }
+        if samples == 0 {
+            continue;
+        }
+        let avg = score / samples as u128;
+        let penalized = avg.saturating_add((shift.unsigned_abs() as u128).saturating_mul(3));
+        if penalized < best_score {
+            best_score = penalized;
+            best_shift = shift;
+        }
+    }
+
+    best_shift
+}
+
+fn estimate_horizontal_overlap_shift(
+    existing: &RgbaImage,
+    incoming: &RgbaImage,
+    overlap: u32,
+) -> i32 {
+    let overlap_h = overlap.min(existing.height()).min(incoming.height());
+    if overlap_h == 0 {
+        return 0;
+    }
+    let max_shift = ((existing.width().min(incoming.width()) as f32) * 0.2)
+        .round()
+        .clamp(0.0, 96.0) as i32;
+    if max_shift == 0 {
+        return 0;
+    }
+
+    let x_step = (existing.width().min(incoming.width()) / 40).max(1);
+    let y_step = (overlap_h / 40).max(1);
+    let existing_y_start = existing.height().saturating_sub(overlap_h);
+
+    let mut best_shift = 0;
+    let mut best_score = u128::MAX;
+    for shift in -max_shift..=max_shift {
+        let mut score = 0u128;
+        let mut samples = 0u32;
+        let mut y = 0u32;
+        while y < overlap_h {
+            let mut x = 0u32;
+            while x < incoming.width() {
+                let existing_x = x as i32 + shift;
+                if existing_x >= 0 && existing_x < existing.width() as i32 {
+                    let existing_px = existing.get_pixel(existing_x as u32, existing_y_start + y);
+                    let incoming_px = incoming.get_pixel(x, y);
+                    score =
+                        score.saturating_add(rgb_distance_sq(*existing_px, *incoming_px) as u128);
+                    samples = samples.saturating_add(1);
+                }
+                x = x.saturating_add(x_step);
+            }
+            y = y.saturating_add(y_step);
+        }
+        if samples == 0 {
+            continue;
+        }
+        let avg = score / samples as u128;
+        let penalized = avg.saturating_add((shift.unsigned_abs() as u128).saturating_mul(3));
+        if penalized < best_score {
+            best_score = penalized;
+            best_shift = shift;
+        }
+    }
+
+    best_shift
 }
 
 fn compute_vertical_seam(cost: &[Vec<u32>]) -> Vec<usize> {
@@ -3506,8 +3820,7 @@ fn apply_alpha_adjust(
             let px = output.get_pixel_mut(x, y);
             let mut alpha = px[3] as f32 * factor;
             if alpha_from_luma {
-                let luma =
-                    0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32;
+                let luma = 0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32;
                 alpha = if invert_luma { 255.0 - luma } else { luma };
             }
             px[3] = alpha.round().clamp(0.0, 255.0) as u8;
@@ -4108,14 +4421,7 @@ fn draw_rounded_rect_shadow(
         shadow,
     );
     draw_rounded_rect(
-        image,
-        start_x,
-        start_y,
-        end_x,
-        end_y,
-        thickness,
-        filled,
-        color,
+        image, start_x, start_y, end_x, end_y, thickness, filled, color,
     );
 }
 
@@ -4215,14 +4521,7 @@ fn draw_speech_bubble(
     color: Rgba<u8>,
 ) {
     draw_rounded_rect(
-        image,
-        start_x,
-        start_y,
-        end_x,
-        end_y,
-        thickness,
-        filled,
-        color,
+        image, start_x, start_y, end_x, end_y, thickness, filled, color,
     );
     let min_x = start_x.min(end_x);
     let max_x = start_x.max(end_x);
@@ -4769,12 +5068,31 @@ mod tests {
     use super::{
         AlphaBrushOp, CanvasAnchor, ColorAdjustParams, EffectsParams, PanoramaDirection,
         ResizeFilter, RotationInterpolation, ShapeKind, ShapeParams, TransformOp, apply_transform,
-        stitch_images,
+        estimate_vertical_overlap_shift, stitch_images,
     };
 
     fn test_image(width: u32, height: u32) -> DynamicImage {
         let image = RgbaImage::from_pixel(width, height, Rgba([120, 80, 30, 255]));
         DynamicImage::ImageRgba8(image)
+    }
+
+    fn gradient_image(width: u32, height: u32) -> RgbaImage {
+        let mut image = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 255]));
+        for y in 0..height {
+            for x in 0..width {
+                image.put_pixel(
+                    x,
+                    y,
+                    Rgba([
+                        ((x * 5 + y * 3) % 256) as u8,
+                        ((x * 2 + y * 7) % 256) as u8,
+                        ((x * 11 + y * 13) % 256) as u8,
+                        255,
+                    ]),
+                );
+            }
+        }
+        image
     }
 
     #[test]
@@ -4963,5 +5281,38 @@ mod tests {
         let out = stitch_images(&[a, b], PanoramaDirection::Horizontal, 0.1);
         assert_eq!(out.height(), 32);
         assert_eq!(out.width(), 80 + 90 - 8);
+    }
+
+    #[test]
+    fn panorama_shift_estimation_detects_vertical_offset() {
+        let base = gradient_image(96, 72);
+        let mut shifted = RgbaImage::from_pixel(96, 72, Rgba([0, 0, 0, 255]));
+        let expected_shift = 8i32;
+        for y in 0..72 {
+            let src_y = y as i32 + expected_shift;
+            if src_y >= 0 && src_y < 72 {
+                for x in 0..96 {
+                    shifted.put_pixel(x, y, *base.get_pixel(x, src_y as u32));
+                }
+            }
+        }
+
+        let estimated = estimate_vertical_overlap_shift(&base, &shifted, 48);
+        assert!((estimated - expected_shift).abs() <= 1);
+    }
+
+    #[test]
+    fn panorama_stitch_expands_height_for_vertical_alignment_shift() {
+        let base = gradient_image(90, 60);
+        let mut shifted = RgbaImage::from_pixel(90, 60, Rgba([0, 0, 0, 255]));
+        for y in 0u32..60 {
+            let src_y = y.saturating_add(10).min(59);
+            for x in 0..90 {
+                shifted.put_pixel(x, y, *base.get_pixel(x, src_y));
+            }
+        }
+
+        let out = stitch_images(&[base, shifted], PanoramaDirection::Horizontal, 0.2);
+        assert!(out.height() > 60);
     }
 }

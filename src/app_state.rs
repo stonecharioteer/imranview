@@ -203,6 +203,10 @@ impl AppState {
             simulate_srgb_output: true,
             display_gamma: 2.2,
             browsing_wrap_navigation: true,
+            browsing_sort_mode: "name".to_owned(),
+            browsing_sort_descending: false,
+            thumbnails_sort_mode: "name".to_owned(),
+            thumbnails_sort_descending: false,
             zoom_step_percent: 20.0,
             video_frame_step_ms: 40,
             ui_language: "System".to_owned(),
@@ -532,6 +536,14 @@ impl AppState {
 
     pub fn images_in_directory(&self) -> &[PathBuf] {
         &self.images_in_directory
+    }
+
+    pub fn reorder_images_in_directory(&mut self, files: Vec<PathBuf>) {
+        self.images_in_directory = files;
+        self.current_index = self
+            .current_file
+            .as_ref()
+            .and_then(|path| resolve_current_index(&self.images_in_directory, path));
     }
 
     pub fn suggested_save_name(&self) -> Option<String> {

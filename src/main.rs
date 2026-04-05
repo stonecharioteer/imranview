@@ -243,6 +243,14 @@ struct CommandPaletteState {
     request_focus: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct FileSortFacts {
+    name: String,
+    extension: String,
+    modified_epoch_secs: u64,
+    size_bytes: u64,
+}
+
 fn default_scanner_command_template() -> String {
     #[cfg(target_os = "windows")]
     {
@@ -914,6 +922,7 @@ struct BatchScanDialogState {
     jpeg_quality: u8,
     page_count: u32,
     command_template: String,
+    device_name: String,
     dpi: u32,
     grayscale: bool,
 }
@@ -931,6 +940,7 @@ impl Default for BatchScanDialogState {
             jpeg_quality: 90,
             page_count: 1,
             command_template: default_scanner_command_template(),
+            device_name: String::new(),
             dpi: 300,
             grayscale: false,
         }
@@ -1174,6 +1184,43 @@ enum AdvancedOptionsTab {
     FileHandling,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileSortMode {
+    Name,
+    Extension,
+    ModifiedTime,
+    FileSize,
+}
+
+impl FileSortMode {
+    fn as_label(self) -> &'static str {
+        match self {
+            FileSortMode::Name => "Name",
+            FileSortMode::Extension => "Type/Extension",
+            FileSortMode::ModifiedTime => "Modified Time",
+            FileSortMode::FileSize => "File Size",
+        }
+    }
+
+    fn as_settings_value(self) -> &'static str {
+        match self {
+            FileSortMode::Name => "name",
+            FileSortMode::Extension => "extension",
+            FileSortMode::ModifiedTime => "modified",
+            FileSortMode::FileSize => "size",
+        }
+    }
+
+    fn from_settings_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "extension" | "ext" | "type" => FileSortMode::Extension,
+            "modified" | "modified_time" | "date" | "time" => FileSortMode::ModifiedTime,
+            "size" | "file_size" => FileSortMode::FileSize,
+            _ => FileSortMode::Name,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AdvancedOptionsDialogState {
     open: bool,
@@ -1184,6 +1231,10 @@ struct AdvancedOptionsDialogState {
     auto_reopen_after_save: bool,
     hide_toolbar_in_fullscreen: bool,
     browsing_wrap_navigation: bool,
+    browsing_sort_mode: FileSortMode,
+    browsing_sort_descending: bool,
+    thumbnails_sort_mode: FileSortMode,
+    thumbnails_sort_descending: bool,
     zoom_step_percent: f32,
     enable_color_management: bool,
     simulate_srgb_output: bool,
@@ -1208,6 +1259,10 @@ impl Default for AdvancedOptionsDialogState {
             auto_reopen_after_save: true,
             hide_toolbar_in_fullscreen: false,
             browsing_wrap_navigation: true,
+            browsing_sort_mode: FileSortMode::Name,
+            browsing_sort_descending: false,
+            thumbnails_sort_mode: FileSortMode::Name,
+            thumbnails_sort_descending: false,
             zoom_step_percent: 20.0,
             enable_color_management: false,
             simulate_srgb_output: true,
@@ -1500,6 +1555,10 @@ impl ImranViewApp {
             auto_reopen_after_save: settings.auto_reopen_after_save,
             hide_toolbar_in_fullscreen: settings.hide_toolbar_in_fullscreen,
             browsing_wrap_navigation: settings.browsing_wrap_navigation,
+            browsing_sort_mode: FileSortMode::from_settings_value(&settings.browsing_sort_mode),
+            browsing_sort_descending: settings.browsing_sort_descending,
+            thumbnails_sort_mode: FileSortMode::from_settings_value(&settings.thumbnails_sort_mode),
+            thumbnails_sort_descending: settings.thumbnails_sort_descending,
             zoom_step_percent: settings.zoom_step_percent.clamp(5.0, 200.0),
             enable_color_management: settings.enable_color_management,
             simulate_srgb_output: settings.simulate_srgb_output,
@@ -1531,6 +1590,19 @@ impl ImranViewApp {
         settings.hide_toolbar_in_fullscreen =
             self.advanced_options_dialog.hide_toolbar_in_fullscreen;
         settings.browsing_wrap_navigation = self.advanced_options_dialog.browsing_wrap_navigation;
+        settings.browsing_sort_mode = self
+            .advanced_options_dialog
+            .browsing_sort_mode
+            .as_settings_value()
+            .to_owned();
+        settings.browsing_sort_descending = self.advanced_options_dialog.browsing_sort_descending;
+        settings.thumbnails_sort_mode = self
+            .advanced_options_dialog
+            .thumbnails_sort_mode
+            .as_settings_value()
+            .to_owned();
+        settings.thumbnails_sort_descending =
+            self.advanced_options_dialog.thumbnails_sort_descending;
         settings.zoom_step_percent = self.advanced_options_dialog.zoom_step_percent;
         settings.enable_color_management = self.advanced_options_dialog.enable_color_management;
         settings.simulate_srgb_output = self.advanced_options_dialog.simulate_srgb_output;
@@ -2046,6 +2118,7 @@ impl ImranViewApp {
         jpeg_quality: u8,
         dpi: u32,
         grayscale: bool,
+        device_name: Option<String>,
     ) {
         self.queue_utility_command(|request_id| WorkerCommand::ScanNative {
             request_id,
@@ -2057,7 +2130,109 @@ impl ImranViewApp {
             jpeg_quality,
             dpi,
             grayscale,
+            device_name,
         });
+    }
+
+    fn collect_file_sort_facts(paths: &[PathBuf]) -> HashMap<PathBuf, FileSortFacts> {
+        let mut facts = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let mut fact = FileSortFacts {
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default(),
+                extension: path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .unwrap_or_default(),
+                ..FileSortFacts::default()
+            };
+            if let Ok(metadata) = fs::metadata(path) {
+                fact.size_bytes = metadata.len();
+                fact.modified_epoch_secs = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+            }
+            facts.insert(path.clone(), fact);
+        }
+        facts
+    }
+
+    fn sort_paths_in_place(paths: &mut [PathBuf], mode: FileSortMode, descending: bool) {
+        let facts = Self::collect_file_sort_facts(paths);
+        paths.sort_by(|left, right| {
+            let left_fact = facts.get(left).cloned().unwrap_or_default();
+            let right_fact = facts.get(right).cloned().unwrap_or_default();
+            let ordering = match mode {
+                FileSortMode::Name => left_fact.name.cmp(&right_fact.name),
+                FileSortMode::Extension => left_fact
+                    .extension
+                    .cmp(&right_fact.extension)
+                    .then_with(|| left_fact.name.cmp(&right_fact.name)),
+                FileSortMode::ModifiedTime => left_fact
+                    .modified_epoch_secs
+                    .cmp(&right_fact.modified_epoch_secs)
+                    .then_with(|| left_fact.name.cmp(&right_fact.name)),
+                FileSortMode::FileSize => left_fact
+                    .size_bytes
+                    .cmp(&right_fact.size_bytes)
+                    .then_with(|| left_fact.name.cmp(&right_fact.name)),
+            };
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+    }
+
+    fn apply_browsing_sort(&self, files: &mut [PathBuf]) {
+        Self::sort_paths_in_place(
+            files,
+            self.advanced_options_dialog.browsing_sort_mode,
+            self.advanced_options_dialog.browsing_sort_descending,
+        );
+    }
+
+    fn resort_current_directory_listing(&mut self) {
+        let mut files = self.state.images_in_directory().to_vec();
+        if files.is_empty() {
+            return;
+        }
+        self.apply_browsing_sort(&mut files);
+        self.state.reorder_images_in_directory(files);
+        self.scroll_thumbnail_to_current = true;
+    }
+
+    fn sorted_thumbnail_entries(&self, entries: Vec<ThumbnailEntry>) -> Vec<ThumbnailEntry> {
+        if entries.len() <= 1 {
+            return entries;
+        }
+
+        let mut entry_by_path = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            entry_by_path.insert(entry.path.clone(), entry);
+        }
+
+        let mut paths: Vec<PathBuf> = entry_by_path.keys().cloned().collect();
+        Self::sort_paths_in_place(
+            &mut paths,
+            self.advanced_options_dialog.thumbnails_sort_mode,
+            self.advanced_options_dialog.thumbnails_sort_descending,
+        );
+
+        let mut sorted = Vec::with_capacity(paths.len());
+        for path in paths {
+            if let Some(entry) = entry_by_path.remove(&path) {
+                sorted.push(entry);
+            }
+        }
+        sorted
     }
 
     fn dispatch_open_tiff_page(&mut self, path: PathBuf, page_index: u32) {
@@ -2344,6 +2519,8 @@ impl ImranViewApp {
                     return;
                 }
                 self.pending.open_inflight = false;
+                let mut files = files;
+                self.apply_browsing_sort(&mut files);
                 self.state
                     .apply_open_payload(path, directory, files, loaded);
                 self.current_metadata = Some(metadata);
@@ -3688,45 +3865,62 @@ impl ImranViewApp {
         let panel_width = COMMAND_PALETTE_PANEL_WIDTH
             .min((viewport_rect.width() - 28.0).max(420.0))
             .max(420.0);
+        let list_height = COMMAND_PALETTE_PANEL_MAX_HEIGHT
+            .min((viewport_rect.height() * 0.68).max(220.0))
+            .max(220.0);
         egui::Area::new(egui::Id::new("command-palette-panel"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 28.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 let frame = egui::Frame::new()
                     .fill(ui.visuals().window_fill)
                     .stroke(ui.visuals().window_stroke)
                     .corner_radius(egui::CornerRadius::same(platform_window_corner_radius()))
                     .shadow(ui.visuals().window_shadow)
-                    .inner_margin(egui::Margin::symmetric(12, 10));
+                    .inner_margin(egui::Margin::symmetric(10, 8));
                 frame.show(ui, |ui| {
                     ui.set_min_width(panel_width);
                     ui.set_max_width(panel_width);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Command Palette").strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(shortcut) =
-                                shortcut_text(ctx, ShortcutAction::CommandPalette)
-                            {
-                                ui.label(egui::RichText::new(shortcut).small().weak());
-                            }
+                    Self::native_bar_frame(ctx)
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Command Palette").small().strong());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if let Some(shortcut) =
+                                            shortcut_text(ctx, ShortcutAction::CommandPalette)
+                                        {
+                                            ui.label(egui::RichText::new(shortcut).small().weak());
+                                        }
+                                    },
+                                );
+                            });
                         });
+                    ui.add_space(6.0);
+                    let search_frame = egui::Frame::new()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                        .corner_radius(egui::CornerRadius::same(platform_widget_corner_radius()))
+                        .inner_margin(egui::Margin::symmetric(8, 6));
+                    search_frame.show(ui, |ui| {
+                        let query_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.command_palette.query)
+                                .hint_text("Type a command...")
+                                .desired_width(f32::INFINITY)
+                                .frame(false),
+                        );
+                        if self.command_palette.request_focus {
+                            query_response.request_focus();
+                            self.command_palette.request_focus = false;
+                        }
+                        if query_response.changed() {
+                            self.command_palette.selected_index = 0;
+                        }
                     });
-                    let query_response = ui.add(
-                        egui::TextEdit::singleline(&mut self.command_palette.query)
-                            .hint_text("Type a command...")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if self.command_palette.request_focus {
-                        query_response.request_focus();
-                        self.command_palette.request_focus = false;
-                    }
-                    if query_response.changed() {
-                        self.command_palette.selected_index = 0;
-                    }
                     ui.separator();
 
-                    let list_height = COMMAND_PALETTE_PANEL_MAX_HEIGHT
-                        .min((viewport_rect.height() - 120.0).max(180.0));
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .max_height(list_height)
@@ -3755,27 +3949,21 @@ impl ImranViewApp {
 
                                 let selected = visible_index == self.command_palette.selected_index;
                                 let mut title = entry.title.clone();
+                                if let Some(shortcut) = &entry.shortcut {
+                                    title.push_str("    ");
+                                    title.push_str(shortcut);
+                                }
                                 if !entry.enabled {
                                     title.push_str(" (Unavailable)");
                                 }
-                                let response = ui
-                                    .horizontal(|ui| {
-                                        let response = ui.selectable_label(selected, title);
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if let Some(shortcut) = &entry.shortcut {
-                                                    ui.label(
-                                                        egui::RichText::new(shortcut)
-                                                            .small()
-                                                            .weak(),
-                                                    );
-                                                }
-                                            },
-                                        );
-                                        response
-                                    })
-                                    .inner;
+                                let mut button = egui::Button::new(title)
+                                    .min_size(egui::vec2(ui.available_width(), 24.0))
+                                    .frame(false);
+                                if selected {
+                                    button =
+                                        button.fill(Self::native_selected_surface(ui.visuals()));
+                                }
+                                let response = ui.add_enabled(entry.enabled, button);
 
                                 if response.hovered() {
                                     self.command_palette.selected_index = visible_index;
@@ -5613,6 +5801,23 @@ impl ImranViewApp {
                             ui.close_menu();
                         }
                     });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if let Some(shortcut) =
+                            shortcut_text(ctx, ShortcutAction::CommandPalette)
+                        {
+                            format!("Command Palette  {shortcut}")
+                        } else {
+                            "Command Palette".to_owned()
+                        };
+                        if ui
+                            .button(label)
+                            .on_hover_text("Search all menu commands")
+                            .clicked()
+                        {
+                            self.open_command_palette();
+                        }
+                    });
                 });
             });
     }
@@ -5826,7 +6031,7 @@ impl ImranViewApp {
             return;
         }
 
-        let entries = self.state.thumbnail_entries();
+        let entries = self.sorted_thumbnail_entries(self.state.thumbnail_entries());
         if self.last_logged_thumb_entry_count != Some(entries.len()) {
             log::debug!(
                 target: "imranview::thumb",
@@ -5935,6 +6140,96 @@ impl ImranViewApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            let mut browsing_sort_changed = false;
+            let mut thumbnail_sort_changed = false;
+
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui
+                        .add_enabled(self.state.has_image(), egui::Button::new("Open current"))
+                        .clicked()
+                    {
+                        if let Some(path) = self.state.current_file_path() {
+                            self.dispatch_open(path, false);
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Open image...").clicked() {
+                        self.open_path_dialog();
+                        ui.close_menu();
+                    }
+                    if ui.button("Refresh folder panel").clicked() {
+                        self.clear_folder_panel_cache();
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Options", |ui| {
+                    ui.label("Browse/navigation order");
+                    for mode in [
+                        FileSortMode::Name,
+                        FileSortMode::Extension,
+                        FileSortMode::ModifiedTime,
+                        FileSortMode::FileSize,
+                    ] {
+                        if ui
+                            .selectable_label(
+                                self.advanced_options_dialog.browsing_sort_mode == mode,
+                                mode.as_label(),
+                            )
+                            .clicked()
+                        {
+                            self.advanced_options_dialog.browsing_sort_mode = mode;
+                            browsing_sort_changed = true;
+                        }
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.advanced_options_dialog.browsing_sort_descending,
+                            "Descending order",
+                        )
+                        .changed()
+                    {
+                        browsing_sort_changed = true;
+                    }
+
+                    ui.separator();
+                    ui.label("Thumbnail grid order");
+                    for mode in [
+                        FileSortMode::Name,
+                        FileSortMode::Extension,
+                        FileSortMode::ModifiedTime,
+                        FileSortMode::FileSize,
+                    ] {
+                        if ui
+                            .selectable_label(
+                                self.advanced_options_dialog.thumbnails_sort_mode == mode,
+                                mode.as_label(),
+                            )
+                            .clicked()
+                        {
+                            self.advanced_options_dialog.thumbnails_sort_mode = mode;
+                            thumbnail_sort_changed = true;
+                        }
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.advanced_options_dialog.thumbnails_sort_descending,
+                            "Descending thumbnails",
+                        )
+                        .changed()
+                    {
+                        thumbnail_sort_changed = true;
+                    }
+                });
+            });
+
+            if browsing_sort_changed {
+                self.resort_current_directory_listing();
+            }
+            if browsing_sort_changed || thumbnail_sort_changed {
+                self.persist_settings();
+            }
+
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Thumbnails");
                 ui.separator();
@@ -5951,7 +6246,7 @@ impl ImranViewApp {
             }
             ui.separator();
 
-            let entries = self.state.thumbnail_entries();
+            let entries = self.sorted_thumbnail_entries(self.state.thumbnail_entries());
             if entries.is_empty() {
                 ui.label("No images in this folder.");
                 return;
@@ -6022,6 +6317,9 @@ impl ImranViewApp {
             response.response.scroll_to_me(Some(egui::Align::Center));
             self.scroll_thumbnail_to_current = false;
         }
+        if response.response.double_clicked() {
+            self.dispatch_open(entry.path.clone(), false);
+        }
 
         if self.thumb_cache.get(&entry.path).is_none()
             && (entry.decode_hint
@@ -6057,6 +6355,145 @@ impl ImranViewApp {
                 });
             });
         }
+    }
+
+    fn show_main_viewer_context_menu(&mut self, ctx: &egui::Context, response: &egui::Response) {
+        response.context_menu(|ui| {
+            if ui
+                .button(menu_item_label(ctx, ShortcutAction::Open, "Open..."))
+                .clicked()
+            {
+                self.open_path_dialog();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    self.state.has_image(),
+                    egui::Button::new(menu_item_label(ctx, ShortcutAction::Save, "Save")),
+                )
+                .clicked()
+            {
+                self.dispatch_save(None, false, self.default_save_options());
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    self.state.has_image(),
+                    egui::Button::new(menu_item_label(ctx, ShortcutAction::SaveAs, "Save As...")),
+                )
+                .clicked()
+            {
+                self.open_save_as_dialog();
+                ui.close_menu();
+            }
+
+            ui.separator();
+
+            if ui
+                .add_enabled(
+                    self.state.has_image(),
+                    egui::Button::new(menu_item_label(
+                        ctx,
+                        ShortcutAction::PreviousImage,
+                        "Previous image",
+                    )),
+                )
+                .clicked()
+            {
+                self.open_previous();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    self.state.has_image(),
+                    egui::Button::new(menu_item_label(
+                        ctx,
+                        ShortcutAction::NextImage,
+                        "Next image",
+                    )),
+                )
+                .clicked()
+            {
+                self.open_next();
+                ui.close_menu();
+            }
+
+            ui.separator();
+
+            if ui
+                .add_enabled(
+                    self.state.has_image(),
+                    egui::Button::new(menu_item_label(ctx, ShortcutAction::ZoomIn, "Zoom in")),
+                )
+                .clicked()
+            {
+                self.zoom_in();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    self.state.has_image(),
+                    egui::Button::new(menu_item_label(ctx, ShortcutAction::ZoomOut, "Zoom out")),
+                )
+                .clicked()
+            {
+                self.zoom_out();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    self.state.has_image(),
+                    egui::Button::new(menu_item_label(ctx, ShortcutAction::Fit, "Fit to window")),
+                )
+                .clicked()
+            {
+                self.zoom_fit();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    self.state.has_image(),
+                    egui::Button::new(menu_item_label(
+                        ctx,
+                        ShortcutAction::ActualSize,
+                        "Actual size",
+                    )),
+                )
+                .clicked()
+            {
+                self.zoom_actual();
+                ui.close_menu();
+            }
+
+            ui.separator();
+            if ui
+                .add_enabled(self.state.has_image(), egui::Button::new("Rotate left"))
+                .clicked()
+            {
+                self.dispatch_transform(TransformOp::RotateLeft);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(self.state.has_image(), egui::Button::new("Rotate right"))
+                .clicked()
+            {
+                self.dispatch_transform(TransformOp::RotateRight);
+                ui.close_menu();
+            }
+
+            ui.separator();
+            if ui
+                .button(menu_item_label(
+                    ctx,
+                    ShortcutAction::CommandPalette,
+                    "Command palette...",
+                ))
+                .clicked()
+            {
+                self.open_command_palette();
+                ui.close_menu();
+            }
+        });
     }
 
     fn draw_main_viewer(&mut self, ctx: &egui::Context) {
@@ -6144,7 +6581,7 @@ impl ImranViewApp {
                         ui.label("Load a compare image from Image > Load compare image...");
                     });
                 }
-            } else if let Some(texture) = &self.main_texture {
+            } else if let Some(texture) = self.main_texture.clone() {
                 let mut desired_size =
                     egui::vec2(self.state.image_width(), self.state.image_height());
                 let main_image_rect: egui::Rect;
@@ -6166,6 +6603,7 @@ impl ImranViewApp {
                             ui.add(egui::Image::new((texture.id(), desired_size)))
                         })
                         .inner;
+                    self.show_main_viewer_context_menu(ctx, &response);
                     main_image_rect = response.rect;
                 } else {
                     desired_size *= self.state.zoom_factor();
@@ -6177,9 +6615,10 @@ impl ImranViewApp {
                         });
                     self.main_scroll_offset = output.state.offset;
                     self.main_viewport_size = output.inner_rect.size();
+                    self.show_main_viewer_context_menu(ctx, &output.inner);
                     main_image_rect = output.inner.rect;
                 }
-                self.draw_magnifier_overlay(ctx, texture, main_image_rect);
+                self.draw_magnifier_overlay(ctx, &texture, main_image_rect);
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("ImranView\n\nFile > Open...");
@@ -8250,9 +8689,13 @@ impl ImranViewApp {
                             egui::DragValue::new(&mut app.batch_scan_dialog.dpi).range(75..=1200),
                         );
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Device (optional)");
+                        ui.text_edit_singleline(&mut app.batch_scan_dialog.device_name);
+                    });
                     ui.checkbox(&mut app.batch_scan_dialog.grayscale, "Capture grayscale");
                     ui.small(
-                        "Uses platform scanner backend (SANE on Linux/macOS, WIA on Windows).",
+                        "Uses platform scanner backend (SANE on Linux/macOS, WIA on Windows). Use scanner command mode for advanced custom pipelines.",
                     );
                 }
                 ui.label("Output folder");
@@ -8360,6 +8803,11 @@ impl ImranViewApp {
                             app.batch_scan_dialog.jpeg_quality,
                             app.batch_scan_dialog.dpi,
                             app.batch_scan_dialog.grayscale,
+                            if app.batch_scan_dialog.device_name.trim().is_empty() {
+                                None
+                            } else {
+                                Some(app.batch_scan_dialog.device_name.trim().to_owned())
+                            },
                         );
                         *open_state = false;
                     }
@@ -8645,7 +9093,9 @@ impl ImranViewApp {
                         }
                     });
                 }
-                ui.small("Requires external `magick` (ImageMagick) with ICC profile support.");
+                ui.small(
+                    "Runs in-process using Little CMS. Source profile is optional; defaults to embedded profile (JPEG/PNG) or sRGB.",
+                );
                 ui.separator();
                 if ui.button("Run profile conversion").clicked() {
                     let target_profile =
@@ -9121,6 +9571,59 @@ impl ImranViewApp {
                             "Wrap next/previous navigation at folder boundaries",
                         );
                         ui.small("When disabled, left/right navigation stops at first/last image.");
+                        ui.separator();
+                        ui.label("Browse/navigation order");
+                        egui::ComboBox::from_id_salt("advanced-browsing-sort")
+                            .selected_text(
+                                app.advanced_options_dialog
+                                    .browsing_sort_mode
+                                    .as_label(),
+                            )
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    FileSortMode::Name,
+                                    FileSortMode::Extension,
+                                    FileSortMode::ModifiedTime,
+                                    FileSortMode::FileSize,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut app.advanced_options_dialog.browsing_sort_mode,
+                                        mode,
+                                        mode.as_label(),
+                                    );
+                                }
+                            });
+                        ui.checkbox(
+                            &mut app.advanced_options_dialog.browsing_sort_descending,
+                            "Descending browse/navigation order",
+                        );
+
+                        ui.separator();
+                        ui.label("Thumbnail order");
+                        egui::ComboBox::from_id_salt("advanced-thumbnails-sort")
+                            .selected_text(
+                                app.advanced_options_dialog
+                                    .thumbnails_sort_mode
+                                    .as_label(),
+                            )
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    FileSortMode::Name,
+                                    FileSortMode::Extension,
+                                    FileSortMode::ModifiedTime,
+                                    FileSortMode::FileSize,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut app.advanced_options_dialog.thumbnails_sort_mode,
+                                        mode,
+                                        mode.as_label(),
+                                    );
+                                }
+                            });
+                        ui.checkbox(
+                            &mut app.advanced_options_dialog.thumbnails_sort_descending,
+                            "Descending thumbnail order",
+                        );
                     }
                     AdvancedOptionsTab::Editing => {
                         ui.add(
@@ -9272,7 +9775,14 @@ impl ImranViewApp {
             },
         );
         self.advanced_options_dialog.open = open;
+        let sort_changed = self.advanced_options_dialog.browsing_sort_mode
+            != before.browsing_sort_mode
+            || self.advanced_options_dialog.browsing_sort_descending
+                != before.browsing_sort_descending;
         if self.advanced_options_dialog != before {
+            if sort_changed {
+                self.resort_current_directory_listing();
+            }
             self.apply_selected_skin(ctx);
             self.update_main_texture_from_state(ctx);
             self.persist_settings();
@@ -9504,6 +10014,10 @@ impl ImranViewApp {
                     if let Some(captured) = self.primary_capture_metadata() {
                         ui.separator();
                         ui.label(format!("Captured: {captured}"));
+                    }
+                    if let Some(shortcut) = shortcut_text(ctx, ShortcutAction::CommandPalette) {
+                        ui.separator();
+                        ui.label(format!("Commands: {shortcut}"));
                     }
                 });
             });
