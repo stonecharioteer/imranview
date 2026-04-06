@@ -383,6 +383,18 @@ fn read_exif_fields(path: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+fn clamp_prefix_to_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if max_bytes >= text.len() {
+        return text;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn extract_xmp_fields(data: &[u8]) -> Vec<(String, String)> {
     let text = String::from_utf8_lossy(data);
     let marker_start = text
@@ -402,7 +414,7 @@ fn extract_xmp_fields(data: &[u8]) -> Vec<(String, String)> {
                 .map(|index| index + "</rdf:RDF>".len())
         })
         .unwrap_or_else(|| tail.len().min(64 * 1024));
-    let snippet = &tail[..marker_end.min(tail.len())];
+    let snippet = clamp_prefix_to_char_boundary(tail, marker_end);
 
     let mut fields = Vec::new();
     for tag in [
@@ -910,8 +922,8 @@ fn split_jpeg_header_and_scan(bytes: &[u8]) -> Result<(Vec<JpegSegment>, Vec<u8>
 mod tests {
     use super::{
         SaveFormat, build_jpeg_icc_app2_segments, embed_jpeg_icc_profile, embed_png_icc_profile,
-        extract_jpeg_icc_profile, extract_png_icc_profile, parse_jpeg_icc_app2_segment,
-        save_image_with_format,
+        extract_jpeg_icc_profile, extract_png_icc_profile, extract_xmp_fields,
+        parse_jpeg_icc_app2_segment, save_image_with_format,
     };
     use image::{DynamicImage, Rgba, RgbaImage};
     use tempfile::tempdir;
@@ -960,5 +972,17 @@ mod tests {
             .expect("PNG ICC extraction should succeed")
             .expect("PNG profile should exist");
         assert_eq!(extracted, icc_payload);
+    }
+
+    #[test]
+    fn extract_xmp_fields_handles_non_char_boundary_fallback_cutoff() {
+        let mut xmp = String::from("<x:xmpmeta>");
+        let filler_len = 65_535usize.saturating_sub(xmp.len());
+        xmp.push_str(&"A".repeat(filler_len));
+        xmp.push('\u{05a9}');
+        xmp.push_str("tail-without-closing-tag");
+
+        let fields = extract_xmp_fields(xmp.as_bytes());
+        assert!(!fields.is_empty(), "expected fallback raw snippet field");
     }
 }
