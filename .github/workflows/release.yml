@@ -24,19 +24,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve release version (YYYY.MM.DD.XX)
+      - name: Resolve release version (semver-compatible YYYY.M.D.N)
         id: version
         shell: bash
         run: |
           set -euo pipefail
           git fetch --tags --force
 
-          today="$(date -u +%Y.%m.%d)"
+          # Cargo requires semver numeric identifiers without leading zeroes.
+          today="$(date -u +%Y.%-m.%-d)"
           max_idx=-1
           while IFS= read -r tag; do
-            if [[ "$tag" =~ ^${today//./\\.}\.([0-9]{2})$ ]]; then
-              idx="${BASH_REMATCH[1]}"
-              value=$((10#$idx))
+            if [[ "$tag" =~ ^${today//./\\.}\.([0-9]+)$ ]]; then
+              value="${BASH_REMATCH[1]}"
               if (( value > max_idx )); then
                 max_idx=$value
               fi
@@ -44,12 +44,8 @@ jobs:
           done < <(git tag -l "${today}.*")
 
           next=$((max_idx + 1))
-          if (( next > 99 )); then
-            echo "all release slots used for ${today} (00-99 exhausted)" >&2
-            exit 1
-          fi
+          version="${today}.${next}"
 
-          version="$(printf "%s.%02d" "$today" "$next")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$version" >> "$GITHUB_OUTPUT"
           echo "release_name=ImranView $version" >> "$GITHUB_OUTPUT"
