@@ -1680,6 +1680,7 @@ impl ImranViewApp {
         self.preview_refine_due_at = None;
         self.preview_refined_for_path = None;
         self.inflight_preloads.remove(&path);
+        let queued_at = Instant::now();
         let request_id = self.next_request_id();
         self.pending.latest_open = request_id;
         self.pending.open_inflight = true;
@@ -1692,7 +1693,11 @@ impl ImranViewApp {
 
         if self
             .worker_tx
-            .send(WorkerCommand::OpenImage { request_id, path })
+            .send(WorkerCommand::OpenImage {
+                request_id,
+                path,
+                queued_at,
+            })
             .is_err()
         {
             self.pending.open_inflight = false;
@@ -1702,6 +1707,7 @@ impl ImranViewApp {
     }
 
     fn dispatch_open_directory(&mut self, directory: PathBuf) {
+        let queued_at = Instant::now();
         let request_id = self.next_request_id();
         self.pending.latest_open = request_id;
         self.pending.open_inflight = true;
@@ -1718,6 +1724,7 @@ impl ImranViewApp {
             .send(WorkerCommand::OpenDirectory {
                 request_id,
                 directory,
+                queued_at,
             })
             .is_err()
         {
@@ -2889,9 +2896,6 @@ impl ImranViewApp {
                         self.pending.utility_inflight = false;
                         self.state.set_error(error_message);
                     }
-                    (WorkerRequestKind::Preload, _) => {
-                        // Preload failures are expected for transient/unsupported files.
-                    }
                     (WorkerRequestKind::Thumbnail, _) => {
                         // Keep this low-noise for folders with unreadable files.
                     }
@@ -3277,7 +3281,7 @@ impl ImranViewApp {
             "Open...",
             Some(ShortcutAction::Open),
             MenuCommand::FileOpen,
-            &["load", "file", "browse"],
+            &["load", "file", "browse", "quick", "quick open"],
         );
         push(
             "File",
@@ -4143,7 +4147,15 @@ impl ImranViewApp {
             dialog = dialog.set_directory(directory);
         }
 
-        if let Some(path) = dialog.pick_file() {
+        let picker_started = Instant::now();
+        let picked_path = dialog.pick_file();
+        crate::perf::log_timing(
+            "open_picker",
+            picker_started.elapsed(),
+            crate::perf::OPEN_PICKER_BUDGET,
+        );
+
+        if let Some(path) = picked_path {
             self.dispatch_open(path, false);
         }
     }
@@ -4162,7 +4174,14 @@ impl ImranViewApp {
         if let Some(directory) = preferred_directory {
             dialog = dialog.set_directory(directory);
         }
-        if let Some(path) = dialog.pick_file() {
+        let picker_started = Instant::now();
+        let picked_path = dialog.pick_file();
+        crate::perf::log_timing(
+            "compare_picker",
+            picker_started.elapsed(),
+            crate::perf::OPEN_PICKER_BUDGET,
+        );
+        if let Some(path) = picked_path {
             self.dispatch_compare_open(path);
         }
     }
@@ -4909,7 +4928,6 @@ impl ImranViewApp {
             WorkerRequestKind::Open => format!("Unable to open image: {error}"),
             WorkerRequestKind::Save => format!("Unable to save image: {error}"),
             WorkerRequestKind::Edit => format!("Unable to apply edit: {error}"),
-            WorkerRequestKind::Preload => format!("Background preload skipped: {error}"),
             WorkerRequestKind::Thumbnail => format!("Thumbnail decode failed: {error}"),
             WorkerRequestKind::Batch => format!("Batch convert failed: {error}"),
             WorkerRequestKind::File => format!("File operation failed: {error}"),

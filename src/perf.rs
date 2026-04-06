@@ -13,6 +13,14 @@ pub const OPEN_IMAGE_BUDGET: PerfBudget = PerfBudget {
     target_ms: 150,
     threshold_ms: 300,
 };
+pub const OPEN_QUEUE_BUDGET: PerfBudget = PerfBudget {
+    target_ms: 40,
+    threshold_ms: 120,
+};
+pub const OPEN_PICKER_BUDGET: PerfBudget = PerfBudget {
+    target_ms: 200,
+    threshold_ms: 750,
+};
 #[cfg(test)]
 pub const NAVIGATION_BUDGET: PerfBudget = PerfBudget {
     target_ms: 90,

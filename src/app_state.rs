@@ -550,6 +550,13 @@ impl AppState {
             .as_ref()
             .filter(|path| is_existing_dir(path))
             .cloned()
+            .or_else(|| {
+                self.recent_directories
+                    .iter()
+                    .find(|path| is_existing_dir(path))
+                    .cloned()
+            })
+            .or_else(default_pictures_directory)
     }
 
     pub fn current_directory_path(&self) -> Option<PathBuf> {
@@ -1015,6 +1022,20 @@ fn push_recent_path(list: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+fn default_pictures_directory() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    let pictures = home.join("Pictures");
+    if is_existing_dir(&pictures) {
+        return Some(pictures);
+    }
+    if is_existing_dir(&home) {
+        return Some(home);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1023,6 +1044,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::AppState;
+    use crate::settings::PersistedSettings;
 
     fn write_test_png(path: &Path, width: u32, height: u32, color: [u8; 4]) {
         let image = RgbaImage::from_pixel(width, height, Rgba(color));
@@ -1186,6 +1208,20 @@ mod tests {
         assert_eq!(
             state.recent_directories().first(),
             Some(&dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn preferred_open_directory_uses_recent_folder_when_no_current_folder() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let mut settings = PersistedSettings::default();
+        settings.last_open_directory = None;
+        settings.recent_directories = vec![dir.path().to_path_buf()];
+
+        let state = AppState::new_with_settings(settings);
+        assert_eq!(
+            state.preferred_open_directory().as_deref(),
+            Some(dir.path())
         );
     }
 }
