@@ -24,27 +24,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve release version (semver-compatible YYYY.M.D.N)
+      - name: Resolve release version (semver-compatible YYYY.M.D-N)
         id: version
         shell: bash
         run: |
           set -euo pipefail
           git fetch --tags --force
 
-          # Cargo requires semver numeric identifiers without leading zeroes.
-          today="$(date -u +%Y.%-m.%-d)"
+          # Keep semver core to exactly three numeric components and use
+          # prerelease suffix for same-day increments.
+          base="$(date -u +%Y.%-m.%-d)"
           max_idx=-1
           while IFS= read -r tag; do
-            if [[ "$tag" =~ ^${today//./\\.}\.([0-9]+)$ ]]; then
+            if [[ "$tag" =~ ^${base//./\\.}-([0-9]+)$ ]]; then
               value="${BASH_REMATCH[1]}"
               if (( value > max_idx )); then
                 max_idx=$value
               fi
             fi
-          done < <(git tag -l "${today}.*")
+          done < <(git tag -l "${base}-*")
 
           next=$((max_idx + 1))
-          version="${today}.${next}"
+          version="${base}-${next}"
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$version" >> "$GITHUB_OUTPUT"
