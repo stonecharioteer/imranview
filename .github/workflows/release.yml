@@ -52,62 +52,9 @@ jobs:
           echo "release_name=ImranView $version" >> "$GITHUB_OUTPUT"
           echo "Resolved release version: $version"
 
-  bump_cargo_version:
-    needs: prepare
-    runs-on: ubuntu-latest
-    outputs:
-      release_sha: ${{ steps.bump.outputs.release_sha }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Update Cargo.toml version and push commit
-        id: bump
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          version='${{ needs.prepare.outputs.version }}'
-          branch='${{ github.ref_name }}'
-
-          awk -v version="$version" '
-            BEGIN { in_package = 0; replaced = 0 }
-            /^\[package\]$/ { in_package = 1; print; next }
-            in_package && /^\[/ && $0 != "[package]" { in_package = 0 }
-            in_package && !replaced && $0 ~ /^version[[:space:]]*=[[:space:]]*"[^"]+"/ {
-              sub(/"[^"]+"/, "\"" version "\"")
-              replaced = 1
-            }
-            { print }
-            END {
-              if (!replaced) {
-                print "failed to locate [package] version in Cargo.toml" > "/dev/stderr"
-                exit 2
-              }
-            }
-          ' Cargo.toml > Cargo.toml.tmp
-          mv Cargo.toml.tmp Cargo.toml
-
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add Cargo.toml
-
-          if git diff --cached --quiet; then
-            echo "Cargo.toml already at release version $version"
-          else
-            git commit -m "chore(release): cut $version"
-            git push origin "HEAD:$branch"
-          fi
-
-          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
   build:
     needs:
       - prepare
-      - bump_cargo_version
     strategy:
       fail-fast: false
       matrix:
@@ -125,10 +72,8 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Checkout release commit
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.bump_cargo_version.outputs.release_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -142,6 +87,7 @@ jobs:
             libturbojpeg0-dev \
             libglib2.0-dev \
             libgtk-3-dev \
+            libxdo-dev \
             libxkbcommon-dev \
             libxcb-render0-dev \
             libxcb-shape0-dev \
@@ -198,8 +144,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
           $version = '${{ needs.prepare.outputs.version }}'
-          $outFile = "dist\\imranview-$version-windows-x86_64-setup.exe"
-          $bin = "target\\release\\imranview.exe"
+          $outFile = "dist/imranview-$version-windows-x86_64-setup.exe"
+          $bin = "target/release/imranview.exe"
           $nsis = "${env:ProgramFiles(x86)}\\NSIS\\makensis.exe"
 
           if (!(Test-Path $bin)) {
@@ -220,18 +166,20 @@ jobs:
   publish:
     needs:
       - prepare
-      - bump_cargo_version
       - build
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout release commit
+      - name: Checkout branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.bump_cargo_version.outputs.release_sha }}
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -254,6 +202,45 @@ jobs:
           echo "Artifacts to release:"
           printf ' - %s\n' "${artifacts[@]}"
 
+      - name: Bump Cargo.toml and Cargo.lock version and push
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version='${{ needs.prepare.outputs.version }}'
+          branch='${{ github.ref_name }}'
+
+          awk -v version="$version" '
+            BEGIN { in_package = 0; replaced = 0 }
+            /^\[package\]$/ { in_package = 1; print; next }
+            in_package && /^\[/ && $0 != "[package]" { in_package = 0 }
+            in_package && !replaced && $0 ~ /^version[[:space:]]*=[[:space:]]*"[^"]+"/ {
+              sub(/"[^"]+"/, "\"" version "\"")
+              replaced = 1
+            }
+            { print }
+            END {
+              if (!replaced) {
+                print "failed to locate [package] version in Cargo.toml" > "/dev/stderr"
+                exit 2
+              }
+            }
+          ' Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+
+          cargo generate-lockfile
+
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock
+
+          if git diff --cached --quiet; then
+            echo "Cargo.toml/Cargo.lock already at release version $version"
+          else
+            git commit -m "chore(release): cut $version"
+            git push origin "HEAD:$branch"
+          fi
+
       - name: Create and push release tag
         shell: bash
         run: |
@@ -268,7 +255,7 @@ jobs:
 
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git tag "$tag" "${{ needs.bump_cargo_version.outputs.release_sha }}"
+          git tag "$tag"
           git push origin "refs/tags/$tag"
 
       - name: Publish GitHub Release

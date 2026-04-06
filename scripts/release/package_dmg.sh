@@ -84,7 +84,9 @@ bundle_dylib_tree() {
   local root_binary="$1"
   local -a queue=("$root_binary")
   local current dep resolved bundled base
-  declare -A seen
+  local seen_file
+  seen_file="$(mktemp)"
+  trap 'rm -f "$seen_file"' RETURN
 
   while (( ${#queue[@]} > 0 )); do
     current="${queue[0]}"
@@ -92,10 +94,10 @@ bundle_dylib_tree() {
 
     local key
     key="$(realpath "$current" 2>/dev/null || echo "$current")"
-    if [[ -n "${seen[$key]:-}" ]]; then
+    if grep -Fqx "$key" "$seen_file"; then
       continue
     fi
-    seen[$key]=1
+    printf '%s\n' "$key" >> "$seen_file"
 
     while IFS= read -r dep; do
       [[ -z "$dep" ]] && continue
