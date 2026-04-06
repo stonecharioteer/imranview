@@ -1,4 +1,5 @@
 mod app_state;
+mod catalog;
 mod image_io;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod native_menu;
@@ -6,9 +7,11 @@ mod perf;
 mod plugin;
 mod settings;
 mod shortcuts;
+mod turbojpeg_backend;
 mod worker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -20,7 +23,10 @@ use eframe::egui;
 
 use crate::app_state::{AppState, ThumbnailEntry};
 use crate::image_io::MetadataSummary;
-use crate::image_io::{collect_images_in_directory, is_supported_image_path};
+use crate::image_io::{
+    PREVIEW_REFINE_DIMENSION, collect_images_in_directory, is_supported_image_path,
+    load_image_payload,
+};
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use crate::native_menu::{NativeMenu, NativeMenuAction};
 use crate::plugin::{PluginContext, PluginEvent, PluginHost};
@@ -47,6 +53,7 @@ const RECENT_MENU_LIMIT: usize = 12;
 const COMMAND_PALETTE_PANEL_WIDTH: f32 = 700.0;
 const COMMAND_PALETTE_PANEL_MAX_HEIGHT: f32 = 560.0;
 const COMMAND_PALETTE_MAX_VISIBLE: usize = 320;
+const PREVIEW_REFINE_IDLE_DELAY_MS: u64 = 220;
 
 const fn platform_window_corner_radius() -> u8 {
     #[cfg(target_os = "macos")]
@@ -221,6 +228,7 @@ enum MenuCommand {
     ViewZoomMagnifier,
     OptionsPerformanceCache,
     OptionsClearRuntimeCaches,
+    OptionsPurgeFolderCatalogCache,
     OptionsAdvancedSettings,
     HelpAbout,
 }
@@ -376,6 +384,7 @@ struct PendingRequests {
     compare_inflight: bool,
     print_inflight: bool,
     utility_inflight: bool,
+    picker_inflight: bool,
     queued_navigation_steps: i32,
 }
 
@@ -389,7 +398,21 @@ impl PendingRequests {
             || self.compare_inflight
             || self.print_inflight
             || self.utility_inflight
+            || self.picker_inflight
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PickerRequestKind {
+    OpenImage,
+    CompareImage,
+}
+
+#[derive(Debug)]
+struct PickerResult {
+    kind: PickerRequestKind,
+    picked_path: Option<PathBuf>,
+    blocked: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -809,6 +832,11 @@ struct PerformanceDialogState {
     thumb_cache_max_mb: usize,
     preload_cache_entry_cap: usize,
     preload_cache_max_mb: usize,
+    catalog_cache_size_bytes: u64,
+    catalog_tracked_folders: usize,
+    catalog_persisted_folders: usize,
+    catalog_entries: usize,
+    catalog_last_error: Option<String>,
 }
 
 impl Default for PerformanceDialogState {
@@ -819,6 +847,11 @@ impl Default for PerformanceDialogState {
             thumb_cache_max_mb: THUMB_TEXTURE_CACHE_MAX_BYTES / (1024 * 1024),
             preload_cache_entry_cap: 6,
             preload_cache_max_mb: 192,
+            catalog_cache_size_bytes: 0,
+            catalog_tracked_folders: 0,
+            catalog_persisted_folders: 0,
+            catalog_entries: 0,
+            catalog_last_error: None,
         }
     }
 }
@@ -1367,6 +1400,8 @@ struct ImranViewApp {
     worker_tx: Sender<WorkerCommand>,
     thumbnail_tx: Sender<PathBuf>,
     worker_rx: Receiver<WorkerResult>,
+    picker_result_tx: Sender<PickerResult>,
+    picker_result_rx: Receiver<PickerResult>,
     request_sequence: u64,
     pending: PendingRequests,
     main_texture: Option<egui::TextureHandle>,
@@ -1422,6 +1457,8 @@ struct ImranViewApp {
     info_message: Option<String>,
     slideshow_running: bool,
     slideshow_last_tick: Instant,
+    preview_refine_due_at: Option<Instant>,
+    preview_refined_for_path: Option<PathBuf>,
     show_about_window: bool,
     command_palette: CommandPaletteState,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -1443,6 +1480,7 @@ impl ImranViewApp {
         let (worker_tx, worker_thread_rx) = mpsc::channel::<WorkerCommand>();
         let (thumbnail_tx, thumbnail_rx) = mpsc::channel::<PathBuf>();
         let (worker_thread_tx, worker_rx) = mpsc::channel::<WorkerResult>();
+        let (picker_result_tx, picker_result_rx) = mpsc::channel::<PickerResult>();
         let worker_config = worker::WorkerConfig {
             preload_cache_cap: state.preload_cache_entry_cap(),
             preload_cache_max_bytes: state.preload_cache_max_mb().saturating_mul(1024 * 1024),
@@ -1461,6 +1499,8 @@ impl ImranViewApp {
             worker_tx,
             thumbnail_tx,
             worker_rx,
+            picker_result_tx,
+            picker_result_rx,
             request_sequence: 1,
             pending: PendingRequests::default(),
             main_texture: None,
@@ -1521,6 +1561,8 @@ impl ImranViewApp {
             info_message: None,
             slideshow_running: false,
             slideshow_last_tick: Instant::now(),
+            preview_refine_due_at: None,
+            preview_refined_for_path: None,
             show_about_window: false,
             command_palette: CommandPaletteState::default(),
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -1655,7 +1697,10 @@ impl ImranViewApp {
         if !from_navigation {
             self.pending.queued_navigation_steps = 0;
         }
+        self.preview_refine_due_at = None;
+        self.preview_refined_for_path = None;
         self.inflight_preloads.remove(&path);
+        let queued_at = Instant::now();
         let request_id = self.next_request_id();
         self.pending.latest_open = request_id;
         self.pending.open_inflight = true;
@@ -1668,7 +1713,11 @@ impl ImranViewApp {
 
         if self
             .worker_tx
-            .send(WorkerCommand::OpenImage { request_id, path })
+            .send(WorkerCommand::OpenImage {
+                request_id,
+                path,
+                queued_at,
+            })
             .is_err()
         {
             self.pending.open_inflight = false;
@@ -1678,6 +1727,7 @@ impl ImranViewApp {
     }
 
     fn dispatch_open_directory(&mut self, directory: PathBuf) {
+        let queued_at = Instant::now();
         let request_id = self.next_request_id();
         self.pending.latest_open = request_id;
         self.pending.open_inflight = true;
@@ -1694,6 +1744,7 @@ impl ImranViewApp {
             .send(WorkerCommand::OpenDirectory {
                 request_id,
                 directory,
+                queued_at,
             })
             .is_err()
         {
@@ -2407,6 +2458,9 @@ impl ImranViewApp {
             return;
         }
 
+        self.preview_refine_due_at = None;
+        self.preview_refined_for_path = None;
+
         self.pending.queued_navigation_steps =
             (self.pending.queued_navigation_steps + step).clamp(-256, 256);
         log::debug!(
@@ -2427,21 +2481,14 @@ impl ImranViewApp {
             return;
         }
 
-        let forward = queued > 0;
         let wrap_navigation = self.advanced_options_dialog.browsing_wrap_navigation;
-        let path_result = if forward {
-            self.state.resolve_next_path_with_wrap(wrap_navigation)
-        } else {
-            self.state.resolve_previous_path_with_wrap(wrap_navigation)
-        };
+        let path_result = self
+            .state
+            .resolve_offset_path_with_wrap(queued as isize, wrap_navigation);
 
         match path_result {
             Ok(path) => {
-                if forward {
-                    self.pending.queued_navigation_steps -= 1;
-                } else {
-                    self.pending.queued_navigation_steps += 1;
-                }
+                self.pending.queued_navigation_steps = 0;
                 self.dispatch_open(path, true);
             }
             Err(err) => {
@@ -2499,6 +2546,74 @@ impl ImranViewApp {
         }
     }
 
+    fn poll_picker_results(&mut self) {
+        loop {
+            match self.picker_result_rx.try_recv() {
+                Ok(result) => self.handle_picker_result(result),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending.picker_inflight = false;
+                    log::error!(target: "imranview::ui", "picker result channel disconnected");
+                    self.state
+                        .set_error("picker result channel disconnected unexpectedly");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_picker_result(&mut self, result: PickerResult) {
+        self.pending.picker_inflight = false;
+
+        let PickerResult {
+            kind,
+            picked_path,
+            blocked,
+        } = result;
+
+        let perf_label = match kind {
+            PickerRequestKind::OpenImage => "open_picker",
+            PickerRequestKind::CompareImage => "compare_picker",
+        };
+
+        crate::perf::log_timing(perf_label, blocked, crate::perf::OPEN_PICKER_BUDGET);
+
+        match (kind, picked_path) {
+            (PickerRequestKind::OpenImage, Some(path)) => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "open picker selected path={} blocked={}ms",
+                    path.display(),
+                    blocked.as_millis()
+                );
+                self.dispatch_open(path, false);
+            }
+            (PickerRequestKind::CompareImage, Some(path)) => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "compare picker selected path={} blocked={}ms",
+                    path.display(),
+                    blocked.as_millis()
+                );
+                self.dispatch_compare_open(path);
+            }
+            (PickerRequestKind::OpenImage, None) => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "open picker cancelled blocked={}ms",
+                    blocked.as_millis()
+                );
+            }
+            (PickerRequestKind::CompareImage, None) => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "compare picker cancelled blocked={}ms",
+                    blocked.as_millis()
+                );
+            }
+        }
+    }
+
     fn handle_worker_result(&mut self, ctx: &egui::Context, result: WorkerResult) {
         match result {
             WorkerResult::Opened {
@@ -2526,8 +2641,14 @@ impl ImranViewApp {
                 self.current_metadata = Some(metadata);
                 self.clear_folder_panel_cache();
                 self.update_main_texture_from_state(ctx);
+                self.schedule_preview_refine_after_idle();
+                if self.preview_refine_due_at.is_some() {
+                    ctx.request_repaint_after(Duration::from_millis(PREVIEW_REFINE_IDLE_DELAY_MS));
+                }
                 self.scroll_thumbnail_to_current = true;
-                self.schedule_preload_neighbors();
+                if self.pending.queued_navigation_steps == 0 {
+                    self.schedule_preload_neighbors();
+                }
                 let thumb_entries = self.state.thumbnail_entries().len();
                 log::debug!(
                     target: "imranview::worker",
@@ -2863,9 +2984,6 @@ impl ImranViewApp {
                         self.pending.utility_inflight = false;
                         self.state.set_error(error_message);
                     }
-                    (WorkerRequestKind::Preload, _) => {
-                        // Preload failures are expected for transient/unsupported files.
-                    }
                     (WorkerRequestKind::Thumbnail, _) => {
                         // Keep this low-noise for folders with unreadable files.
                     }
@@ -2995,6 +3113,7 @@ impl ImranViewApp {
             | MenuCommand::ViewToggleThumbnailWindow
             | MenuCommand::OptionsPerformanceCache
             | MenuCommand::OptionsClearRuntimeCaches
+            | MenuCommand::OptionsPurgeFolderCatalogCache
             | MenuCommand::OptionsAdvancedSettings
             | MenuCommand::HelpAbout => true,
             MenuCommand::FileOpenRecent(path) => path.is_file(),
@@ -3152,6 +3271,7 @@ impl ImranViewApp {
             MenuCommand::ViewZoomMagnifier => self.open_magnifier_dialog(),
             MenuCommand::OptionsPerformanceCache => self.open_performance_dialog(),
             MenuCommand::OptionsClearRuntimeCaches => self.clear_runtime_caches(),
+            MenuCommand::OptionsPurgeFolderCatalogCache => self.purge_folder_catalog_cache(),
             MenuCommand::OptionsAdvancedSettings => self.open_advanced_options_dialog(),
             MenuCommand::HelpAbout => self.open_about_window(),
         }
@@ -3249,7 +3369,7 @@ impl ImranViewApp {
             "Open...",
             Some(ShortcutAction::Open),
             MenuCommand::FileOpen,
-            &["load", "file", "browse"],
+            &["load", "file", "browse", "quick", "quick open"],
         );
         push(
             "File",
@@ -3714,6 +3834,15 @@ impl ImranViewApp {
         );
         push(
             "Options",
+            "Purge folder catalog cache",
+            None,
+            MenuCommand::OptionsPurgeFolderCatalogCache,
+            &[
+                "purge", "catalog", "folder", "cache", "disk", "sqlite", "database",
+            ],
+        );
+        push(
+            "Options",
             "Advanced settings...",
             None,
             MenuCommand::OptionsAdvancedSettings,
@@ -4092,42 +4221,106 @@ impl ImranViewApp {
         self.slideshow_last_tick = Instant::now();
     }
 
-    fn open_path_dialog(&mut self) {
+    fn launch_picker_async(&mut self, kind: PickerRequestKind) {
+        if self.pending.picker_inflight {
+            log::debug!(
+                target: "imranview::ui",
+                "picker request ignored because another picker is in-flight"
+            );
+            return;
+        }
+
+        let preferred_directory_started = Instant::now();
         let preferred_directory = self.state.preferred_open_directory();
-        let mut dialog = rfd::FileDialog::new().set_title("Open image").add_filter(
-            "Images",
-            &[
-                "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg", "pbm", "pgm",
-                "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
-            ],
-        );
+        let preferred_directory_elapsed = preferred_directory_started.elapsed();
+        let preferred_directory_label = preferred_directory
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_owned());
 
-        if let Some(directory) = preferred_directory {
-            dialog = dialog.set_directory(directory);
+        match kind {
+            PickerRequestKind::OpenImage => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "open picker prepare preferred_directory={} lookup={}ms",
+                    preferred_directory_label,
+                    preferred_directory_elapsed.as_millis()
+                );
+            }
+            PickerRequestKind::CompareImage => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "compare picker prepare preferred_directory={} lookup={}ms",
+                    preferred_directory_label,
+                    preferred_directory_elapsed.as_millis()
+                );
+            }
         }
 
-        if let Some(path) = dialog.pick_file() {
-            self.dispatch_open(path, false);
-        }
+        self.pending.picker_inflight = true;
+        let picker_result_tx = self.picker_result_tx.clone();
+        std::thread::spawn(move || {
+            match kind {
+                PickerRequestKind::OpenImage => {
+                    log::debug!(
+                        target: "imranview::ui",
+                        "open picker invoking native dialog (no explicit set_directory) preferred_directory_candidate={}",
+                        preferred_directory_label
+                    );
+                }
+                PickerRequestKind::CompareImage => {
+                    log::debug!(
+                        target: "imranview::ui",
+                        "compare picker invoking native dialog (no explicit set_directory) preferred_directory_candidate={}",
+                        preferred_directory_label
+                    );
+                }
+            }
+
+            let dialog = match kind {
+                PickerRequestKind::OpenImage => rfd::FileDialog::new().set_title("Open image").add_filter(
+                    "Images",
+                    &[
+                        "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg", "pbm",
+                        "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
+                    ],
+                ),
+                PickerRequestKind::CompareImage => rfd::FileDialog::new()
+                    .set_title("Open compare image")
+                    .add_filter(
+                        "Images",
+                        &[
+                            "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg",
+                            "pbm", "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
+                        ],
+                    ),
+            };
+
+            let picker_started = Instant::now();
+            let picked_path = dialog.pick_file();
+            let blocked = picker_started.elapsed();
+            if picker_result_tx
+                .send(PickerResult {
+                    kind,
+                    picked_path,
+                    blocked,
+                })
+                .is_err()
+            {
+                log::warn!(
+                    target: "imranview::ui",
+                    "failed to send picker result back to UI thread"
+                );
+            }
+        });
+    }
+
+    fn open_path_dialog(&mut self) {
+        self.launch_picker_async(PickerRequestKind::OpenImage);
     }
 
     fn open_compare_path_dialog(&mut self) {
-        let preferred_directory = self.state.preferred_open_directory();
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Open compare image")
-            .add_filter(
-                "Images",
-                &[
-                    "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg", "pbm",
-                    "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
-                ],
-            );
-        if let Some(directory) = preferred_directory {
-            dialog = dialog.set_directory(directory);
-        }
-        if let Some(path) = dialog.pick_file() {
-            self.dispatch_compare_open(path);
-        }
+        self.launch_picker_async(PickerRequestKind::CompareImage);
     }
 
     fn open_save_as_dialog(&mut self) {
@@ -4732,6 +4925,7 @@ impl ImranViewApp {
         self.performance_dialog.thumb_cache_max_mb = self.state.thumb_cache_max_mb();
         self.performance_dialog.preload_cache_entry_cap = self.state.preload_cache_entry_cap();
         self.performance_dialog.preload_cache_max_mb = self.state.preload_cache_max_mb();
+        self.refresh_catalog_cache_stats();
         self.performance_dialog.open = true;
     }
 
@@ -4743,6 +4937,37 @@ impl ImranViewApp {
         self.inflight_thumbnails.clear();
         self.inflight_preloads.clear();
         self.info_message = Some("Cleared thumbnail and preload caches".to_owned());
+    }
+
+    fn refresh_catalog_cache_stats(&mut self) {
+        match crate::catalog::cache_stats() {
+            Ok(stats) => {
+                self.performance_dialog.catalog_cache_size_bytes = stats.database_bytes;
+                self.performance_dialog.catalog_tracked_folders = stats.tracked_folders;
+                self.performance_dialog.catalog_persisted_folders = stats.persisted_folders;
+                self.performance_dialog.catalog_entries = stats.persisted_entries;
+                self.performance_dialog.catalog_last_error = None;
+            }
+            Err(err) => {
+                self.performance_dialog.catalog_last_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn purge_folder_catalog_cache(&mut self) {
+        match crate::catalog::purge_cache() {
+            Ok(bytes_freed) => {
+                self.refresh_catalog_cache_stats();
+                self.info_message = Some(format!(
+                    "Purged folder catalog cache ({})",
+                    human_file_size(bytes_freed)
+                ));
+            }
+            Err(err) => {
+                self.state
+                    .set_error(format!("failed to purge folder catalog cache: {err}"));
+            }
+        }
     }
 
     fn apply_performance_settings(&mut self) {
@@ -4840,7 +5065,6 @@ impl ImranViewApp {
             WorkerRequestKind::Open => format!("Unable to open image: {error}"),
             WorkerRequestKind::Save => format!("Unable to save image: {error}"),
             WorkerRequestKind::Edit => format!("Unable to apply edit: {error}"),
-            WorkerRequestKind::Preload => format!("Background preload skipped: {error}"),
             WorkerRequestKind::Thumbnail => format!("Thumbnail decode failed: {error}"),
             WorkerRequestKind::Batch => format!("Batch convert failed: {error}"),
             WorkerRequestKind::File => format!("File operation failed: {error}"),
@@ -4877,6 +5101,65 @@ impl ImranViewApp {
 
         self.open_next();
         self.slideshow_last_tick = Instant::now();
+    }
+
+    fn schedule_preview_refine_after_idle(&mut self) {
+        if !self.state.downscaled_for_preview() {
+            self.preview_refine_due_at = None;
+            return;
+        }
+        self.preview_refine_due_at =
+            Some(Instant::now() + Duration::from_millis(PREVIEW_REFINE_IDLE_DELAY_MS));
+        self.preview_refined_for_path = None;
+    }
+
+    fn maybe_refine_preview_after_idle(&mut self, ctx: &egui::Context) {
+        let Some(due_at) = self.preview_refine_due_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now < due_at {
+            let wait = due_at.saturating_duration_since(now);
+            ctx.request_repaint_after(wait.min(Duration::from_millis(32)));
+            return;
+        }
+        if self.pending.open_inflight
+            || self.pending.queued_navigation_steps != 0
+            || self.slideshow_running
+        {
+            self.schedule_preview_refine_after_idle();
+            return;
+        }
+        let Some(path) = self.state.current_file_path() else {
+            self.preview_refine_due_at = None;
+            return;
+        };
+        if self.preview_refined_for_path.as_ref() == Some(&path) {
+            self.preview_refine_due_at = None;
+            return;
+        }
+        if !self.state.downscaled_for_preview() {
+            self.preview_refine_due_at = None;
+            return;
+        }
+        match self
+            .state
+            .refresh_preview_from_working(PREVIEW_REFINE_DIMENSION)
+        {
+            Ok(()) => {
+                self.preview_refined_for_path = Some(path);
+                self.preview_refine_due_at = None;
+                self.update_main_texture_from_state(ctx);
+                log::debug!(target: "imranview::perf", "refined preview after idle pause");
+            }
+            Err(err) => {
+                log::debug!(
+                    target: "imranview::perf",
+                    "skipped preview refine: {err:#}"
+                );
+                self.preview_refine_due_at = None;
+            }
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -5782,6 +6065,10 @@ impl ImranViewApp {
                         }
                         if ui.button("Clear runtime caches").clicked() {
                             self.clear_runtime_caches();
+                            ui.close_menu();
+                        }
+                        if ui.button("Purge folder catalog cache").clicked() {
+                            self.purge_folder_catalog_cache();
                             ui.close_menu();
                         }
                         if ui.button("Advanced settings...").clicked() {
@@ -6735,7 +7022,7 @@ impl ImranViewApp {
                     }
                     ui.vertical(|ui| {
                         ui.heading("ImranView");
-                        ui.label("Imran, brother of Irfan");
+                        ui.label("If you are Irfan, then I'm your brother.");
                         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     });
                 });
@@ -8250,6 +8537,33 @@ impl ImranViewApp {
                         egui::DragValue::new(&mut app.performance_dialog.preload_cache_max_mb)
                             .range(32..=2048),
                     );
+                });
+
+                ui.separator();
+                ui.label("Folder catalog cache (disk)");
+                ui.label(format!(
+                    "Database size: {}",
+                    human_file_size(app.performance_dialog.catalog_cache_size_bytes)
+                ));
+                ui.label(format!(
+                    "Tracked folders: {} | Persisted folders: {} | Indexed entries: {}",
+                    app.performance_dialog.catalog_tracked_folders,
+                    app.performance_dialog.catalog_persisted_folders,
+                    app.performance_dialog.catalog_entries
+                ));
+                if let Some(error) = app.performance_dialog.catalog_last_error.as_ref() {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("Catalog error: {error}"),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh catalog stats").clicked() {
+                        app.refresh_catalog_cache_stats();
+                    }
+                    if ui.button("Purge folder catalog cache").clicked() {
+                        app.purge_folder_catalog_cache();
+                    }
                 });
 
                 ui.separator();
@@ -10015,6 +10329,10 @@ impl ImranViewApp {
                         ui.separator();
                         ui.label(format!("Captured: {captured}"));
                     }
+                    if self.pending.picker_inflight {
+                        ui.separator();
+                        ui.label("Picker: opening…");
+                    }
                     if let Some(shortcut) = shortcut_text(ctx, ShortcutAction::CommandPalette) {
                         ui.separator();
                         ui.label(format!("Commands: {shortcut}"));
@@ -10028,9 +10346,11 @@ impl eframe::App for ImranViewApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.maybe_install_native_menu(frame);
         self.poll_worker_results(ctx);
+        self.poll_picker_results();
         self.handle_native_menu_events(ctx);
         self.run_shortcuts(ctx);
         self.run_slideshow_tick();
+        self.maybe_refine_preview_after_idle(ctx);
         self.sync_viewport_state(ctx);
 
         if self.should_draw_in_window_menu() {
@@ -10089,6 +10409,7 @@ impl eframe::App for ImranViewApp {
 
         if self.pending.has_inflight()
             || !self.inflight_thumbnails.is_empty()
+            || self.preview_refine_due_at.is_some()
             || self.slideshow_running
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -10177,6 +10498,205 @@ fn human_file_size(bytes: u64) -> String {
     }
 }
 
+fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
+    if sorted_values.is_empty() {
+        return 0.0;
+    }
+    let clamped = percentile.clamp(0.0, 100.0);
+    let rank = ((clamped / 100.0) * sorted_values.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted_values.len() - 1);
+    sorted_values[index]
+}
+
+fn push_slowest_sample(samples: &mut Vec<(f64, PathBuf)>, elapsed_ms: f64, path: &Path) {
+    const MAX_SLOWEST: usize = 5;
+    let insertion = samples
+        .iter()
+        .position(|(existing, _)| elapsed_ms > *existing)
+        .unwrap_or(samples.len());
+    if insertion < MAX_SLOWEST {
+        samples.insert(insertion, (elapsed_ms, path.to_path_buf()));
+        if samples.len() > MAX_SLOWEST {
+            samples.pop();
+        }
+    } else if samples.len() < MAX_SLOWEST {
+        samples.push((elapsed_ms, path.to_path_buf()));
+    }
+}
+
+struct RecursiveImageScan {
+    files: Vec<PathBuf>,
+    directories_scanned: usize,
+    scan_errors: usize,
+    scan_error_samples: Vec<(PathBuf, String)>,
+}
+
+fn collect_images_recursively(root: &Path) -> RecursiveImageScan {
+    const MAX_SCAN_ERROR_SAMPLES: usize = 5;
+
+    let mut files = Vec::new();
+    let mut directories_scanned = 0usize;
+    let mut scan_errors = 0usize;
+    let mut scan_error_samples = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(directory) = stack.pop() {
+        directories_scanned += 1;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(err) => {
+                scan_errors += 1;
+                if scan_error_samples.len() < MAX_SCAN_ERROR_SAMPLES {
+                    scan_error_samples.push((directory.clone(), err.to_string()));
+                }
+                continue;
+            }
+        };
+
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    scan_errors += 1;
+                    if scan_error_samples.len() < MAX_SCAN_ERROR_SAMPLES {
+                        scan_error_samples.push((directory.clone(), err.to_string()));
+                    }
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    scan_errors += 1;
+                    if scan_error_samples.len() < MAX_SCAN_ERROR_SAMPLES {
+                        scan_error_samples.push((path.clone(), err.to_string()));
+                    }
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() && is_supported_image_path(&path) {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+    RecursiveImageScan {
+        files,
+        directories_scanned,
+        scan_errors,
+        scan_error_samples,
+    }
+}
+
+fn run_perf_transition(directory: PathBuf) -> Result<()> {
+    if !directory.is_dir() {
+        return Err(anyhow!(
+            "perf-transition expects a directory, got {}",
+            directory.display()
+        ));
+    }
+
+    let scan = collect_images_recursively(&directory);
+    let files = scan.files;
+    if files.is_empty() {
+        return Err(anyhow!(
+            "no supported images found in {} (recursive scan)",
+            directory.display()
+        ));
+    }
+
+    let total_files = files.len();
+    println!("perf-transition");
+    println!("directory: {}", directory.display());
+    println!("directories_scanned: {}", scan.directories_scanned);
+    println!("scan_errors: {}", scan.scan_errors);
+    println!("images_found: {total_files}");
+    println!();
+
+    let run_started = Instant::now();
+    let mut decode_ms = Vec::with_capacity(total_files);
+    let mut slowest = Vec::new();
+    let mut failure_count = 0usize;
+    let mut failure_samples: Vec<(PathBuf, String)> = Vec::new();
+    let progress_interval = if total_files >= 10_000 { 1_000 } else { 250 };
+
+    for (index, path) in files.iter().enumerate() {
+        let started = Instant::now();
+        match load_image_payload(path) {
+            Ok(_) => {
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                decode_ms.push(elapsed_ms);
+                push_slowest_sample(&mut slowest, elapsed_ms, path);
+            }
+            Err(err) => {
+                failure_count += 1;
+                if failure_samples.len() < 5 {
+                    failure_samples.push((path.clone(), err.to_string()));
+                }
+            }
+        }
+
+        let processed = index + 1;
+        if processed % progress_interval == 0 || processed == total_files {
+            eprintln!("processed {processed}/{total_files}");
+        }
+    }
+
+    if decode_ms.is_empty() {
+        return Err(anyhow!(
+            "failed to decode every supported image in {}",
+            directory.display()
+        ));
+    }
+
+    decode_ms.sort_by(|left, right| left.total_cmp(right));
+    let elapsed_seconds = run_started.elapsed().as_secs_f64();
+    let decoded = decode_ms.len();
+    println!("decoded_images: {decoded}");
+    println!("failed_images: {failure_count}");
+    println!("elapsed_s: {:.2}", elapsed_seconds);
+    println!(
+        "throughput_images_per_s: {:.2}",
+        decoded as f64 / elapsed_seconds.max(0.000_001)
+    );
+    println!("median_ms: {:.2}", percentile(&decode_ms, 50.0));
+    println!("p75_ms: {:.2}", percentile(&decode_ms, 75.0));
+    println!("p90_ms: {:.2}", percentile(&decode_ms, 90.0));
+    println!("p99_ms: {:.2}", percentile(&decode_ms, 99.0));
+
+    if !slowest.is_empty() {
+        println!();
+        println!("slowest_samples:");
+        for (elapsed_ms, path) in &slowest {
+            println!("  {:.2} ms  {}", elapsed_ms, path.display());
+        }
+    }
+
+    if !failure_samples.is_empty() {
+        println!();
+        println!("failed_samples:");
+        for (path, error) in &failure_samples {
+            println!("  {} => {}", path.display(), error);
+        }
+    }
+
+    if !scan.scan_error_samples.is_empty() {
+        println!();
+        println!("scan_error_samples:");
+        for (path, error) in &scan.scan_error_samples {
+            println!("  {} => {}", path.display(), error);
+        }
+    }
+
+    Ok(())
+}
+
 fn init_logging() {
     let env = env_logger::Env::default().default_filter_or("info");
     let mut builder = env_logger::Builder::from_env(env);
@@ -10186,7 +10706,23 @@ fn init_logging() {
 
 fn main() -> Result<()> {
     init_logging();
-    let cli_path = std::env::args_os().nth(1).map(PathBuf::from);
+    let mut args = std::env::args_os();
+    let _binary = args.next();
+    let first_arg = args.next();
+    if first_arg.as_deref() == Some(OsStr::new("perf-transition")) {
+        let Some(directory) = args.next() else {
+            return Err(anyhow!(
+                "usage: imranview perf-transition <DIR>\nexample: imranview perf-transition ~/Pictures/wallpaper/phone"
+            ));
+        };
+        if args.next().is_some() {
+            return Err(anyhow!(
+                "usage: imranview perf-transition <DIR>\nexample: imranview perf-transition ~/Pictures/wallpaper/phone"
+            ));
+        }
+        return run_perf_transition(PathBuf::from(directory));
+    }
+    let cli_path = first_arg.map(PathBuf::from);
     let startup_settings = load_settings();
     log::info!(target: "imranview::startup", "launching ImranView");
 

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
 use std::thread;
 use std::time::Instant;
 
@@ -14,16 +14,20 @@ use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use lcms2::{Intent, PixelFormat, Profile, Transform};
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::list_images_in_directory;
 use crate::image_io::{
     LoadedImagePayload, MetadataSummary, SaveFormat, ThumbnailPayload, collect_images_in_directory,
     embed_icc_profile_best_effort, extract_embedded_icc_profile, extract_metadata_summary,
     infer_save_format, load_image_payload, load_thumbnail_payload, load_working_image,
     payload_from_working_image, preserve_metadata_best_effort, save_image_with_format,
 };
-use crate::perf::{EDIT_IMAGE_BUDGET, OPEN_IMAGE_BUDGET, SAVE_IMAGE_BUDGET, log_timing};
+use crate::perf::{
+    EDIT_IMAGE_BUDGET, OPEN_IMAGE_BUDGET, OPEN_QUEUE_BUDGET, SAVE_IMAGE_BUDGET, log_timing,
+};
 
 const PRELOAD_CACHE_CAP: usize = 6;
 const PRELOAD_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
+const PRELOAD_WORK_QUEUE_CAP: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerConfig {
@@ -47,7 +51,6 @@ pub enum WorkerRequestKind {
     Open,
     Save,
     Edit,
-    Preload,
     Thumbnail,
     Batch,
     File,
@@ -385,10 +388,12 @@ pub enum WorkerCommand {
     OpenImage {
         request_id: u64,
         path: PathBuf,
+        queued_at: Instant,
     },
     OpenDirectory {
         request_id: u64,
         directory: PathBuf,
+        queued_at: Instant,
     },
     SaveImage {
         request_id: u64,
@@ -676,12 +681,28 @@ pub fn spawn_workers(
     result_tx: Sender<WorkerResult>,
     config: WorkerConfig,
 ) {
+    let preload_cache = Arc::new(Mutex::new(PreloadCache::new(
+        config.preload_cache_cap,
+        config.preload_cache_max_bytes,
+    )));
+    let (preload_tx, preload_rx) = std::sync::mpsc::sync_channel::<PathBuf>(PRELOAD_WORK_QUEUE_CAP);
+
     log::debug!(target: "imranview::worker", "spawning primary worker thread");
     let _ = thread::Builder::new()
         .name("imranview-worker".to_owned())
         .spawn({
             let result_tx = result_tx.clone();
-            move || run_worker(command_rx, result_tx, config)
+            let preload_cache = Arc::clone(&preload_cache);
+            move || run_worker(command_rx, result_tx, preload_cache, preload_tx)
+        });
+
+    log::debug!(target: "imranview::worker", "spawning preload worker thread");
+    let _ = thread::Builder::new()
+        .name("imranview-preload".to_owned())
+        .spawn({
+            let result_tx = result_tx.clone();
+            let preload_cache = Arc::clone(&preload_cache);
+            move || run_preload_worker(preload_rx, result_tx, preload_cache)
         });
 
     spawn_thumbnail_workers(thumbnail_rx, result_tx, config.thumbnail_workers);
@@ -722,23 +743,26 @@ fn thumbnail_worker_count(configured_workers: usize) -> usize {
 fn run_worker(
     command_rx: Receiver<WorkerCommand>,
     result_tx: Sender<WorkerResult>,
-    config: WorkerConfig,
+    preload_cache: Arc<Mutex<PreloadCache>>,
+    preload_tx: SyncSender<PathBuf>,
 ) {
     log::debug!(target: "imranview::worker", "worker thread started");
-    let mut preload_cache =
-        PreloadCache::new(config.preload_cache_cap, config.preload_cache_max_bytes);
     while let Ok(command) = command_rx.recv() {
         let result = match command {
-            WorkerCommand::OpenImage { request_id, path } => {
-                Some(run_open(request_id, path, &mut preload_cache))
-            }
+            WorkerCommand::OpenImage {
+                request_id,
+                path,
+                queued_at,
+            } => Some(run_open(request_id, path, queued_at, &preload_cache)),
             WorkerCommand::OpenDirectory {
                 request_id,
                 directory,
+                queued_at,
             } => Some(run_open_directory(
                 request_id,
                 directory,
-                &mut preload_cache,
+                queued_at,
+                &preload_cache,
             )),
             WorkerCommand::SaveImage {
                 request_id,
@@ -760,7 +784,25 @@ fn run_worker(
                 op,
                 image,
             } => Some(run_transform(request_id, op, image)),
-            WorkerCommand::PreloadImage { path } => run_preload(path, &mut preload_cache),
+            WorkerCommand::PreloadImage { path } => match preload_tx.try_send(path.clone()) {
+                Ok(()) => None,
+                Err(TrySendError::Full(path)) => {
+                    log::debug!(
+                        target: "imranview::worker",
+                        "preload queue full, skipping {}",
+                        path.display()
+                    );
+                    Some(WorkerResult::Preloaded { path })
+                }
+                Err(TrySendError::Disconnected(path)) => {
+                    log::warn!(
+                        target: "imranview::worker",
+                        "preload worker disconnected, skipping {}",
+                        path.display()
+                    );
+                    Some(WorkerResult::Preloaded { path })
+                }
+            },
             WorkerCommand::BatchConvert {
                 request_id,
                 options,
@@ -942,7 +984,10 @@ fn run_worker(
                 preload_cache_cap,
                 preload_cache_max_bytes,
             } => {
-                preload_cache =
+                let mut cache = preload_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *cache =
                     PreloadCache::new(preload_cache_cap.max(1), preload_cache_max_bytes.max(1));
                 log::debug!(
                     target: "imranview::worker",
@@ -965,6 +1010,26 @@ fn run_worker(
         }
     }
     log::debug!(target: "imranview::worker", "worker thread stopped");
+}
+
+fn run_preload_worker(
+    preload_rx: Receiver<PathBuf>,
+    result_tx: Sender<WorkerResult>,
+    preload_cache: Arc<Mutex<PreloadCache>>,
+) {
+    log::debug!(target: "imranview::worker", "preload worker thread started");
+    while let Ok(path) = preload_rx.recv() {
+        if let Some(result) = run_preload(path, &preload_cache) {
+            if result_tx.send(result).is_err() {
+                log::warn!(
+                    target: "imranview::worker",
+                    "result channel disconnected, preload worker exiting"
+                );
+                break;
+            }
+        }
+    }
+    log::debug!(target: "imranview::worker", "preload worker thread stopped");
 }
 
 fn run_thumbnail_worker(
@@ -1005,16 +1070,43 @@ fn run_thumbnail_worker(
     );
 }
 
-fn run_open(request_id: u64, path: PathBuf, preload_cache: &mut PreloadCache) -> WorkerResult {
+fn take_preloaded(
+    path: &Path,
+    preload_cache: &Arc<Mutex<PreloadCache>>,
+) -> Option<LoadedImagePayload> {
+    let mut cache = preload_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.take(path)
+}
+
+fn insert_preloaded(
+    path: PathBuf,
+    payload: LoadedImagePayload,
+    preload_cache: &Arc<Mutex<PreloadCache>>,
+) {
+    let mut cache = preload_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(path, payload);
+}
+
+fn run_open(
+    request_id: u64,
+    path: PathBuf,
+    queued_at: Instant,
+    preload_cache: &Arc<Mutex<PreloadCache>>,
+) -> WorkerResult {
     log::debug!(
         target: "imranview::worker",
         "open start request_id={} path={}",
         request_id,
         path.display()
     );
+    log_timing("open_queue", queued_at.elapsed(), OPEN_QUEUE_BUDGET);
     let started = Instant::now();
     let output = (|| -> Result<WorkerResult> {
-        let loaded = if let Some(cached) = preload_cache.take(&path) {
+        let loaded = if let Some(cached) = take_preloaded(&path, preload_cache) {
             log::debug!(
                 target: "imranview::worker",
                 "open cache hit request_id={} path={}",
@@ -1029,7 +1121,7 @@ fn run_open(request_id: u64, path: PathBuf, preload_cache: &mut PreloadCache) ->
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        let files = collect_images_in_directory(&directory)?;
+        let files = list_images_in_directory(&directory)?;
         let metadata = extract_metadata_summary(&path);
         Ok(WorkerResult::Opened {
             request_id,
@@ -1052,7 +1144,8 @@ fn run_open(request_id: u64, path: PathBuf, preload_cache: &mut PreloadCache) ->
 fn run_open_directory(
     request_id: u64,
     directory: PathBuf,
-    preload_cache: &mut PreloadCache,
+    queued_at: Instant,
+    preload_cache: &Arc<Mutex<PreloadCache>>,
 ) -> WorkerResult {
     log::debug!(
         target: "imranview::worker",
@@ -1060,14 +1153,15 @@ fn run_open_directory(
         request_id,
         directory.display()
     );
+    log_timing("open_queue", queued_at.elapsed(), OPEN_QUEUE_BUDGET);
     let started = Instant::now();
     let output = (|| -> Result<WorkerResult> {
-        let files = collect_images_in_directory(&directory)?;
+        let files = list_images_in_directory(&directory)?;
         let path = files
             .first()
             .cloned()
             .context("selected folder has no supported images")?;
-        let loaded = if let Some(cached) = preload_cache.take(&path) {
+        let loaded = if let Some(cached) = take_preloaded(&path, preload_cache) {
             log::debug!(
                 target: "imranview::worker",
                 "open directory cache hit request_id={} path={}",
@@ -1097,7 +1191,7 @@ fn run_open_directory(
     })
 }
 
-fn run_preload(path: PathBuf, preload_cache: &mut PreloadCache) -> Option<WorkerResult> {
+fn run_preload(path: PathBuf, preload_cache: &Arc<Mutex<PreloadCache>>) -> Option<WorkerResult> {
     log::debug!(
         target: "imranview::worker",
         "preload start path={}",
@@ -1105,7 +1199,7 @@ fn run_preload(path: PathBuf, preload_cache: &mut PreloadCache) -> Option<Worker
     );
     match load_image_payload(&path) {
         Ok(payload) => {
-            preload_cache.insert(path.clone(), payload);
+            insert_preloaded(path.clone(), payload, preload_cache);
             Some(WorkerResult::Preloaded { path })
         }
         Err(err) => {
@@ -1115,11 +1209,7 @@ fn run_preload(path: PathBuf, preload_cache: &mut PreloadCache) -> Option<Worker
                 path.display(),
                 err
             );
-            Some(WorkerResult::Failed {
-                request_id: None,
-                kind: WorkerRequestKind::Preload,
-                error: err.to_string(),
-            })
+            Some(WorkerResult::Preloaded { path })
         }
     }
 }

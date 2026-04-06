@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use image::DynamicImage;
 
-use crate::image_io::LoadedImagePayload;
+use crate::image_io::{LoadedImagePayload, render_preview_rgba_with_max};
 #[cfg(test)]
 use crate::image_io::{
     collect_images_in_directory, load_image_payload, payload_from_working_image, save_image,
@@ -342,6 +342,17 @@ impl AppState {
         self.resolve_adjacent_path(-1, wrap_navigation)
     }
 
+    pub fn resolve_offset_path_with_wrap(
+        &self,
+        offset_steps: isize,
+        wrap_navigation: bool,
+    ) -> Result<PathBuf> {
+        if offset_steps == 0 {
+            return self.current_file_path().context("no image loaded");
+        }
+        self.resolve_adjacent_path(offset_steps, wrap_navigation)
+    }
+
     #[cfg(test)]
     pub fn save_current_as(&mut self, path: PathBuf) -> Result<()> {
         self.save_to_path(path, true)
@@ -357,6 +368,17 @@ impl AppState {
             .as_ref()
             .map(|image| Arc::clone(&image.working_image))
             .context("no image loaded")
+    }
+
+    pub fn refresh_preview_from_working(&mut self, max_dimension: u32) -> Result<()> {
+        let image = self.current_image.as_mut().context("no image loaded")?;
+        let (preview_rgba, preview_width, preview_height, downscaled_for_preview) =
+            render_preview_rgba_with_max(image.working_image.as_ref(), max_dimension);
+        image.preview_rgba = Arc::from(preview_rgba.into_boxed_slice());
+        image.preview_width = preview_width;
+        image.preview_height = preview_height;
+        image.downscaled_for_preview = downscaled_for_preview;
+        Ok(())
     }
 
     pub fn current_file_path(&self) -> Option<PathBuf> {
@@ -528,6 +550,13 @@ impl AppState {
             .as_ref()
             .filter(|path| is_existing_dir(path))
             .cloned()
+            .or_else(|| {
+                self.recent_directories
+                    .iter()
+                    .find(|path| is_existing_dir(path))
+                    .cloned()
+            })
+            .or_else(default_pictures_directory)
     }
 
     pub fn current_directory_path(&self) -> Option<PathBuf> {
@@ -993,6 +1022,20 @@ fn push_recent_path(list: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+fn default_pictures_directory() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    let pictures = home.join("Pictures");
+    if is_existing_dir(&pictures) {
+        return Some(pictures);
+    }
+    if is_existing_dir(&home) {
+        return Some(home);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1001,6 +1044,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::AppState;
+    use crate::settings::PersistedSettings;
 
     fn write_test_png(path: &Path, width: u32, height: u32, color: [u8; 4]) {
         let image = RgbaImage::from_pixel(width, height, Rgba(color));
@@ -1164,6 +1208,20 @@ mod tests {
         assert_eq!(
             state.recent_directories().first(),
             Some(&dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn preferred_open_directory_uses_recent_folder_when_no_current_folder() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let mut settings = PersistedSettings::default();
+        settings.last_open_directory = None;
+        settings.recent_directories = vec![dir.path().to_path_buf()];
+
+        let state = AppState::new_with_settings(settings);
+        assert_eq!(
+            state.preferred_open_directory().as_deref(),
+            Some(dir.path())
         );
     }
 }

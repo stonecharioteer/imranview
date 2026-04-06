@@ -13,6 +13,9 @@ use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
 use thiserror::Error;
 
+#[cfg(all(feature = "turbojpeg", any(target_os = "linux", target_os = "macos")))]
+use crate::turbojpeg_backend;
+
 pub type ImageIoResult<T> = std::result::Result<T, ImageIoError>;
 
 #[derive(Debug, Error)]
@@ -91,7 +94,8 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "avif", "bmp", "gif", "hdr", "heic", "heif", "ico", "jpeg", "jpg", "pbm", "pgm", "png", "pnm",
     "ppm", "qoi", "tif", "tiff", "webp",
 ];
-const PREVIEW_MAX_DIMENSION: u32 = 4096;
+const PREVIEW_FAST_DIMENSION: u32 = 2048;
+pub const PREVIEW_REFINE_DIMENSION: u32 = 4096;
 const THUMBNAIL_MAX_DIMENSION: u32 = 192;
 const EXIF_FIELD_LIMIT: usize = 32;
 
@@ -125,7 +129,7 @@ pub fn extract_metadata_summary(path: &Path) -> MetadataSummary {
 
 pub fn payload_from_working_image(working_image: Arc<DynamicImage>) -> LoadedImagePayload {
     let (preview_rgba, preview_width, preview_height, downscaled_for_preview) =
-        render_preview_rgba(working_image.as_ref());
+        render_preview_rgba_with_max(working_image.as_ref(), PREVIEW_FAST_DIMENSION);
     let (original_width, original_height) = working_image.dimensions();
     LoadedImagePayload {
         preview_rgba,
@@ -307,25 +311,57 @@ pub fn is_supported_image_path(path: &Path) -> bool {
 }
 
 fn decode_oriented_image(path: &Path) -> Result<DynamicImage> {
-    let decoded = ImageReader::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?
-        .with_guessed_format()
-        .with_context(|| format!("failed to guess image format for {}", path.display()))?
-        .decode()
-        .with_context(|| format!("failed to decode {}", path.display()))?;
+    let decoded = decode_image_with_backend(path)?;
 
     Ok(apply_exif_orientation(path, decoded))
 }
 
-fn render_preview_rgba(image: &DynamicImage) -> (Vec<u8>, u32, u32, bool) {
+fn decode_image_with_backend(path: &Path) -> Result<DynamicImage> {
+    let jpeg_decoder_preference = std::env::var("IMRANVIEW_JPEG_DECODER")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if is_jpeg_path(path) {
+        #[cfg(all(feature = "turbojpeg", any(target_os = "linux", target_os = "macos")))]
+        if jpeg_decoder_preference != "image" {
+            match turbojpeg_backend::decode_jpeg_with_turbojpeg(path) {
+                Ok(decoded) => return Ok(decoded),
+                Err(err) => {
+                    log::debug!(
+                        target: "imranview::image_io",
+                        "turbojpeg decode fallback for {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    ImageReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess image format for {}", path.display()))?
+        .decode()
+        .with_context(|| format!("failed to decode {}", path.display()))
+}
+
+fn is_jpeg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+        .unwrap_or(false)
+}
+
+pub fn render_preview_rgba_with_max(
+    image: &DynamicImage,
+    max_dimension: u32,
+) -> (Vec<u8>, u32, u32, bool) {
+    let max_dimension = max_dimension.max(1);
     let (width, height) = image.dimensions();
-    let max_dimension = width.max(height);
-    if max_dimension > PREVIEW_MAX_DIMENSION {
-        let preview = image.resize(
-            PREVIEW_MAX_DIMENSION,
-            PREVIEW_MAX_DIMENSION,
-            FilterType::Triangle,
-        );
+    let largest_edge = width.max(height);
+    if largest_edge > max_dimension {
+        let preview = image.resize(max_dimension, max_dimension, FilterType::Triangle);
         let (rgba, w, h) = to_rgba_bytes(&preview);
         return (rgba, w, h, true);
     }
@@ -383,6 +419,18 @@ fn read_exif_fields(path: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+fn clamp_prefix_to_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if max_bytes >= text.len() {
+        return text;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn extract_xmp_fields(data: &[u8]) -> Vec<(String, String)> {
     let text = String::from_utf8_lossy(data);
     let marker_start = text
@@ -402,7 +450,7 @@ fn extract_xmp_fields(data: &[u8]) -> Vec<(String, String)> {
                 .map(|index| index + "</rdf:RDF>".len())
         })
         .unwrap_or_else(|| tail.len().min(64 * 1024));
-    let snippet = &tail[..marker_end.min(tail.len())];
+    let snippet = clamp_prefix_to_char_boundary(tail, marker_end);
 
     let mut fields = Vec::new();
     for tag in [
@@ -910,8 +958,8 @@ fn split_jpeg_header_and_scan(bytes: &[u8]) -> Result<(Vec<JpegSegment>, Vec<u8>
 mod tests {
     use super::{
         SaveFormat, build_jpeg_icc_app2_segments, embed_jpeg_icc_profile, embed_png_icc_profile,
-        extract_jpeg_icc_profile, extract_png_icc_profile, parse_jpeg_icc_app2_segment,
-        save_image_with_format,
+        extract_jpeg_icc_profile, extract_png_icc_profile, extract_xmp_fields,
+        parse_jpeg_icc_app2_segment, save_image_with_format,
     };
     use image::{DynamicImage, Rgba, RgbaImage};
     use tempfile::tempdir;
@@ -960,5 +1008,17 @@ mod tests {
             .expect("PNG ICC extraction should succeed")
             .expect("PNG profile should exist");
         assert_eq!(extracted, icc_payload);
+    }
+
+    #[test]
+    fn extract_xmp_fields_handles_non_char_boundary_fallback_cutoff() {
+        let mut xmp = String::from("<x:xmpmeta>");
+        let filler_len = 65_535usize.saturating_sub(xmp.len());
+        xmp.push_str(&"A".repeat(filler_len));
+        xmp.push('\u{05a9}');
+        xmp.push_str("tail-without-closing-tag");
+
+        let fields = extract_xmp_fields(xmp.as_bytes());
+        assert!(!fields.is_empty(), "expected fallback raw snippet field");
     }
 }
