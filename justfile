@@ -54,6 +54,7 @@ setup:
           libturbojpeg0-dev \
           libglib2.0-dev \
           libgtk-3-dev \
+          libxdo-dev \
           libxkbcommon-dev \
           libxcb-render0-dev \
           libxcb-shape0-dev \
