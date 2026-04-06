@@ -13,6 +13,9 @@ use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
 use thiserror::Error;
 
+#[cfg(all(feature = "turbojpeg", any(target_os = "linux", target_os = "macos")))]
+use crate::turbojpeg_backend;
+
 pub type ImageIoResult<T> = std::result::Result<T, ImageIoError>;
 
 #[derive(Debug, Error)]
@@ -308,14 +311,46 @@ pub fn is_supported_image_path(path: &Path) -> bool {
 }
 
 fn decode_oriented_image(path: &Path) -> Result<DynamicImage> {
-    let decoded = ImageReader::open(path)
+    let decoded = decode_image_with_backend(path)?;
+
+    Ok(apply_exif_orientation(path, decoded))
+}
+
+fn decode_image_with_backend(path: &Path) -> Result<DynamicImage> {
+    let jpeg_decoder_preference = std::env::var("IMRANVIEW_JPEG_DECODER")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if is_jpeg_path(path) {
+        #[cfg(all(feature = "turbojpeg", any(target_os = "linux", target_os = "macos")))]
+        if jpeg_decoder_preference != "image" {
+            match turbojpeg_backend::decode_jpeg_with_turbojpeg(path) {
+                Ok(decoded) => return Ok(decoded),
+                Err(err) => {
+                    log::debug!(
+                        target: "imranview::image_io",
+                        "turbojpeg decode fallback for {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    ImageReader::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?
         .with_guessed_format()
         .with_context(|| format!("failed to guess image format for {}", path.display()))?
         .decode()
-        .with_context(|| format!("failed to decode {}", path.display()))?;
+        .with_context(|| format!("failed to decode {}", path.display()))
+}
 
-    Ok(apply_exif_orientation(path, decoded))
+fn is_jpeg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+        .unwrap_or(false)
 }
 
 pub fn render_preview_rgba_with_max(

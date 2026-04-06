@@ -3,6 +3,10 @@ name = "imranview"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["turbojpeg"]
+turbojpeg = []
+
 [dependencies]
 anyhow = "1.0"
 crc32fast = "1.5"

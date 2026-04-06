@@ -68,6 +68,8 @@ just perf-gate [debug.log ...]
 just ci
 
 just package [target]
+
+just setup
 ```
 
 ## Build prerequisites
@@ -78,6 +80,7 @@ Linux (Ubuntu/Debian):
 sudo apt-get update
 sudo apt-get install -y \
   pkg-config \
+  libturbojpeg0-dev \
   libglib2.0-dev \
   libgtk-3-dev \
   libxkbcommon-dev \
@@ -86,11 +89,17 @@ sudo apt-get install -y \
   libxcb-xfixes0-dev
 ```
 
+macOS:
+
+```bash
+brew install jpeg-turbo pkg-config ripgrep
+```
+
 Windows:
 
 - Use the MSVC Rust toolchain (`x86_64-pc-windows-msvc`).
 - Install Visual Studio Build Tools with `Desktop development with C++`, MSVC toolset, and Windows 10/11 SDK (for `rc.exe` and native linker tools).
-- No GTK/GLib packages are required on Windows.
+- No additional image-decoder package is required for local development on Windows.
 
 Optional runtime tools (feature-dependent, all OSes):
 
@@ -98,6 +107,11 @@ Optional runtime tools (feature-dependent, all OSes):
 - Lossless JPEG transform: `jpegtran`
 - EXIF date/time update: `exiftool`
 - Linux/macOS scan command mode: `scanimage` (SANE tools)
+
+Decoder backend overrides:
+
+- JPEG decode uses `libturbojpeg` when available and falls back to the `image` crate.
+- Set `IMRANVIEW_JPEG_DECODER=image` to force `image` crate JPEG decoding.
 
 ## Manual release pipeline
 
