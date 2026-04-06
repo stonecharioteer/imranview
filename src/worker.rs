@@ -14,6 +14,7 @@ use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use lcms2::{Intent, PixelFormat, Profile, Transform};
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::list_images_in_directory;
 use crate::image_io::{
     LoadedImagePayload, MetadataSummary, SaveFormat, ThumbnailPayload, collect_images_in_directory,
     embed_icc_profile_best_effort, extract_embedded_icc_profile, extract_metadata_summary,
@@ -1029,7 +1030,7 @@ fn run_open(request_id: u64, path: PathBuf, preload_cache: &mut PreloadCache) ->
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        let files = collect_images_in_directory(&directory)?;
+        let files = list_images_in_directory(&directory)?;
         let metadata = extract_metadata_summary(&path);
         Ok(WorkerResult::Opened {
             request_id,
@@ -1062,7 +1063,7 @@ fn run_open_directory(
     );
     let started = Instant::now();
     let output = (|| -> Result<WorkerResult> {
-        let files = collect_images_in_directory(&directory)?;
+        let files = list_images_in_directory(&directory)?;
         let path = files
             .first()
             .cloned()

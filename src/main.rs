@@ -1,4 +1,5 @@
 mod app_state;
+mod catalog;
 mod image_io;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod native_menu;
@@ -20,7 +21,9 @@ use eframe::egui;
 
 use crate::app_state::{AppState, ThumbnailEntry};
 use crate::image_io::MetadataSummary;
-use crate::image_io::{collect_images_in_directory, is_supported_image_path};
+use crate::image_io::{
+    PREVIEW_REFINE_DIMENSION, collect_images_in_directory, is_supported_image_path,
+};
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use crate::native_menu::{NativeMenu, NativeMenuAction};
 use crate::plugin::{PluginContext, PluginEvent, PluginHost};
@@ -47,6 +50,7 @@ const RECENT_MENU_LIMIT: usize = 12;
 const COMMAND_PALETTE_PANEL_WIDTH: f32 = 700.0;
 const COMMAND_PALETTE_PANEL_MAX_HEIGHT: f32 = 560.0;
 const COMMAND_PALETTE_MAX_VISIBLE: usize = 320;
+const PREVIEW_REFINE_IDLE_DELAY_MS: u64 = 220;
 
 const fn platform_window_corner_radius() -> u8 {
     #[cfg(target_os = "macos")]
@@ -221,6 +225,7 @@ enum MenuCommand {
     ViewZoomMagnifier,
     OptionsPerformanceCache,
     OptionsClearRuntimeCaches,
+    OptionsPurgeFolderCatalogCache,
     OptionsAdvancedSettings,
     HelpAbout,
 }
@@ -809,6 +814,11 @@ struct PerformanceDialogState {
     thumb_cache_max_mb: usize,
     preload_cache_entry_cap: usize,
     preload_cache_max_mb: usize,
+    catalog_cache_size_bytes: u64,
+    catalog_tracked_folders: usize,
+    catalog_persisted_folders: usize,
+    catalog_entries: usize,
+    catalog_last_error: Option<String>,
 }
 
 impl Default for PerformanceDialogState {
@@ -819,6 +829,11 @@ impl Default for PerformanceDialogState {
             thumb_cache_max_mb: THUMB_TEXTURE_CACHE_MAX_BYTES / (1024 * 1024),
             preload_cache_entry_cap: 6,
             preload_cache_max_mb: 192,
+            catalog_cache_size_bytes: 0,
+            catalog_tracked_folders: 0,
+            catalog_persisted_folders: 0,
+            catalog_entries: 0,
+            catalog_last_error: None,
         }
     }
 }
@@ -1422,6 +1437,8 @@ struct ImranViewApp {
     info_message: Option<String>,
     slideshow_running: bool,
     slideshow_last_tick: Instant,
+    preview_refine_due_at: Option<Instant>,
+    preview_refined_for_path: Option<PathBuf>,
     show_about_window: bool,
     command_palette: CommandPaletteState,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -1521,6 +1538,8 @@ impl ImranViewApp {
             info_message: None,
             slideshow_running: false,
             slideshow_last_tick: Instant::now(),
+            preview_refine_due_at: None,
+            preview_refined_for_path: None,
             show_about_window: false,
             command_palette: CommandPaletteState::default(),
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -1655,6 +1674,8 @@ impl ImranViewApp {
         if !from_navigation {
             self.pending.queued_navigation_steps = 0;
         }
+        self.preview_refine_due_at = None;
+        self.preview_refined_for_path = None;
         self.inflight_preloads.remove(&path);
         let request_id = self.next_request_id();
         self.pending.latest_open = request_id;
@@ -2407,6 +2428,9 @@ impl ImranViewApp {
             return;
         }
 
+        self.preview_refine_due_at = None;
+        self.preview_refined_for_path = None;
+
         self.pending.queued_navigation_steps =
             (self.pending.queued_navigation_steps + step).clamp(-256, 256);
         log::debug!(
@@ -2427,21 +2451,14 @@ impl ImranViewApp {
             return;
         }
 
-        let forward = queued > 0;
         let wrap_navigation = self.advanced_options_dialog.browsing_wrap_navigation;
-        let path_result = if forward {
-            self.state.resolve_next_path_with_wrap(wrap_navigation)
-        } else {
-            self.state.resolve_previous_path_with_wrap(wrap_navigation)
-        };
+        let path_result = self
+            .state
+            .resolve_offset_path_with_wrap(queued as isize, wrap_navigation);
 
         match path_result {
             Ok(path) => {
-                if forward {
-                    self.pending.queued_navigation_steps -= 1;
-                } else {
-                    self.pending.queued_navigation_steps += 1;
-                }
+                self.pending.queued_navigation_steps = 0;
                 self.dispatch_open(path, true);
             }
             Err(err) => {
@@ -2526,8 +2543,14 @@ impl ImranViewApp {
                 self.current_metadata = Some(metadata);
                 self.clear_folder_panel_cache();
                 self.update_main_texture_from_state(ctx);
+                self.schedule_preview_refine_after_idle();
+                if self.preview_refine_due_at.is_some() {
+                    ctx.request_repaint_after(Duration::from_millis(PREVIEW_REFINE_IDLE_DELAY_MS));
+                }
                 self.scroll_thumbnail_to_current = true;
-                self.schedule_preload_neighbors();
+                if self.pending.queued_navigation_steps == 0 {
+                    self.schedule_preload_neighbors();
+                }
                 let thumb_entries = self.state.thumbnail_entries().len();
                 log::debug!(
                     target: "imranview::worker",
@@ -2995,6 +3018,7 @@ impl ImranViewApp {
             | MenuCommand::ViewToggleThumbnailWindow
             | MenuCommand::OptionsPerformanceCache
             | MenuCommand::OptionsClearRuntimeCaches
+            | MenuCommand::OptionsPurgeFolderCatalogCache
             | MenuCommand::OptionsAdvancedSettings
             | MenuCommand::HelpAbout => true,
             MenuCommand::FileOpenRecent(path) => path.is_file(),
@@ -3152,6 +3176,7 @@ impl ImranViewApp {
             MenuCommand::ViewZoomMagnifier => self.open_magnifier_dialog(),
             MenuCommand::OptionsPerformanceCache => self.open_performance_dialog(),
             MenuCommand::OptionsClearRuntimeCaches => self.clear_runtime_caches(),
+            MenuCommand::OptionsPurgeFolderCatalogCache => self.purge_folder_catalog_cache(),
             MenuCommand::OptionsAdvancedSettings => self.open_advanced_options_dialog(),
             MenuCommand::HelpAbout => self.open_about_window(),
         }
@@ -3711,6 +3736,15 @@ impl ImranViewApp {
             None,
             MenuCommand::OptionsClearRuntimeCaches,
             &["clear", "cache", "memory"],
+        );
+        push(
+            "Options",
+            "Purge folder catalog cache",
+            None,
+            MenuCommand::OptionsPurgeFolderCatalogCache,
+            &[
+                "purge", "catalog", "folder", "cache", "disk", "sqlite", "database",
+            ],
         );
         push(
             "Options",
@@ -4732,6 +4766,7 @@ impl ImranViewApp {
         self.performance_dialog.thumb_cache_max_mb = self.state.thumb_cache_max_mb();
         self.performance_dialog.preload_cache_entry_cap = self.state.preload_cache_entry_cap();
         self.performance_dialog.preload_cache_max_mb = self.state.preload_cache_max_mb();
+        self.refresh_catalog_cache_stats();
         self.performance_dialog.open = true;
     }
 
@@ -4743,6 +4778,37 @@ impl ImranViewApp {
         self.inflight_thumbnails.clear();
         self.inflight_preloads.clear();
         self.info_message = Some("Cleared thumbnail and preload caches".to_owned());
+    }
+
+    fn refresh_catalog_cache_stats(&mut self) {
+        match crate::catalog::cache_stats() {
+            Ok(stats) => {
+                self.performance_dialog.catalog_cache_size_bytes = stats.database_bytes;
+                self.performance_dialog.catalog_tracked_folders = stats.tracked_folders;
+                self.performance_dialog.catalog_persisted_folders = stats.persisted_folders;
+                self.performance_dialog.catalog_entries = stats.persisted_entries;
+                self.performance_dialog.catalog_last_error = None;
+            }
+            Err(err) => {
+                self.performance_dialog.catalog_last_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn purge_folder_catalog_cache(&mut self) {
+        match crate::catalog::purge_cache() {
+            Ok(bytes_freed) => {
+                self.refresh_catalog_cache_stats();
+                self.info_message = Some(format!(
+                    "Purged folder catalog cache ({})",
+                    human_file_size(bytes_freed)
+                ));
+            }
+            Err(err) => {
+                self.state
+                    .set_error(format!("failed to purge folder catalog cache: {err}"));
+            }
+        }
     }
 
     fn apply_performance_settings(&mut self) {
@@ -4877,6 +4943,65 @@ impl ImranViewApp {
 
         self.open_next();
         self.slideshow_last_tick = Instant::now();
+    }
+
+    fn schedule_preview_refine_after_idle(&mut self) {
+        if !self.state.downscaled_for_preview() {
+            self.preview_refine_due_at = None;
+            return;
+        }
+        self.preview_refine_due_at =
+            Some(Instant::now() + Duration::from_millis(PREVIEW_REFINE_IDLE_DELAY_MS));
+        self.preview_refined_for_path = None;
+    }
+
+    fn maybe_refine_preview_after_idle(&mut self, ctx: &egui::Context) {
+        let Some(due_at) = self.preview_refine_due_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now < due_at {
+            let wait = due_at.saturating_duration_since(now);
+            ctx.request_repaint_after(wait.min(Duration::from_millis(32)));
+            return;
+        }
+        if self.pending.open_inflight
+            || self.pending.queued_navigation_steps != 0
+            || self.slideshow_running
+        {
+            self.schedule_preview_refine_after_idle();
+            return;
+        }
+        let Some(path) = self.state.current_file_path() else {
+            self.preview_refine_due_at = None;
+            return;
+        };
+        if self.preview_refined_for_path.as_ref() == Some(&path) {
+            self.preview_refine_due_at = None;
+            return;
+        }
+        if !self.state.downscaled_for_preview() {
+            self.preview_refine_due_at = None;
+            return;
+        }
+        match self
+            .state
+            .refresh_preview_from_working(PREVIEW_REFINE_DIMENSION)
+        {
+            Ok(()) => {
+                self.preview_refined_for_path = Some(path);
+                self.preview_refine_due_at = None;
+                self.update_main_texture_from_state(ctx);
+                log::debug!(target: "imranview::perf", "refined preview after idle pause");
+            }
+            Err(err) => {
+                log::debug!(
+                    target: "imranview::perf",
+                    "skipped preview refine: {err:#}"
+                );
+                self.preview_refine_due_at = None;
+            }
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -5782,6 +5907,10 @@ impl ImranViewApp {
                         }
                         if ui.button("Clear runtime caches").clicked() {
                             self.clear_runtime_caches();
+                            ui.close_menu();
+                        }
+                        if ui.button("Purge folder catalog cache").clicked() {
+                            self.purge_folder_catalog_cache();
                             ui.close_menu();
                         }
                         if ui.button("Advanced settings...").clicked() {
@@ -6735,7 +6864,7 @@ impl ImranViewApp {
                     }
                     ui.vertical(|ui| {
                         ui.heading("ImranView");
-                        ui.label("Imran, brother of Irfan");
+                        ui.label("If you are Irfan, then I'm your brother.");
                         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     });
                 });
@@ -8250,6 +8379,33 @@ impl ImranViewApp {
                         egui::DragValue::new(&mut app.performance_dialog.preload_cache_max_mb)
                             .range(32..=2048),
                     );
+                });
+
+                ui.separator();
+                ui.label("Folder catalog cache (disk)");
+                ui.label(format!(
+                    "Database size: {}",
+                    human_file_size(app.performance_dialog.catalog_cache_size_bytes)
+                ));
+                ui.label(format!(
+                    "Tracked folders: {} | Persisted folders: {} | Indexed entries: {}",
+                    app.performance_dialog.catalog_tracked_folders,
+                    app.performance_dialog.catalog_persisted_folders,
+                    app.performance_dialog.catalog_entries
+                ));
+                if let Some(error) = app.performance_dialog.catalog_last_error.as_ref() {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("Catalog error: {error}"),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh catalog stats").clicked() {
+                        app.refresh_catalog_cache_stats();
+                    }
+                    if ui.button("Purge folder catalog cache").clicked() {
+                        app.purge_folder_catalog_cache();
+                    }
                 });
 
                 ui.separator();
@@ -10031,6 +10187,7 @@ impl eframe::App for ImranViewApp {
         self.handle_native_menu_events(ctx);
         self.run_shortcuts(ctx);
         self.run_slideshow_tick();
+        self.maybe_refine_preview_after_idle(ctx);
         self.sync_viewport_state(ctx);
 
         if self.should_draw_in_window_menu() {
@@ -10089,6 +10246,7 @@ impl eframe::App for ImranViewApp {
 
         if self.pending.has_inflight()
             || !self.inflight_thumbnails.is_empty()
+            || self.preview_refine_due_at.is_some()
             || self.slideshow_running
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));

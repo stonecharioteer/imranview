@@ -91,7 +91,8 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "avif", "bmp", "gif", "hdr", "heic", "heif", "ico", "jpeg", "jpg", "pbm", "pgm", "png", "pnm",
     "ppm", "qoi", "tif", "tiff", "webp",
 ];
-const PREVIEW_MAX_DIMENSION: u32 = 4096;
+const PREVIEW_FAST_DIMENSION: u32 = 2048;
+pub const PREVIEW_REFINE_DIMENSION: u32 = 4096;
 const THUMBNAIL_MAX_DIMENSION: u32 = 192;
 const EXIF_FIELD_LIMIT: usize = 32;
 
@@ -125,7 +126,7 @@ pub fn extract_metadata_summary(path: &Path) -> MetadataSummary {
 
 pub fn payload_from_working_image(working_image: Arc<DynamicImage>) -> LoadedImagePayload {
     let (preview_rgba, preview_width, preview_height, downscaled_for_preview) =
-        render_preview_rgba(working_image.as_ref());
+        render_preview_rgba_with_max(working_image.as_ref(), PREVIEW_FAST_DIMENSION);
     let (original_width, original_height) = working_image.dimensions();
     LoadedImagePayload {
         preview_rgba,
@@ -317,15 +318,15 @@ fn decode_oriented_image(path: &Path) -> Result<DynamicImage> {
     Ok(apply_exif_orientation(path, decoded))
 }
 
-fn render_preview_rgba(image: &DynamicImage) -> (Vec<u8>, u32, u32, bool) {
+pub fn render_preview_rgba_with_max(
+    image: &DynamicImage,
+    max_dimension: u32,
+) -> (Vec<u8>, u32, u32, bool) {
+    let max_dimension = max_dimension.max(1);
     let (width, height) = image.dimensions();
-    let max_dimension = width.max(height);
-    if max_dimension > PREVIEW_MAX_DIMENSION {
-        let preview = image.resize(
-            PREVIEW_MAX_DIMENSION,
-            PREVIEW_MAX_DIMENSION,
-            FilterType::Triangle,
-        );
+    let largest_edge = width.max(height);
+    if largest_edge > max_dimension {
+        let preview = image.resize(max_dimension, max_dimension, FilterType::Triangle);
         let (rgba, w, h) = to_rgba_bytes(&preview);
         return (rgba, w, h, true);
     }

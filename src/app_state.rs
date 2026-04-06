@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use image::DynamicImage;
 
-use crate::image_io::LoadedImagePayload;
+use crate::image_io::{LoadedImagePayload, render_preview_rgba_with_max};
 #[cfg(test)]
 use crate::image_io::{
     collect_images_in_directory, load_image_payload, payload_from_working_image, save_image,
@@ -342,6 +342,17 @@ impl AppState {
         self.resolve_adjacent_path(-1, wrap_navigation)
     }
 
+    pub fn resolve_offset_path_with_wrap(
+        &self,
+        offset_steps: isize,
+        wrap_navigation: bool,
+    ) -> Result<PathBuf> {
+        if offset_steps == 0 {
+            return self.current_file_path().context("no image loaded");
+        }
+        self.resolve_adjacent_path(offset_steps, wrap_navigation)
+    }
+
     #[cfg(test)]
     pub fn save_current_as(&mut self, path: PathBuf) -> Result<()> {
         self.save_to_path(path, true)
@@ -357,6 +368,17 @@ impl AppState {
             .as_ref()
             .map(|image| Arc::clone(&image.working_image))
             .context("no image loaded")
+    }
+
+    pub fn refresh_preview_from_working(&mut self, max_dimension: u32) -> Result<()> {
+        let image = self.current_image.as_mut().context("no image loaded")?;
+        let (preview_rgba, preview_width, preview_height, downscaled_for_preview) =
+            render_preview_rgba_with_max(image.working_image.as_ref(), max_dimension);
+        image.preview_rgba = Arc::from(preview_rgba.into_boxed_slice());
+        image.preview_width = preview_width;
+        image.preview_height = preview_height;
+        image.downscaled_for_preview = downscaled_for_preview;
+        Ok(())
     }
 
     pub fn current_file_path(&self) -> Option<PathBuf> {
