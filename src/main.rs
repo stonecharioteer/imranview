@@ -3,7 +3,9 @@ mod catalog;
 mod image_io;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod native_menu;
+mod pending_requests;
 mod perf;
+mod picker;
 mod plugin;
 mod settings;
 mod shortcuts;
@@ -29,6 +31,8 @@ use crate::image_io::{
 };
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use crate::native_menu::{NativeMenu, NativeMenuAction};
+use crate::pending_requests::PendingRequests;
+use crate::picker::{PickerRequestKind, PickerResult};
 use crate::plugin::{PluginContext, PluginEvent, PluginHost};
 use crate::settings::{PersistedSettings, load_settings, save_settings};
 use crate::shortcuts::{ShortcutAction, menu_item_label, shortcut_text};
@@ -364,55 +368,6 @@ fn load_png_texture(
 fn load_app_icon_data(bytes: &[u8]) -> Result<egui::IconData> {
     eframe::icon_data::from_png_bytes(bytes)
         .map_err(|err| anyhow!("failed to decode app icon PNG bytes: {err}"))
-}
-
-#[derive(Default)]
-struct PendingRequests {
-    latest_open: u64,
-    latest_save: u64,
-    latest_edit: u64,
-    latest_batch: u64,
-    latest_file: u64,
-    latest_compare: u64,
-    latest_print: u64,
-    latest_utility: u64,
-    open_inflight: bool,
-    save_inflight: bool,
-    edit_inflight: bool,
-    batch_inflight: bool,
-    file_inflight: bool,
-    compare_inflight: bool,
-    print_inflight: bool,
-    utility_inflight: bool,
-    picker_inflight: bool,
-    queued_navigation_steps: i32,
-}
-
-impl PendingRequests {
-    fn has_inflight(&self) -> bool {
-        self.open_inflight
-            || self.save_inflight
-            || self.edit_inflight
-            || self.batch_inflight
-            || self.file_inflight
-            || self.compare_inflight
-            || self.print_inflight
-            || self.utility_inflight
-            || self.picker_inflight
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PickerRequestKind {
-    OpenImage,
-    CompareImage,
-}
-
-#[derive(Debug)]
-struct PickerResult {
-    kind: PickerRequestKind,
-    picked_path: Option<PathBuf>,
-    blocked: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2571,12 +2526,7 @@ impl ImranViewApp {
             blocked,
         } = result;
 
-        let perf_label = match kind {
-            PickerRequestKind::OpenImage => "open_picker",
-            PickerRequestKind::CompareImage => "compare_picker",
-        };
-
-        crate::perf::log_timing(perf_label, blocked, crate::perf::OPEN_PICKER_BUDGET);
+        crate::perf::log_timing(kind.perf_label(), blocked, crate::perf::OPEN_PICKER_BUDGET);
 
         match (kind, picked_path) {
             (PickerRequestKind::OpenImage, Some(path)) => {
@@ -4233,86 +4183,18 @@ impl ImranViewApp {
         let preferred_directory_started = Instant::now();
         let preferred_directory = self.state.preferred_open_directory();
         let preferred_directory_elapsed = preferred_directory_started.elapsed();
-        let preferred_directory_label = preferred_directory
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<none>".to_owned());
-
-        match kind {
-            PickerRequestKind::OpenImage => {
-                log::debug!(
-                    target: "imranview::ui",
-                    "open picker prepare preferred_directory={} lookup={}ms",
-                    preferred_directory_label,
-                    preferred_directory_elapsed.as_millis()
-                );
-            }
-            PickerRequestKind::CompareImage => {
-                log::debug!(
-                    target: "imranview::ui",
-                    "compare picker prepare preferred_directory={} lookup={}ms",
-                    preferred_directory_label,
-                    preferred_directory_elapsed.as_millis()
-                );
-            }
-        }
+        crate::picker::log_prepare(
+            kind,
+            preferred_directory.as_ref(),
+            preferred_directory_elapsed,
+        );
 
         self.pending.picker_inflight = true;
-        let picker_result_tx = self.picker_result_tx.clone();
-        std::thread::spawn(move || {
-            match kind {
-                PickerRequestKind::OpenImage => {
-                    log::debug!(
-                        target: "imranview::ui",
-                        "open picker invoking native dialog (no explicit set_directory) preferred_directory_candidate={}",
-                        preferred_directory_label
-                    );
-                }
-                PickerRequestKind::CompareImage => {
-                    log::debug!(
-                        target: "imranview::ui",
-                        "compare picker invoking native dialog (no explicit set_directory) preferred_directory_candidate={}",
-                        preferred_directory_label
-                    );
-                }
-            }
-
-            let dialog = match kind {
-                PickerRequestKind::OpenImage => rfd::FileDialog::new().set_title("Open image").add_filter(
-                    "Images",
-                    &[
-                        "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg", "pbm",
-                        "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
-                    ],
-                ),
-                PickerRequestKind::CompareImage => rfd::FileDialog::new()
-                    .set_title("Open compare image")
-                    .add_filter(
-                        "Images",
-                        &[
-                            "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg",
-                            "pbm", "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
-                        ],
-                    ),
-            };
-
-            let picker_started = Instant::now();
-            let picked_path = dialog.pick_file();
-            let blocked = picker_started.elapsed();
-            if picker_result_tx
-                .send(PickerResult {
-                    kind,
-                    picked_path,
-                    blocked,
-                })
-                .is_err()
-            {
-                log::warn!(
-                    target: "imranview::ui",
-                    "failed to send picker result back to UI thread"
-                );
-            }
-        });
+        crate::picker::launch_picker_async(
+            kind,
+            preferred_directory,
+            self.picker_result_tx.clone(),
+        );
     }
 
     fn open_path_dialog(&mut self) {
