@@ -384,6 +384,7 @@ struct PendingRequests {
     compare_inflight: bool,
     print_inflight: bool,
     utility_inflight: bool,
+    picker_inflight: bool,
     queued_navigation_steps: i32,
 }
 
@@ -397,7 +398,21 @@ impl PendingRequests {
             || self.compare_inflight
             || self.print_inflight
             || self.utility_inflight
+            || self.picker_inflight
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PickerRequestKind {
+    OpenImage,
+    CompareImage,
+}
+
+#[derive(Debug)]
+struct PickerResult {
+    kind: PickerRequestKind,
+    picked_path: Option<PathBuf>,
+    blocked: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1385,6 +1400,8 @@ struct ImranViewApp {
     worker_tx: Sender<WorkerCommand>,
     thumbnail_tx: Sender<PathBuf>,
     worker_rx: Receiver<WorkerResult>,
+    picker_result_tx: Sender<PickerResult>,
+    picker_result_rx: Receiver<PickerResult>,
     request_sequence: u64,
     pending: PendingRequests,
     main_texture: Option<egui::TextureHandle>,
@@ -1463,6 +1480,7 @@ impl ImranViewApp {
         let (worker_tx, worker_thread_rx) = mpsc::channel::<WorkerCommand>();
         let (thumbnail_tx, thumbnail_rx) = mpsc::channel::<PathBuf>();
         let (worker_thread_tx, worker_rx) = mpsc::channel::<WorkerResult>();
+        let (picker_result_tx, picker_result_rx) = mpsc::channel::<PickerResult>();
         let worker_config = worker::WorkerConfig {
             preload_cache_cap: state.preload_cache_entry_cap(),
             preload_cache_max_bytes: state.preload_cache_max_mb().saturating_mul(1024 * 1024),
@@ -1481,6 +1499,8 @@ impl ImranViewApp {
             worker_tx,
             thumbnail_tx,
             worker_rx,
+            picker_result_tx,
+            picker_result_rx,
             request_sequence: 1,
             pending: PendingRequests::default(),
             main_texture: None,
@@ -2522,6 +2542,74 @@ impl ImranViewApp {
                         .set_error("background worker disconnected unexpectedly");
                     break;
                 }
+            }
+        }
+    }
+
+    fn poll_picker_results(&mut self) {
+        loop {
+            match self.picker_result_rx.try_recv() {
+                Ok(result) => self.handle_picker_result(result),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending.picker_inflight = false;
+                    log::error!(target: "imranview::ui", "picker result channel disconnected");
+                    self.state
+                        .set_error("picker result channel disconnected unexpectedly");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_picker_result(&mut self, result: PickerResult) {
+        self.pending.picker_inflight = false;
+
+        let PickerResult {
+            kind,
+            picked_path,
+            blocked,
+        } = result;
+
+        let perf_label = match kind {
+            PickerRequestKind::OpenImage => "open_picker",
+            PickerRequestKind::CompareImage => "compare_picker",
+        };
+
+        crate::perf::log_timing(perf_label, blocked, crate::perf::OPEN_PICKER_BUDGET);
+
+        match (kind, picked_path) {
+            (PickerRequestKind::OpenImage, Some(path)) => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "open picker selected path={} blocked={}ms",
+                    path.display(),
+                    blocked.as_millis()
+                );
+                self.dispatch_open(path, false);
+            }
+            (PickerRequestKind::CompareImage, Some(path)) => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "compare picker selected path={} blocked={}ms",
+                    path.display(),
+                    blocked.as_millis()
+                );
+                self.dispatch_compare_open(path);
+            }
+            (PickerRequestKind::OpenImage, None) => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "open picker cancelled blocked={}ms",
+                    blocked.as_millis()
+                );
+            }
+            (PickerRequestKind::CompareImage, None) => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "compare picker cancelled blocked={}ms",
+                    blocked.as_millis()
+                );
             }
         }
     }
@@ -4133,57 +4221,106 @@ impl ImranViewApp {
         self.slideshow_last_tick = Instant::now();
     }
 
-    fn open_path_dialog(&mut self) {
+    fn launch_picker_async(&mut self, kind: PickerRequestKind) {
+        if self.pending.picker_inflight {
+            log::debug!(
+                target: "imranview::ui",
+                "picker request ignored because another picker is in-flight"
+            );
+            return;
+        }
+
+        let preferred_directory_started = Instant::now();
         let preferred_directory = self.state.preferred_open_directory();
-        let mut dialog = rfd::FileDialog::new().set_title("Open image").add_filter(
-            "Images",
-            &[
-                "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg", "pbm", "pgm",
-                "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
-            ],
-        );
+        let preferred_directory_elapsed = preferred_directory_started.elapsed();
+        let preferred_directory_label = preferred_directory
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_owned());
 
-        if let Some(directory) = preferred_directory {
-            dialog = dialog.set_directory(directory);
+        match kind {
+            PickerRequestKind::OpenImage => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "open picker prepare preferred_directory={} lookup={}ms",
+                    preferred_directory_label,
+                    preferred_directory_elapsed.as_millis()
+                );
+            }
+            PickerRequestKind::CompareImage => {
+                log::debug!(
+                    target: "imranview::ui",
+                    "compare picker prepare preferred_directory={} lookup={}ms",
+                    preferred_directory_label,
+                    preferred_directory_elapsed.as_millis()
+                );
+            }
         }
 
-        let picker_started = Instant::now();
-        let picked_path = dialog.pick_file();
-        crate::perf::log_timing(
-            "open_picker",
-            picker_started.elapsed(),
-            crate::perf::OPEN_PICKER_BUDGET,
-        );
+        self.pending.picker_inflight = true;
+        let picker_result_tx = self.picker_result_tx.clone();
+        std::thread::spawn(move || {
+            match kind {
+                PickerRequestKind::OpenImage => {
+                    log::debug!(
+                        target: "imranview::ui",
+                        "open picker invoking native dialog (no explicit set_directory) preferred_directory_candidate={}",
+                        preferred_directory_label
+                    );
+                }
+                PickerRequestKind::CompareImage => {
+                    log::debug!(
+                        target: "imranview::ui",
+                        "compare picker invoking native dialog (no explicit set_directory) preferred_directory_candidate={}",
+                        preferred_directory_label
+                    );
+                }
+            }
 
-        if let Some(path) = picked_path {
-            self.dispatch_open(path, false);
-        }
+            let dialog = match kind {
+                PickerRequestKind::OpenImage => rfd::FileDialog::new().set_title("Open image").add_filter(
+                    "Images",
+                    &[
+                        "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg", "pbm",
+                        "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
+                    ],
+                ),
+                PickerRequestKind::CompareImage => rfd::FileDialog::new()
+                    .set_title("Open compare image")
+                    .add_filter(
+                        "Images",
+                        &[
+                            "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg",
+                            "pbm", "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
+                        ],
+                    ),
+            };
+
+            let picker_started = Instant::now();
+            let picked_path = dialog.pick_file();
+            let blocked = picker_started.elapsed();
+            if picker_result_tx
+                .send(PickerResult {
+                    kind,
+                    picked_path,
+                    blocked,
+                })
+                .is_err()
+            {
+                log::warn!(
+                    target: "imranview::ui",
+                    "failed to send picker result back to UI thread"
+                );
+            }
+        });
+    }
+
+    fn open_path_dialog(&mut self) {
+        self.launch_picker_async(PickerRequestKind::OpenImage);
     }
 
     fn open_compare_path_dialog(&mut self) {
-        let preferred_directory = self.state.preferred_open_directory();
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Open compare image")
-            .add_filter(
-                "Images",
-                &[
-                    "avif", "bmp", "gif", "heic", "heif", "hdr", "ico", "jpeg", "jpg", "pbm",
-                    "pgm", "png", "pnm", "ppm", "qoi", "tif", "tiff", "webp",
-                ],
-            );
-        if let Some(directory) = preferred_directory {
-            dialog = dialog.set_directory(directory);
-        }
-        let picker_started = Instant::now();
-        let picked_path = dialog.pick_file();
-        crate::perf::log_timing(
-            "compare_picker",
-            picker_started.elapsed(),
-            crate::perf::OPEN_PICKER_BUDGET,
-        );
-        if let Some(path) = picked_path {
-            self.dispatch_compare_open(path);
-        }
+        self.launch_picker_async(PickerRequestKind::CompareImage);
     }
 
     fn open_save_as_dialog(&mut self) {
@@ -10192,6 +10329,10 @@ impl ImranViewApp {
                         ui.separator();
                         ui.label(format!("Captured: {captured}"));
                     }
+                    if self.pending.picker_inflight {
+                        ui.separator();
+                        ui.label("Picker: opening…");
+                    }
                     if let Some(shortcut) = shortcut_text(ctx, ShortcutAction::CommandPalette) {
                         ui.separator();
                         ui.label(format!("Commands: {shortcut}"));
@@ -10205,6 +10346,7 @@ impl eframe::App for ImranViewApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.maybe_install_native_menu(frame);
         self.poll_worker_results(ctx);
+        self.poll_picker_results();
         self.handle_native_menu_events(ctx);
         self.run_shortcuts(ctx);
         self.run_slideshow_tick();

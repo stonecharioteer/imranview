@@ -32,3 +32,13 @@
   - Remove dead code and unused assets.
   - Prefer efficient data structures and algorithms.
   - Validate changes with release builds (`cargo run --release`, `cargo test --release` where practical).
+
+## Modularity + File Size Guardrails
+- Keep modules focused: one file should represent one cohesive responsibility.
+- Avoid adding substantial new logic directly to already-large files (especially `src/main.rs`).
+- Prefer extracting features into dedicated modules (for example: `src/ui/`, `src/dialogs/`, `src/picker/`, `src/services/`) and keep `main.rs` as composition/wiring.
+- For non-trivial features, require at least one of:
+  - moving new logic to a new module, or
+  - shrinking touched large files by extracting existing logic during the change.
+- Before merging, ask: "Would this be easier to test and maintain if split into a module?" If yes, split it.
+- Add tests near extracted modules so behavior is validated without relying on monolithic integration paths.
