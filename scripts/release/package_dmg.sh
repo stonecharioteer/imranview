@@ -165,6 +165,21 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <string>ImranView.icns</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Image</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.image</string>
+      </array>
+    </dict>
+  </array>
   <key>LSMinimumSystemVersion</key>
   <string>11.0</string>
   <key>NSHighResolutionCapable</key>

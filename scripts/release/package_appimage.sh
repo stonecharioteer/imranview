@@ -80,6 +80,7 @@ Exec=imranview %F
 Icon=imranview
 Terminal=false
 Categories=Graphics;Viewer;
+MimeType=image/avif;image/bmp;image/gif;image/heic;image/heif;image/vnd.microsoft.icon;image/jpeg;image/png;image/tiff;image/webp;image/x-portable-anymap;image/x-portable-bitmap;image/x-portable-graymap;image/x-portable-pixmap;image/vnd.radiance;image/qoi;
 StartupNotify=true
 DESKTOP
 
