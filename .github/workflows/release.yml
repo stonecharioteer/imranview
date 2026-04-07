@@ -144,9 +144,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
           $version = '${{ needs.prepare.outputs.version }}'
-          $outFile = "dist/imranview-$version-windows-x86_64-setup.exe"
-          $bin = "target/release/imranview.exe"
-          $nsis = "${env:ProgramFiles(x86)}\\NSIS\\makensis.exe"
+          $bin = (Resolve-Path "target\release\imranview.exe").Path
+          $distDir = (Resolve-Path "dist").Path
+          $outFile = Join-Path $distDir "imranview-$version-windows-x86_64-setup.exe"
+          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
 
           if (!(Test-Path $bin)) {
             throw "Windows packaging failed: binary not found at $bin"
@@ -155,7 +156,7 @@ jobs:
             throw "Windows packaging failed: NSIS not found at $nsis"
           }
 
-          & $nsis /DVERSION=$version /DOUTFILE=$outFile /DBIN=$bin scripts\\windows\\installer.nsi
+          & $nsis "/DVERSION=$version" "/DOUTFILE=$outFile" "/DBIN=$bin" scripts\windows\installer.nsi
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
