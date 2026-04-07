@@ -12,7 +12,7 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
 ICONSET_DIR="$DIST_DIR/macos/icon.iconset"
 ICON_ICNS="$RESOURCES_DIR/ImranView.icns"
-DMG_OUT="$DIST_DIR/imranview-${VERSION}-macos.dmg"
+DMG_OUT="$DIST_DIR/imranview-${VERSION}-macos-arm64.dmg"
 APP_BIN="$MACOS_DIR/imranview-bin"
 APP_LAUNCHER="$MACOS_DIR/imranview"
 
@@ -23,6 +23,12 @@ fi
 
 if ! command -v brew >/dev/null 2>&1; then
   echo "macOS packaging failed: Homebrew is required to resolve runtime libraries" >&2
+  exit 1
+fi
+
+HOST_ARCH="$(uname -m)"
+if [[ "$HOST_ARCH" != "arm64" ]]; then
+  echo "macOS packaging failed: expected arm64 host for arm64 DMG, got $HOST_ARCH" >&2
   exit 1
 fi
 

@@ -65,9 +65,9 @@ jobs:
           - os: ubuntu-latest
             artifact_name: linux-appimage
             artifact_glob: dist/*.AppImage
-          - os: macos-latest
-            artifact_name: macos-dmg
-            artifact_glob: dist/*.dmg
+          - os: macos-14
+            artifact_name: macos-dmg-arm64
+            artifact_glob: dist/*-macos-arm64.dmg
           - os: windows-latest
             artifact_name: windows-nsis
             artifact_glob: dist/*setup.exe
