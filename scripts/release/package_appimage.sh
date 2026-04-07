@@ -83,6 +83,9 @@ Categories=Graphics;Viewer;
 StartupNotify=true
 DESKTOP
 
+# appimagetool expects a desktop file at the AppDir root.
+cp "$APPDIR/usr/share/applications/imranview.desktop" "$APPDIR/imranview.desktop"
+
 if [[ ! -x "$APPIMAGE_TOOL" ]]; then
   curl -sSL "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -o "$APPIMAGE_TOOL"
   chmod +x "$APPIMAGE_TOOL"
