@@ -2255,7 +2255,7 @@ dependencies = [
 
 [[package]]
 name = "imranview"
-version = "2026.4.7-0"
+version = "2026.4.7-1"
 dependencies = [
  "anyhow",
  "crc32fast",

@@ -1,6 +1,6 @@
 [package]
 name = "imranview"
-version = "2026.4.7-0"
+version = "2026.4.7-1"
 edition = "2024"
 
 [features]
